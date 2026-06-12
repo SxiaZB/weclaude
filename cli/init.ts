@@ -237,7 +237,21 @@ const main = async (): Promise<void> => {
     }
     log(c.green(`  ✓ tmux session=${c.bold(r.tmuxSession ?? "")} pane=${r.tmuxPane ?? ""} sid=${r.sessionId ?? ""}`));
     log(c.dim(`  附加: tmux attach -t ${r.tmuxSession ?? "weclaude"}`));
-    log(c.dim("  现在在 WeCom 发任意消息,daemon 会注入到该 pane 里的 claude;首次工具调用会推授权卡片。"));
+
+    if (!enableHook) {
+      log(c.dim("  hook 未启用 — 跳过 demo 注入,后续在 WeCom 发任意消息即可。"));
+      log(c.green("\n✅ 引导完成。"));
+      return;
+    }
+    log(c.dim("  注入 demo prompt (会触发 Bash 工具调用 → WeCom 推授权卡片 → 点击放行后镜像回流) ..."));
+    const inj = (await post("/mirror/inject", { target: claimed, text: DEMO_PROMPT_MIRROR })) as {
+      ok?: boolean; reason?: string;
+    };
+    if (!inj.ok) {
+      log(c.yellow(`  ⚠ inject 失败: ${inj.reason ?? "unknown"} — 可手动在 WeCom 发任意消息验证。`));
+    } else {
+      log(c.green("  ✓ demo 已注入,留意 WeCom 收到的按钮卡片。"));
+    }
     log(c.green("\n✅ 引导完成。后续可用 `weclaude status` / `weclaude logs -f` 观察。"));
     return;
   }
@@ -268,6 +282,11 @@ const DEMO_PROMPT =
     "2. 用 Read 工具读取 ~/.weclaude/config.jsonc 的前 30 行,告诉我 wrc.mode 当前是什么值。",
     "3. 用一句话总结。",
   ].join("\n");
+
+// Mirror demo: short and tool-forcing — single Bash call so the user gets one
+// approval card to click, sees it run, and the assistant reply mirrors back.
+const DEMO_PROMPT_MIRROR =
+  "请用 Bash 运行 `ls ~/.weclaude/` ,然后用一句话告诉我看到了什么文件。";
 
 const runDemo = (claudeBin: string): Promise<void> =>
   new Promise((resolve) => {

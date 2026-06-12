@@ -113,6 +113,19 @@ const main = async (): Promise<void> => {
       const att = m.attach({ sessionId: r.sessionId!, jsonlPath: r.jsonlPath!, target, tmuxPane: r.tmuxPane, tmuxSession: r.tmuxSession });
       json(res, att.ok ? 200 : 500, att.ok ? { ok: true, sessionId: r.sessionId, tmuxSession: r.tmuxSession, tmuxPane: r.tmuxPane, target } : { ok: false, reason: att.reason });
     });
+    // Frame-less inject — used by `weclaude init` to fire a demo prompt right
+    // after /mirror/spawn so first-time users see the full PreToolUse → card
+    // → mirror loop without needing to type in WeCom.
+    http.register("POST /mirror/inject", async (req, res) => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as Partial<{ target: string; text: string }>;
+      const target = (body.target ?? cfg.defaultChat ?? "").trim();
+      const text = (body.text ?? "").toString();
+      if (!target) { json(res, 400, { ok: false, reason: "target required" }); return; }
+      if (!text.trim()) { json(res, 400, { ok: false, reason: "text required" }); return; }
+      const r = await m.injectText(target, text);
+      json(res, r.ok ? 200 : 500, r);
+    });
   }
 
   const shutdown = async (signal: string): Promise<void> => {

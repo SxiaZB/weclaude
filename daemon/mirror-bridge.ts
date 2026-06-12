@@ -807,6 +807,12 @@ export interface MirrorBridge {
    *  standalone path instead of growing the same bubble. No-op when no live
    *  stream exists. */
   terminateLiveStream: (sessionId: string) => void;
+  /** Inject text into an attached mirror without an originating WeCom frame.
+   *  Used by `weclaude init` to fire a demo prompt right after auto-spawn so
+   *  the user sees the full PreToolUse → approval card → assistant mirror
+   *  loop end-to-end. Skips the live-stream/replyStream machinery — the tail
+   *  pushes assistant output via the standalone path. */
+  injectText: (target: string, text: string) => Promise<{ ok: boolean; reason?: string }>;
 }
 
 interface ToolEntry {
@@ -1423,6 +1429,31 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         log.info({ sessionId, turnId: a.liveStream.turnId }, "approval click — terminating liveStream");
         void finalizeStream(a, a.liveStream);
       }
+    },
+    injectText: async (target, text) => {
+      const a = byTarget.get(target);
+      if (!a) return { ok: false, reason: "no mirror attached for target" };
+      if (!text.trim()) return { ok: false, reason: "empty text" };
+      // Pre-record so the tail's user-line emission is suppressed by the
+      // recentInjects dedupe (otherwise the user sees their own demo prompt
+      // echoed back as a quoted bubble).
+      rememberInject(text);
+      const sid = a.sessionId;
+      const paneAlive = a.tmuxPane ? await tmuxPaneAlive(a.tmuxPane) : false;
+      if (!paneAlive) {
+        log.warn({ target, sessionId: sid, oldPane: a.tmuxPane }, "injectText: pane not alive, respawning");
+        const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn-init", sessionId: sid }), resumeSessionId: sid, windowName: target });
+        if (!r.ok || !r.tmuxPane) return { ok: false, reason: `respawn failed: ${r.reason ?? "unknown"}` };
+        a.tmuxPane = r.tmuxPane;
+        a.tmuxSession = r.tmuxSession ?? a.tmuxSession;
+        deps.store.set(target, { sessionId: sid, jsonlPath: a.jsonlPath, tmuxSession: a.tmuxSession, tmuxPane: a.tmuxPane });
+      }
+      // freshSpawn: true — the pane was just minted by /mirror/spawn, the TUI
+      // is still warming up so the verifier in injectViaTmux needs the slack.
+      return await inject({
+        text, images: [], cfg, log: log.child({ principal: target, sessionId: sid, sub: "init-demo" }),
+        sessionId: sid, tmuxTarget: a.tmuxPane, freshSpawn: true,
+      });
     },
     shutdown: () => {
       for (const a of bySessionId.values()) {
