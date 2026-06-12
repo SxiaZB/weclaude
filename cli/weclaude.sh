@@ -39,7 +39,8 @@ weclaude <subcommand>
   config-path            show resolved config path
   sync                   write hooks/MCP/env into sync.targets settings.json
   unsync                 remove our entries from sync.targets settings.json
-  uninstall              full teardown: unsync + remove daemon (run before `npm uninstall -g`)
+  uninstall              full teardown: stop daemon + unsync + plugin uninstall + remove daemon (run before `npm uninstall -g`)
+                         add `--purge` to also delete ~/.weclaude state
   version                print weclaude version
   help
 EOF
@@ -132,11 +133,25 @@ case "$cmd" in
     ;;
   config-path) http_get /status | jq -r '.sourcePath // empty' ;;
   uninstall)
+    # Order matters: stop the daemon FIRST so it can't rewrite settings/lock
+    # files mid-teardown; then strip MCP/env from agent settings; then remove
+    # the plist/unit + Claude plugin registration. State at ~/.weclaude is
+    # preserved unless `--purge` is given.
+    purge=0
+    [[ "${1:-}" == "--purge" ]] && purge=1
+    http_post /shutdown >/dev/null 2>&1 || true
     NODE_BIN="$(command -v node)"
     SYNC_SCRIPT="$REPO_ROOT/dist/cli/sync.js"
     [[ -f "$SYNC_SCRIPT" ]] && "$NODE_BIN" "$SYNC_SCRIPT" --remove || true
     bash "$REPO_ROOT/scripts/uninstall.sh"
-    echo "[weclaude] cleaned. safe to 'npm uninstall -g weclaude' (state at ~/.weclaude kept)"
+    rm -f "$HOME_DIR/.weclaude/sync.lock.json"
+    if (( purge )); then
+      rm -rf "$HOME_DIR/.weclaude"
+      echo "[weclaude] state purged (~/.weclaude removed)"
+    else
+      echo "[weclaude] cleaned. state kept at ~/.weclaude — remove with 'weclaude uninstall --purge' or 'rm -rf ~/.weclaude'"
+    fi
+    echo "[weclaude] safe to 'npm uninstall -g weclaude' now"
     ;;
   mirror)
     require_claude_internal
