@@ -8,10 +8,12 @@
 // 时按 store 重写以丢弃过期 / 被覆盖的旧行。TTL 24h, 上限 1000 条 LRU。
 import { mkdirSync, existsSync, readFileSync, appendFileSync, writeFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { structuredPatch } from "diff";
 import type { Logger } from "pino";
 import type { Decision } from "./pending.js";
 import type { Handler } from "./http.js";
 import { expandHome } from "../shared/paths.js";
+import { resolvePublicHost } from "../shared/lan-ip.js";
 
 type Kind = "tool" | "approval";
 
@@ -176,7 +178,7 @@ export const buildDetailUrl = (
 ): string => {
   const root = publicBase && publicBase.length > 0
     ? publicBase.replace(/\/+$/, "")
-    : `http://${fallbackHost === "0.0.0.0" ? "127.0.0.1" : fallbackHost}:${fallbackPort}`;
+    : `http://${resolvePublicHost(fallbackHost)}:${fallbackPort}`;
   const params = new URLSearchParams({
     id,
     forceInnerBrowser: "1",
@@ -291,121 +293,37 @@ const SHARED_CSS = `
 `;
 
 // ── git-style diff ────────────────────────────────────────────────────
-type DiffOp = { tag: "eq" | "del" | "add"; text: string };
-
-// LCS-based 行级 diff。m*n DP, 输入超过 LCS_LIMIT 行就降级为 del-then-add,
-// 避免 Write 巨型文件 / 跑大 input 时 OOM。
-const LCS_LIMIT = 1500;
-const lineDiff = (a: string, b: string): DiffOp[] => {
-  const A = a === "" ? [] : a.split("\n");
-  const B = b === "" ? [] : b.split("\n");
-  const m = A.length, n = B.length;
-  if (m === 0 && n === 0) return [];
-  if (m === 0) return B.map((t) => ({ tag: "add" as const, text: t }));
-  if (n === 0) return A.map((t) => ({ tag: "del" as const, text: t }));
-  if (m > LCS_LIMIT || n > LCS_LIMIT) {
-    return [
-      ...A.map((t) => ({ tag: "del" as const, text: t })),
-      ...B.map((t) => ({ tag: "add" as const, text: t })),
-    ];
-  }
-  // dp[i][j] = LCS length of A[i..] vs B[j..]
-  const dp: Uint16Array[] = Array.from({ length: m + 1 }, () => new Uint16Array(n + 1));
-  for (let i = m - 1; i >= 0; i--) {
-    for (let j = n - 1; j >= 0; j--) {
-      if (A[i] === B[j]) dp[i]![j] = dp[i + 1]![j + 1]! + 1;
-      else dp[i]![j] = Math.max(dp[i + 1]![j]!, dp[i]![j + 1]!);
-    }
-  }
-  const out: DiffOp[] = [];
-  let i = 0, j = 0;
-  while (i < m && j < n) {
-    if (A[i] === B[j]) { out.push({ tag: "eq", text: A[i]! }); i++; j++; }
-    else if (dp[i + 1]![j]! >= dp[i]![j + 1]!) { out.push({ tag: "del", text: A[i]! }); i++; }
-    else { out.push({ tag: "add", text: B[j]! }); j++; }
-  }
-  while (i < m) out.push({ tag: "del", text: A[i++]! });
-  while (j < n) out.push({ tag: "add", text: B[j++]! });
-  return out;
-};
-
-// 把连续 eq 行折叠成 hunk。CTX 行数控制紧邻变更的上下文保留量。
-interface HunkRow { tag: DiffOp["tag"] | "hunk"; text: string; oldLn?: number; newLn?: number }
-const CTX = 3;
-const buildHunks = (ops: DiffOp[]): HunkRow[] => {
-  // 给所有 op 打上左右行号
-  let oa = 1, nb = 1;
-  type Annotated = DiffOp & { oa?: number; nb?: number };
-  const ann: Annotated[] = ops.map((o) => {
-    const r: Annotated = { ...o };
-    if (o.tag === "eq") { r.oa = oa++; r.nb = nb++; }
-    else if (o.tag === "del") { r.oa = oa++; }
-    else { r.nb = nb++; }
-    return r;
-  });
-  // 找出每个变更附近 CTX 行的窗口, 合并相邻窗口
-  const keep = new Array<boolean>(ann.length).fill(false);
-  ann.forEach((o, idx) => {
-    if (o.tag !== "eq") {
-      for (let k = Math.max(0, idx - CTX); k <= Math.min(ann.length - 1, idx + CTX); k++) keep[k] = true;
-    }
-  });
-  const out: HunkRow[] = [];
-  let inHunk = false, hunkStartOa = 1, hunkStartNb = 1, hunkOa = 0, hunkNb = 0;
-  let pendingRows: HunkRow[] = [];
-  const flushHunk = (): void => {
-    if (pendingRows.length === 0) return;
-    out.push({
-      tag: "hunk",
-      text: `@@ -${hunkStartOa},${hunkOa} +${hunkStartNb},${hunkNb} @@`,
-    });
-    out.push(...pendingRows);
-    pendingRows = [];
-    inHunk = false;
-  };
-  ann.forEach((o, idx) => {
-    if (!keep[idx]) {
-      flushHunk();
-      return;
-    }
-    if (!inHunk) {
-      hunkStartOa = o.oa ?? (o.tag === "add" ? Math.max(1, (ann[idx]?.nb ?? 1)) : 1);
-      hunkStartNb = o.nb ?? 1;
-      // pure-add 起点的 oa 用前一行 oa+1, pure-del 起点的 nb 同理 — 只是 header 显示, 不严
-      hunkOa = 0; hunkNb = 0;
-      inHunk = true;
-    }
-    pendingRows.push({ tag: o.tag, text: o.text, oldLn: o.oa, newLn: o.nb });
-    if (o.tag !== "add") hunkOa++;
-    if (o.tag !== "del") hunkNb++;
-  });
-  flushHunk();
-  return out;
-};
-
-const renderDiffRows = (rows: HunkRow[]): string => {
-  return rows.map((r) => {
-    if (r.tag === "hunk") {
-      return `<div class="row hunk">${escHtml(r.text)}</div>`;
-    }
-    const sign = r.tag === "add" ? "+" : r.tag === "del" ? "-" : " ";
-    const oldLn = r.oldLn !== undefined ? r.oldLn : "";
-    const newLn = r.newLn !== undefined ? r.newLn : "";
-    return `<div class="row ${r.tag}"><div class="ln">${oldLn}</div><div class="ln">${newLn}</div><div class="sign">${sign}</div><div class="txt">${escHtml(r.text) || "&nbsp;"}</div></div>`;
-  }).join("");
-};
-
+// 用 jsdiff 的 structuredPatch 算 hunk: 标准的 Myers 实现 + 自动 ±3 行上下文折叠,
+// 输出形如 { hunks: [{ oldStart, oldLines, newStart, newLines, lines: [' eq','+add','-del'] }] }.
 interface DiffBlock { path: string; oldStr: string; newStr: string; label?: string }
 
 const renderDiffBlock = (b: DiffBlock): string => {
-  const ops = lineDiff(b.oldStr, b.newStr);
-  const rows = buildHunks(ops);
-  const adds = ops.filter((o) => o.tag === "add").length;
-  const dels = ops.filter((o) => o.tag === "del").length;
+  // structuredPatch 要求两端都以 \n 收尾, 否则会在 hunk 末尾追加 "\\ No newline at end of file"
+  const norm = (s: string): string => (s === "" || s.endsWith("\n") ? s : `${s}\n`);
+  const patch = structuredPatch("a", "b", norm(b.oldStr), norm(b.newStr), "", "", { context: 3 });
+  let adds = 0, dels = 0;
+  const rowsHtml = patch.hunks.flatMap((h) => {
+    const header = `<div class="row hunk">@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines} @@</div>`;
+    let oa = h.oldStart, nb = h.newStart;
+    const body = h.lines
+      .filter((ln) => !ln.startsWith("\\")) // 去掉 "\\ No newline at end of file"
+      .map((ln) => {
+        const sign = ln[0] ?? " ";
+        const text = ln.slice(1);
+        const tag = sign === "+" ? "add" : sign === "-" ? "del" : "eq";
+        const oldLn = tag === "add" ? "" : oa++;
+        const newLn = tag === "del" ? "" : nb++;
+        if (tag === "add") adds++;
+        else if (tag === "del") dels++;
+        return `<div class="row ${tag}"><div class="ln">${oldLn}</div><div class="ln">${newLn}</div><div class="sign">${sign}</div><div class="txt">${escHtml(text) || "&nbsp;"}</div></div>`;
+      })
+      .join("");
+    return [header, body];
+  }).join("");
   const head = b.label ? `${escHtml(b.label)} · ` : "";
   return `<section>
     <h2>${head}<span style="color:#1a7f37">+${adds}</span> <span style="color:#cf222e">-${dels}</span>${b.path ? ` · <span style="color:#1f2328;text-transform:none;letter-spacing:0">${escHtml(b.path)}</span>` : ""}</h2>
-    <div class="diff">${renderDiffRows(rows)}</div>
+    <div class="diff">${rowsHtml}</div>
   </section>`;
 };
 
