@@ -1,0 +1,75 @@
+{
+  "name": "weclaude",
+  "version": "0.1.2",
+  "description": "Bridge Claude Code and WeCom: PreToolUse approval cards + bidirectional tmux session mirror with image paste",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "wecom",
+    "wechat-work",
+    "remote-control",
+    "approval",
+    "mcp"
+  ],
+  "bin": {
+    "weclaude": "./cli/weclaude.sh",
+    "weclaude-daemon": "./dist/daemon/index.js",
+    "weclaude-mcp": "./dist/mcp/server.js",
+    "weclaude-init": "./dist/cli/init.js"
+  },
+  "files": [
+    "cli/weclaude.sh",
+    "dist/cli/init.js",
+    "dist/cli/init.js.map",
+    "dist/cli/sync.js",
+    "dist/cli/sync.js.map",
+    "dist/daemon/**/*.js",
+    "dist/daemon/**/*.js.map",
+    "dist/mcp/**/*.js",
+    "dist/mcp/**/*.js.map",
+    "dist/shared/**/*.js",
+    "dist/shared/**/*.js.map",
+    "hooks/pre-tool-use.sh",
+    "hooks/hooks.json",
+    "scripts/install.sh",
+    "scripts/uninstall.sh",
+    "launchd/com.weclaude.daemon.plist.template",
+    "systemd/weclaude.service.template",
+    "config.example.jsonc",
+    "commands/wrc.md",
+    "README.md",
+    "docs/ONBOARDING.md",
+    "docs/DESIGN-INIT.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli/init.js dist/daemon/index.js dist/mcp/server.js",
+    "dev:daemon": "tsx daemon/index.ts",
+    "dev:cli": "tsx cli/weclaude.ts",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "rm -rf dist && npm run build",
+    "prepack": "test -f dist/daemon/index.js || npm run build"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^7.2.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@wecom/aibot-node-sdk": "^1.0.6",
+    "jsonc-parser": "^3.3.1",
+    "pino": "^9.5.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ]
+}

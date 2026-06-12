@@ -1,0 +1,14 @@
+{
+  "name": "weclaude-local",
+  "version": "0.0.1",
+  "description": "Local marketplace shim — exposes weclaude plugin from this repo.",
+  "owner": { "name": "zyy" },
+  "plugins": [
+    {
+      "name": "weclaude",
+      "source": ".",
+      "description": "Remote-control Claude Code from WeCom (/wrc).",
+      "category": "productivity"
+    }
+  ]
+}
