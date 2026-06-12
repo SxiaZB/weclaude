@@ -92,16 +92,25 @@ const installDaemon = (): void => {
 // `${CLAUDE_PLUGIN_ROOT}` resolves) + `commands/wrc.md` + the MCP server
 // declared in `.claude-plugin/plugin.json`. Idempotent: marketplace add
 // re-uses the existing entry, install upgrades in place.
+//
+// 失败即 throw — 没装上 hook 等于整套授权链路废掉,继续往下跑只会让用户看到
+// 假的"✅ 引导完成",再被 auto mode 拦截一脸懵。
 const installPlugin = (claudeBin: string): void => {
   log(c.dim(`  注册 marketplace + 安装插件 (${claudeBin}) ...`));
   const m = spawnSync(claudeBin, ["plugin", "marketplace", "add", REPO], { stdio: "inherit" });
   if (m.status !== 0) {
-    log(c.yellow(`  ⚠ plugin marketplace add 失败 (退出码 ${m.status}) — hook 可能未注册，可手动:\n     ${claudeBin} plugin marketplace add ${REPO}\n     ${claudeBin} plugin install weclaude@weclaude-local`));
-    return;
+    throw new Error(
+      `plugin marketplace add 失败 (退出码 ${m.status}) — hook 无法注册。\n` +
+      `  手动: ${claudeBin} plugin marketplace add ${REPO}`,
+    );
   }
   const i = spawnSync(claudeBin, ["plugin", "install", "weclaude@weclaude-local", "--scope", "user"], { stdio: "inherit" });
   if (i.status !== 0) {
-    log(c.yellow(`  ⚠ plugin install 失败 (退出码 ${i.status}) — 可手动: ${claudeBin} plugin install weclaude@weclaude-local`));
+    throw new Error(
+      `plugin install 失败 (退出码 ${i.status}) — hook 无法注册。\n` +
+      `  常见原因: ${claudeBin} 版本过旧,不支持当前插件源类型 — 请先升级 ${claudeBin} 后重试 init。\n` +
+      `  手动: ${claudeBin} plugin install weclaude@weclaude-local --scope user`,
+    );
   }
 };
 
@@ -224,8 +233,9 @@ const main = async (): Promise<void> => {
     return;
   }
   if (wrcMode === "mirror") {
-    // Mirror 路径:不能用 `claude -p`(脱离 tmux),改为主动起 tmux+claude pane,
-    // 让用户立即看到 mirror 形态;之后在 WeCom 发任意消息即可走完整 mirror 流。
+    // Mirror 路径:拉起 tmux+claude pane,然后让用户在 WeCom 发首条消息。
+    // 首条 inbound 走完整 dispatch 链路:openStream → 注入 tmux → tail 回流为
+    // 打字机气泡。比 frame-less /mirror/inject 体验好得多(后者无 liveStream)。
     log(c.dim("  正在拉起 tmux+claude pane (mirror 模式) ..."));
     const r = (await post("/mirror/spawn", { target: claimed })) as {
       ok?: boolean; reason?: string; tmuxSession?: string; tmuxPane?: string; sessionId?: string;
@@ -237,20 +247,10 @@ const main = async (): Promise<void> => {
     }
     log(c.green(`  ✓ tmux session=${c.bold(r.tmuxSession ?? "")} pane=${r.tmuxPane ?? ""} sid=${r.sessionId ?? ""}`));
     log(c.dim(`  附加: tmux attach -t ${r.tmuxSession ?? "weclaude"}`));
-
-    if (!enableHook) {
-      log(c.dim("  hook 未启用 — 跳过 demo 注入,后续在 WeCom 发任意消息即可。"));
-      log(c.green("\n✅ 引导完成。"));
-      return;
-    }
-    log(c.dim("  注入 demo prompt (会触发 Bash 工具调用 → WeCom 推授权卡片 → 点击放行后镜像回流) ..."));
-    const inj = (await post("/mirror/inject", { target: claimed, text: DEMO_PROMPT_MIRROR })) as {
-      ok?: boolean; reason?: string;
-    };
-    if (!inj.ok) {
-      log(c.yellow(`  ⚠ inject 失败: ${inj.reason ?? "unknown"} — 可手动在 WeCom 发任意消息验证。`));
-    } else {
-      log(c.green("  ✓ demo 已注入,留意 WeCom 收到的按钮卡片。"));
+    log(`\n  ${c.bold("→ 现在去 WeCom 给机器人发一条消息(比如 \"hi\"):")}`);
+    log(c.dim("    inbound → openStream → 注入 tmux pane → 输出回流为打字机气泡"));
+    if (enableHook) {
+      log(c.dim("    若消息触发工具调用,会在 WeCom 推授权卡片"));
     }
     log(c.green("\n✅ 引导完成。后续可用 `weclaude status` / `weclaude logs -f` 观察。"));
     return;
@@ -282,11 +282,6 @@ const DEMO_PROMPT =
     "2. 用 Read 工具读取 ~/.weclaude/config.jsonc 的前 30 行,告诉我 wrc.mode 当前是什么值。",
     "3. 用一句话总结。",
   ].join("\n");
-
-// Mirror demo: short and tool-forcing — single Bash call so the user gets one
-// approval card to click, sees it run, and the assistant reply mirrors back.
-const DEMO_PROMPT_MIRROR =
-  "请用 Bash 运行 `ls ~/.weclaude/` ,然后用一句话告诉我看到了什么文件。";
 
 const runDemo = (claudeBin: string): Promise<void> =>
   new Promise((resolve) => {
