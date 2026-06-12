@@ -173,9 +173,9 @@ const renderInput = (
 const quoteArea = (text: string): TemplateCard["quote_area"] =>
   ({ type: 0, quote_text: text } as TemplateCard["quote_area"]);
 
-const SUB_DESC_MAX = 200;
-const subTitle = (desc?: string): { sub_title_text: string } | Record<string, never> =>
-  desc ? { sub_title_text: TRUNC(desc, SUB_DESC_MAX) } : {};
+const MAIN_DESC_MAX = 30;
+const mainTitle = (title: string, desc?: string): TemplateCard["main_title"] =>
+  desc ? { title, desc: TRUNC(desc, MAIN_DESC_MAX) } : { title };
 
 const dirName = (cwd: string): string => cwd.replace(/^.*\//, "") || cwd;
 
@@ -190,10 +190,7 @@ const buildCard = (a: CardArgs): TemplateCard => {
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: {
-      title: `🔐 授权 · ${a.toolName} · ${dir}/`,
-    },
-    ...subTitle(r.desc),
+    main_title: mainTitle(`🔐 授权 · ${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -247,10 +244,7 @@ const buildResolvedCard = (
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: {
-      title: `${a.toolName} · ${dir}/`,
-    },
-    ...subTitle(r.desc),
+    main_title: mainTitle(`${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -266,8 +260,7 @@ const buildCancelledCard = (a: CardArgs): TemplateCard => {
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `${a.toolName} · ${dir}/` },
-    ...subTitle(r.desc),
+    main_title: mainTitle(`${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -286,8 +279,7 @@ const buildAlreadyResolvedCard = (a: CardArgs): TemplateCard => {
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `${a.toolName} · ${dir}/` },
-    ...subTitle(r.desc),
+    main_title: mainTitle(`${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
