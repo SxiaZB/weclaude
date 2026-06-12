@@ -52,6 +52,12 @@ const stripMentions = (text: string): string => {
   return text.replace(/\s*@\S+\s*/u, " ").replace(/\s+/gu, " ").trim();
 };
 
+// DMs can't @ a bot — any "@" the user types is content (e.g. "@src/foo.ts"),
+// so we only strip mentions in group chats.
+const isGroup = (msg: BaseMessage): boolean => msg.chattype === "group" && !!msg.chatid;
+const maybeStripMentions = (msg: BaseMessage, text: string): string =>
+  isGroup(msg) ? stripMentions(text) : text;
+
 const isAllowed = (cfg: Config, principals: string[]): boolean => {
   if (cfg.wrc.allowFrom.length === 0) return false;
   // Tolerate invisible chars sneaking into hand-edited config (paste artifacts).
@@ -238,7 +244,7 @@ export const installInboundRouter = (
     const msg = frame.body;
     if (!msg) return;
     const raw = msg.text?.content ?? "";
-    const text = stripMentions(raw);
+    const text = maybeStripMentions(msg, raw);
     log.info({ msgid: msg.msgid, len: text.length }, "rx text");
     const { stop, who } = await gate(frame, msg, text);
     if (stop) return;
@@ -274,7 +280,7 @@ export const installInboundRouter = (
     let imgIdx = 0;
     for (const item of msg.mixed?.msg_item ?? []) {
       if (item.msgtype === "text" && item.text?.content) {
-        const t = stripMentions(item.text.content);
+        const t = maybeStripMentions(msg, item.text.content);
         if (t) texts.push(t);
       } else if (item.msgtype === "image" && item.image?.url) {
         const path = await downloadToInbox(
