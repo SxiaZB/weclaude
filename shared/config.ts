@@ -48,6 +48,9 @@ const Mirror = z.object({
   includeToolResults: z.boolean().default(false),
   // Truncate each tool_result body to this many chars.
   toolResultMaxChars: z.number().int().positive().default(400),
+  // 工具调用气泡里 `compact` 一行的最大字符数 (`🔧 Name <compact>` / `[• compact](url)`).
+  // 旧值 40 太窄, 长 bash / 长 file_path 直接被截掉; 抬到 120 兼顾可读与单行。
+  toolUseInlineMaxChars: z.number().int().positive().default(120),
   // Where inbound images/files from WeCom get saved before being pasted into
   // the live TTY. Files persist — claude reads them by absolute path.
   inboxDir: z.string().default("~/.weclaude/inbox"),

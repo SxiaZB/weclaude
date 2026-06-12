@@ -95,6 +95,7 @@ interface TailDeps {
   includeTools: boolean;
   includeToolResults: boolean;
   toolResultMaxChars: number;
+  toolUseInlineMaxChars: number;
   isOwnInject: (text: string) => boolean;
   onItem: (item: RenderItem) => void;
   /** Build a click-to-detail URL for a tool_use id; returns "" when disabled
@@ -228,14 +229,14 @@ const safeForMarkdown = (s: string): string =>
     .replace(/\[/g, "［")
     .replace(/\]/g, "］");
 
-const renderToolInputCompact = (input: unknown): string => {
+const renderToolInputCompact = (input: unknown, max: number): string => {
   // Heuristic: prefer command/file_path/pattern-like keys for the inline summary.
   if (input && typeof input === "object") {
     const o = input as Record<string, unknown>;
     const pick = o.command ?? o.file_path ?? o.path ?? o.pattern ?? o.url ?? o.query ?? o.prompt;
-    if (typeof pick === "string") return oneLineSummary(pick);
+    if (typeof pick === "string") return oneLineSummary(pick, max);
   }
-  return oneLineSummary(renderToolInput(input));
+  return oneLineSummary(renderToolInput(input), max);
 };
 
 // 渲染一组同名 tool_use:
@@ -250,7 +251,7 @@ const renderToolUseGroupBody = (
   deps: TailDeps,
 ): string => {
   const renderOne = (c: { toolUseId: string; input: unknown }): { compact: string; url: string } => ({
-    compact: safeForMarkdown(renderToolInputCompact(c.input)),
+    compact: safeForMarkdown(renderToolInputCompact(c.input, deps.toolUseInlineMaxChars)),
     url: deps.detailUrlFor(c.toolUseId),
   });
   if (calls.length === 1) {
@@ -1203,6 +1204,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       includeTools: cfg.wrc.mirror.includeTools,
       includeToolResults: cfg.wrc.mirror.includeToolResults,
       toolResultMaxChars: cfg.wrc.mirror.toolResultMaxChars,
+      toolUseInlineMaxChars: cfg.wrc.mirror.toolUseInlineMaxChars,
       isOwnInject,
       onItem: (item) => onItem(a, item),
       detailUrlFor,
@@ -1394,6 +1396,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       includeTools: cfg.wrc.mirror.includeTools,
       includeToolResults: cfg.wrc.mirror.includeToolResults,
       toolResultMaxChars: cfg.wrc.mirror.toolResultMaxChars,
+      toolUseInlineMaxChars: cfg.wrc.mirror.toolUseInlineMaxChars,
       isOwnInject,
       onItem: (item) => onItem(a, item),
       detailUrlFor,
