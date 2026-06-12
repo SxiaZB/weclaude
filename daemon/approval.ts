@@ -222,7 +222,7 @@ const resolvedButton = (
 ): { text: string; style: number; key: string } => {
   if (d === "allow_window") {
     return {
-      text: `${verbOf(d, windowMinutes)}(点击取消)`,
+      text: `${verbOf(d, windowMinutes)} · 点击取消`,
       style: 4,
       key: encodeCancelKey(sessionId),
     };
@@ -366,7 +366,7 @@ const buildBatchResolvedCard = (
   const tail = oneLine(transcriptTail).trim();
   const button = decision === "allow_window"
     ? {
-        text: `${verbOf(decision, batch.windowMinutes)}(点击取消)`,
+        text: `${verbOf(decision, batch.windowMinutes)} · 点击取消`,
         style: 4,
         key: encodeCancelKey(batch.sessionId),
       }
