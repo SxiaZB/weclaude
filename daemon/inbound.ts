@@ -42,8 +42,14 @@ const isNewCommand = (text: string): boolean => text.trim() === "/new";
 // Strip any "@<botname>" mention (leading, mid-text, or trailing) so it doesn't
 // leak into claude's prompt. WeCom may place the mention anywhere depending on
 // where the user typed it.
-const stripMentions = (text: string): string =>
-  text.replace(/\s*@\S+\s*/gu, " ").replace(/\s+/gu, " ").trim();
+// Safety: if the text contains more than one "@", it's ambiguous (user likely
+// also @'d a file path like "@src/foo.ts"), so leave it untouched rather than
+// risk eating the path.
+const stripMentions = (text: string): string => {
+  const atCount = (text.match(/@/gu) ?? []).length;
+  if (atCount !== 1) return text;
+  return text.replace(/\s*@\S+\s*/u, " ").replace(/\s+/gu, " ").trim();
+};
 
 const isAllowed = (cfg: Config, principals: string[]): boolean => {
   if (cfg.wrc.allowFrom.length === 0) return false;
