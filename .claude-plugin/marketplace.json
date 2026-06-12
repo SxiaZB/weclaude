@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "weclaude",
-      "source": ".",
+      "source": "./",
       "description": "Remote-control Claude Code from WeCom (/wrc).",
       "category": "productivity"
     }
