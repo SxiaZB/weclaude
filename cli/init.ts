@@ -214,7 +214,7 @@ const DEMO_PROMPT = (chat: string): string =>
     "请按顺序执行，不要输出多余解释：",
     "1. 用 Bash 运行 `echo hello world from weclaude`。",
     "2. 用 Bash 运行 `sleep 3`。",
-    `3. 用 mcp 工具 \`wecom__send_markdown\` 向 chat="${chat}" 发送 content="✅ weclaude 演示完成：hello world"。`,
+    `3. 用 mcp 工具 \`weclaude__send_markdown\` 向 chat="${chat}" 发送 content="✅ weclaude 演示完成：hello world"。`,
   ].join("\n");
 
 const runDemo = (chat: string, claudeBin: string): Promise<void> =>

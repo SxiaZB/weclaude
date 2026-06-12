@@ -166,8 +166,6 @@ weclaude uninstall           # 完整卸载（先于 npm uninstall）
 **Q: 多机部署？**
 `config.jsonc` 可以纳入 dotfiles；`secrets.json` 每台机器独立填。第二台机器跑 `weclaude init` 会跳过覆盖提示，但仍要重新走 claim 步骤拿本机 IM principal。
 
-更多排错见 [docs/ONBOARDING.md](docs/ONBOARDING.md)。
-
 ---
 
 ## 架构一瞥
@@ -185,14 +183,6 @@ weclaude uninstall           # 完整卸载（先于 npm uninstall）
 daemon 是**唯一**持有 WeCom WS 连接的进程，hook 和 MCP 都是它的薄 HTTP 客户端。
 
 详情看 [CLAUDE.md](CLAUDE.md)。
-
----
-
-## 文档
-
-- [docs/ONBOARDING.md](docs/ONBOARDING.md) — 上手细节、排错、多机部署
-- [docs/DESIGN-INIT.md](docs/DESIGN-INIT.md) — `init` 流程的设计取舍
-- [CLAUDE.md](CLAUDE.md) — 给 Claude Code 看的项目地图
 
 ## License
 

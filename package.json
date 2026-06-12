@@ -41,8 +41,6 @@
     "commands/wrc.md",
     "README.md",
     "CLAUDE.md",
-    "docs/ONBOARDING.md",
-    "docs/DESIGN-INIT.md",
     "LICENSE"
   ],
   "scripts": {

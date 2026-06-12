@@ -9,3 +9,4 @@ dist
 config.local.jsonc
 secrets.json
 .npmrc
+docs/
