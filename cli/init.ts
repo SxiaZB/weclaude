@@ -7,13 +7,11 @@
 //      install resident daemon.
 //   4. Arm bootstrap claim. Wait for the user to send a magic phrase in IM.
 //      That message bypasses allowFrom, sets defaultChat, and adds the sender.
-//   5. Demo: spawn `claude -p` with a prompt that exercises Bash → triggers
-//      approval card → sleeps → sends final markdown via MCP. End-to-end smoke.
+//   5. Mirror 模式下:拉起 tmux+claude pane,提示用户在 WeCom 发首条消息。
 import { existsSync, readFileSync } from "node:fs";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
 import { input, password, select, confirm } from "@inquirer/prompts";
 import { patchJsonc } from "../shared/config-writer.js";
 import { expandHome } from "../shared/paths.js";
@@ -225,33 +223,28 @@ const main = async (): Promise<void> => {
   }
   log(c.green(`\n  ✓ 已绑定: ${c.bold(claimed)}`));
 
-  // ── Step 3: live demo ──────────────────────────────────────────
-  step(3, "授权转发演示");
-  if (!enableHook) {
-    log(c.yellow("  hook 未启用 — 跳过授权演示。"));
-    log(c.green("\n✅ 引导完成。"));
-    return;
-  }
-  if (wrcMode === "mirror") {
-    // Mirror 路径:拉起 tmux+claude pane,然后让用户在 WeCom 发首条消息。
-    // 首条 inbound 走完整 dispatch 链路:openStream → 注入 tmux → tail 回流为
-    // 打字机气泡。比 frame-less /mirror/inject 体验好得多(后者无 liveStream)。
-    log(c.dim("  正在拉起 tmux+claude pane (mirror 模式) ..."));
-    const r = (await post("/mirror/spawn", { target: claimed })) as {
-      ok?: boolean; reason?: string; tmuxSession?: string; tmuxPane?: string; sessionId?: string;
-    };
-    if (!r.ok) {
-      log(c.red(`  ✗ /mirror/spawn 失败: ${r.reason ?? "unknown"}`));
-      log(c.yellow("  可手动: tmux new-session -s weclaude 后跑 claude;或在 WeCom 发任意消息触发 auto-spawn。"));
-      return;
-    }
-    log(c.green(`  ✓ tmux session=${c.bold(r.tmuxSession ?? "")} pane=${r.tmuxPane ?? ""} sid=${r.sessionId ?? ""}`));
-    log(c.dim(`  附加: tmux attach -t ${r.tmuxSession ?? "weclaude"}`));
-    log(`\n  ${c.bold("→ 现在去 WeCom 给机器人发一条消息(比如 \"hi\"):")}`);
-    log(c.dim("    inbound → openStream → 注入 tmux pane → 输出回流为打字机气泡"));
+  // ── Step 3: spin up mirror pane ────────────────────────────────
+  step(3, "拉起 mirror 会话");
+  if (!enableHook || wrcMode !== "mirror") {
     log(c.green("\n✅ 引导完成。后续可用 `weclaude status` / `weclaude logs -f` 观察。"));
     return;
   }
+  // Mirror 路径:拉起 tmux+claude pane,然后让用户在 WeCom 发首条消息。
+  // 首条 inbound 走完整 dispatch 链路:openStream → 注入 tmux → tail 回流为
+  // 打字机气泡。比 frame-less /mirror/inject 体验好得多(后者无 liveStream)。
+  log(c.dim("  正在拉起 tmux+claude pane (mirror 模式) ..."));
+  const r = (await post("/mirror/spawn", { target: claimed })) as {
+    ok?: boolean; reason?: string; tmuxSession?: string; tmuxPane?: string; sessionId?: string;
+  };
+  if (!r.ok) {
+    log(c.red(`  ✗ /mirror/spawn 失败: ${r.reason ?? "unknown"}`));
+    log(c.yellow("  可手动: tmux new-session -s weclaude 后跑 claude;或在 WeCom 发任意消息触发 auto-spawn。"));
+    return;
+  }
+  log(c.green(`  ✓ tmux session=${c.bold(r.tmuxSession ?? "")} pane=${r.tmuxPane ?? ""} sid=${r.sessionId ?? ""}`));
+  log(c.dim(`  附加: tmux attach -t ${r.tmuxSession ?? "weclaude"}`));
+  log(`\n  ${c.bold("→ 现在去 WeCom 给机器人发一条消息(比如 \"hi\"):")}`);
+  log(c.dim("    inbound → openStream → 注入 tmux pane → 输出回流为打字机气泡"));
   log(c.green("\n✅ 引导完成。后续可用 `weclaude status` / `weclaude logs -f` 观察。"));
 };
 
@@ -268,27 +261,6 @@ const pollClaim = async (timeoutMs: number): Promise<string | undefined> => {
   }
   return undefined;
 };
-
-const DEMO_PROMPT =
-  [
-    "请按顺序执行,不要输出多余解释:",
-    "1. 用 Bash 工具运行 `ls ~/.weclaude/` 看一下 weclaude 的状态目录里都有哪些文件。",
-    "2. 用 Read 工具读取 ~/.weclaude/config.jsonc 的前 30 行,告诉我 wrc.mode 当前是什么值。",
-    "3. 用一句话总结。",
-  ].join("\n");
-
-const runDemo = (claudeBin: string): Promise<void> =>
-  new Promise((resolve) => {
-    const proc = spawn(claudeBin, ["-p", DEMO_PROMPT], {
-      stdio: ["ignore", "inherit", "inherit"],
-      env: { ...process.env, HOME: process.env.HOME ?? homedir() },
-    });
-    proc.on("close", () => resolve());
-    proc.on("error", (e) => {
-      log(c.red(`  demo spawn 失败: ${e.message}`));
-      resolve();
-    });
-  });
 
 main().catch((e) => {
   // eslint-disable-next-line no-console
