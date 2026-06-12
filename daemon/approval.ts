@@ -1097,22 +1097,51 @@ export const installApprovalEventListener = (
           return;
         }
         const snap = getResolvedSnapshot(reqId);
-        try {
-          await client.updateTemplateCard(
-            frame,
-            buildAlreadyResolvedCard({
+        // 没拍到快照 (daemon 重启 / TTL 过期) — 任何 update 都会用空字段把
+        // 原卡覆盖成 "授权 · /" + "已经放行", 比保留原卡更糟, 直接放弃。
+        if (!snap) {
+          log.info({ reqId }, "noop click but snapshot missing — skip update");
+          return;
+        }
+        const meta = snap.meta;
+        const toolInputStr = (() => {
+          try { return JSON.stringify(meta.toolInput ?? {}, null, 2); }
+          catch { return String(meta.toolInput); }
+        })();
+        const sessionShort = meta.sessionId ? meta.sessionId.slice(-8) : "?";
+        // allow_window 的 resolved 卡用 cancel 按钮, 理论不会进 noop;
+        // 真撞上(SDK 行为变更等)兜底渲染成「已经放行」, 别画出会取消整窗口
+        // 的「点击取消」按钮误导用户。其它 decision 用 buildResolvedCard
+        // 保留 "✅ 已通过" / "❌ 已拒绝" / "本会话通过" 原文案。
+        const card = snap.decision === "allow_window"
+          ? buildAlreadyResolvedCard({
               reqId: cbTaskId || reqId,
-              toolName: snap?.meta.toolName ?? "授权",
-              toolInput: snap?.meta.toolInput ?? {},
-              toolInputStr: "",
-              cwd: snap?.meta.cwd ?? "",
-              sessionShort: snap?.meta.sessionId ? snap.meta.sessionId.slice(-8) : "?",
-              transcriptTail: snap?.meta.transcriptTail ?? "",
+              toolName: meta.toolName ?? "授权",
+              toolInput: meta.toolInput ?? {},
+              toolInputStr,
+              cwd: meta.cwd ?? "",
+              sessionShort,
+              transcriptTail: meta.transcriptTail ?? "",
               windowMinutes: cfg.approval.windowMinutes,
               detailUrl: detailUrlFor(reqId),
-            }),
-          );
-          log.info({ reqId }, "noop click — already-resolved card refreshed");
+            })
+          : buildResolvedCard({
+              reqId: cbTaskId || reqId,
+              toolName: meta.toolName ?? "授权",
+              toolInput: meta.toolInput,
+              toolInputStr,
+              cwd: meta.cwd ?? "",
+              sessionShort,
+              transcriptTail: meta.transcriptTail ?? "",
+              windowMinutes: cfg.approval.windowMinutes,
+              decision: snap.decision,
+              by: frame.body?.from?.userid ?? "?",
+              sessionId: meta.sessionId ?? "",
+              detailUrl: detailUrlFor(reqId),
+            });
+        try {
+          await client.updateTemplateCard(frame, card);
+          log.info({ reqId, decision: snap.decision }, "noop click — resolved card refreshed");
         } catch (e) {
           log.warn({ err: (e as Error).message, reqId }, "updateTemplateCard (noop) failed");
         }
@@ -1189,11 +1218,16 @@ export const installApprovalEventListener = (
         }
       })();
       const sessionShort = meta?.sessionId ? meta.sessionId.slice(-8) : "?";
-      // snap 命中 = 这张卡已被 sweep / 重复点击, 没有真正状态变更, 渲染成
-      // 「已经放行」而不是再画一遍 allow_window「点击取消」按钮 — 否则用户
-      // 在被批量放行的卡上会看到一个会去取消整个窗口的按钮, 误导。
+      // snap 命中分支拆开判:
+      //  - snap.decision == allow_window → 这张卡是被 sweep 提前放行的"鬼卡",
+      //    渲染「已经放行」, 别画 allow_window 的「点击取消」 — 不然用户在被
+      //    批量放行的卡上点一下就会误取消整个自动窗口。
+      //  - 其它 decision → 已是 resolvePending 留下的快照(普通 resolve 也 stash),
+      //    用 buildResolvedCard 重画原文案 ("✅ 已通过" / "❌ 已拒绝" / 本会话通过),
+      //    避免降级到信息量更少的「已经放行」。
+      const isSwept = Boolean(snap && snap.decision === "allow_window");
       try {
-        const card = snap
+        const card = isSwept
           ? buildAlreadyResolvedCard({
               reqId: cbTaskId || reqId,
               toolName: meta?.toolName ?? "授权",

@@ -50,6 +50,9 @@ export const resolvePending = (reqId: string, decision: Decision): boolean => {
   if (!p) return false;
   clearTimeout(p.timer);
   store.delete(reqId);
+  // 留 meta + 真实 decision 给后续 noop 再点的 visual ack 渲染用 —
+  // 没这个就只能用空 meta 把卡面糊成 "授权 · /" + "已经放行"。
+  stashResolved(reqId, p.meta, decision);
   p.resolve(decision);
   return true;
 };
