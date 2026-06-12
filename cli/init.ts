@@ -146,7 +146,7 @@ const main = async (): Promise<void> => {
       { name: "claude-internal (Tencent 内部)", value: "claude-internal" },
       { name: "自定义路径", value: "custom" },
     ],
-    default: "claude-internal",
+    default: "claude",
   })) as AgentKind;
   const customSettings =
     agentKind === "custom"
