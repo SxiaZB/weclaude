@@ -1090,6 +1090,12 @@ export const installApprovalEventListener = (
       // Noop branch: 卡片已 resolved, 用户再次点击 — 给一次视觉反馈。
       if (decoded.noopReqId !== undefined) {
         const reqId = decoded.noopReqId;
+        // 终态: 已取消自动通过 (noop:cancelled:<id>) — 卡面已经是最终形态,
+        // 再点不要触发 buildAlreadyResolvedCard 把内容糊成"已经放行" 空卡。
+        if (reqId.startsWith("cancelled:")) {
+          log.info({ key }, "cancelled card re-click — terminal, no update");
+          return;
+        }
         const snap = getResolvedSnapshot(reqId);
         try {
           await client.updateTemplateCard(
