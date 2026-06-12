@@ -205,7 +205,7 @@ const buildCard = (a: CardArgs): TemplateCard => {
 const verbOf = (d: Decision, windowMinutes: number): string => {
   switch (d) {
     case "deny": return "已拒绝";
-    case "allow_window": return `${windowMinutes}min会话内通过所有`;
+    case "allow_window": return `${windowMinutes}min会话内全过`;
     case "allow_session": return "本会话通过";
     default: return "已通过";
   }

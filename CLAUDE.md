@@ -22,10 +22,12 @@ There are **no tests**. Don't fabricate test commands.
 
 Local dev loop:
 ```bash
-npm run build && weclaude reload    # rebuild, then bounce the resident daemon
-weclaude logs -f                    # tail ~/.weclaude/daemon.log
-weclaude status                     # HTTP /status — wsConnected, pending count, sourcePath
+npm run build && ./cli/weclaude.sh reload    # rebuild, then bounce the resident daemon
+./cli/weclaude.sh logs -f                    # tail ~/.weclaude/daemon.log
+./cli/weclaude.sh status                     # HTTP /status — wsConnected, pending count, sourcePath
 ```
+
+When the user says **"reload"** in this repo, it means exactly: `npm run build && ./cli/weclaude.sh reload`. The global `weclaude` binary may not be on `$PATH` in dev shells — always invoke `./cli/weclaude.sh` from the repo root.
 
 ## High-level architecture
 
