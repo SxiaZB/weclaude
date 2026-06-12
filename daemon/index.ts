@@ -132,6 +132,39 @@ const main = async (): Promise<void> => {
       const r = await m.injectText(target, text);
       json(res, r.ok ? 200 : 500, r);
     });
+    // Per-chat project-path binding. POST sets the "next" cwd that /new (and
+    // /clear with mismatch) will spawn in; GET reads the current bindings.
+    // Resolved target precedence: explicit body.target → sessionId-derived
+    // (so MCP can omit it) → cfg.defaultChat. Sender of the call (MCP) is
+    // typically running inside a claude that's already attached, so passing
+    // sessionId is the cleanest way to identify the right chat.
+    http.register("POST /mirror/cwd", async (req, res) => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as Partial<{ target: string; sessionId: string; cwd: string }>;
+      const cwd = (body.cwd ?? "").toString();
+      let target = (body.target ?? "").trim();
+      if (!target && body.sessionId) {
+        const t = m.targetForSession(body.sessionId.trim());
+        if (t) target = t;
+      }
+      if (!target) target = (cfg.defaultChat ?? "").trim();
+      if (!target) { json(res, 400, { ok: false, reason: "target required (or pass sessionId of an attached chat)" }); return; }
+      if (!cwd) { json(res, 400, { ok: false, reason: "cwd required" }); return; }
+      const r = m.setPendingCwd(target, cwd);
+      json(res, r.ok ? 200 : 400, { ...r, target });
+    });
+    http.register("GET /mirror/cwd", async (req, res) => {
+      const u = new URL(req.url ?? "", "http://x");
+      let target = (u.searchParams.get("target") ?? "").trim();
+      const sid = (u.searchParams.get("sessionId") ?? "").trim();
+      if (!target && sid) {
+        const t = m.targetForSession(sid);
+        if (t) target = t;
+      }
+      if (!target) target = (cfg.defaultChat ?? "").trim();
+      if (!target) { json(res, 400, { ok: false, reason: "target required (or pass sessionId)" }); return; }
+      json(res, 200, { ok: true, target, ...m.getCwd(target) });
+    });
   }
 
   const shutdown = async (signal: string): Promise<void> => {

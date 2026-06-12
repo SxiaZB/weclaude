@@ -818,6 +818,11 @@ export interface AttachArgs {
   tmuxPane?: string;
   /** tmux session name (e.g. `weclaude-xxx`). Persisted so a reload can re-derive a fresh paneId for the same session. */
   tmuxSession?: string;
+  /** Cwd the live pane is running in. Persisted so /pwd can show truth and
+   *  /clear can detect mismatch. Empty → cfg.wrc.cwd. */
+  cwd?: string;
+  /** User-requested next cwd (carry-over on re-attach). */
+  pendingCwd?: string;
 }
 
 export interface AttachResult {
@@ -861,6 +866,16 @@ export interface MirrorBridge {
    *  Claude is currently doing (active generation / open prompt). No-op for
    *  spawn-mode attachments (no live TTY to interrupt). */
   interruptPane: (target: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** Cwd lifecycle for the chat-bound project path. `getCwd` returns
+   *  `{ runningCwd, pendingCwd, defaultCwd }` so /pwd can render all three
+   *  truthfully. `setPendingCwd` writes the user-requested next cwd into the
+   *  store; `clearPendingCwd` is called by the bridge after a /new spawn lands. */
+  getCwd: (target: string) => { runningCwd: string; pendingCwd: string; defaultCwd: string };
+  setPendingCwd: (target: string, cwd: string) => { ok: boolean; reason?: string; runningCwd: string; pendingCwd: string };
+  /** Detach + respawn a target's pane in `cfg.wrc.cwd` or its pendingCwd
+   *  override. Used by /new to give the user a fresh claude in the bound
+   *  project. Returns the new attachment result. */
+  newSession: (target: string, windowName?: string) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
 }
 
 interface ToolEntry {
@@ -897,6 +912,13 @@ interface AttachState {
   tmuxPane: string;
   /** tmux session name; kept so we can re-derive `tmuxPane` after a daemon reload (pane ids aren't stable across the daemon process). */
   tmuxSession: string;
+  /** Cwd the live pane was actually spawned/respawned in (post-expandHome).
+   *  Diverges from `pendingCwd` when the user has requested a switch but
+   *  hasn't yet hit /new — /clear bridges the gap by upgrading to /new. */
+  runningCwd: string;
+  /** User-requested next cwd (set via set_project_path MCP tool). Applied at
+   *  next /new (or /clear → upgraded to /new). Cleared after the spawn. */
+  pendingCwd: string;
   tail: TailHandle;
   liveStream?: ActiveStream;
   /** Per-attachment FIFO so standalone pushes from the same mirror stay ordered. */
@@ -1173,7 +1195,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       ? buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id)
       : "";
 
-  const attach = ({ sessionId, jsonlPath, target: targetOverride, tmuxPane, tmuxSession }: AttachArgs): AttachResult => {
+  const attach = ({ sessionId, jsonlPath, target: targetOverride, tmuxPane, tmuxSession, cwd, pendingCwd }: AttachArgs): AttachResult => {
     const target = resolveTarget(targetOverride);
     if (!target) return { ok: false, reason: "no target chat (set wrc.mirror.pushChat or defaultChat, or pass target)" };
     // Note: jsonlPath may not exist yet on the auto-spawn path — claude only
@@ -1186,6 +1208,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const prevBySid = bySessionId.get(sessionId);
     if (prevBySid) detach(prevBySid, "sessionId reattach");
     const prevByTarget = byTarget.get(target);
+    // Carry over pending request only when caller didn't explicitly say
+    // otherwise. `undefined` (omitted) → carry from prev (re-attach case);
+    // `""` → explicit clear (newSession just consumed it); `"/foo"` → set.
+    const carryPending = pendingCwd !== undefined ? pendingCwd : (prevByTarget?.pendingCwd ?? "");
     if (prevByTarget) detach(prevByTarget, "target reassigned");
     // Build the attachment first so the tail's onItem closure can capture it.
     const a: AttachState = {
@@ -1194,6 +1220,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       target,
       tmuxPane: (tmuxPane ?? "").trim(),
       tmuxSession: (tmuxSession ?? "").trim(),
+      runningCwd: expandHome(((cwd ?? "").trim()) || cfg.wrc.cwd),
+      pendingCwd: carryPending,
       tail: { stop: () => undefined }, // placeholder; replaced below
       standalonePending: Promise.resolve(),
     };
@@ -1218,8 +1246,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       jsonlPath,
       tmuxSession: a.tmuxSession || undefined,
       tmuxPane: a.tmuxPane || undefined,
+      cwd: a.runningCwd || undefined,
+      pendingCwd: a.pendingCwd || undefined,
     });
-    log.info({ sessionId, jsonlPath, target, tmuxSession: a.tmuxSession, mirrors: bySessionId.size }, "mirror attached");
+    log.info({ sessionId, jsonlPath, target, tmuxSession: a.tmuxSession, runningCwd: a.runningCwd, pendingCwd: a.pendingCwd, mirrors: bySessionId.size }, "mirror attached");
     return { ok: true, sessionId, jsonlPath, target };
   };
 
@@ -1273,6 +1303,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       target: principal,
       tmuxPane: livePane,
       tmuxSession: rec.tmuxSession ?? "",
+      cwd: rec.cwd,
+      pendingCwd: rec.pendingCwd,
     });
     if (!r.ok) {
       log.warn({ principal, reason: r.reason }, "mirror restore: re-attach failed");
@@ -1413,6 +1445,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       jsonlPath: newJsonlPath,
       tmuxSession: a.tmuxSession || undefined,
       tmuxPane: a.tmuxPane || undefined,
+      cwd: a.runningCwd || undefined,
+      pendingCwd: a.pendingCwd || undefined,
     });
     log.info({ target: a.target, oldSessionId, newSessionId, oldJsonlPath, newJsonlPath }, "mirror migrated post-/clear");
   };
@@ -1465,6 +1499,126 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     timer = setTimeout(tick, POLL_MS);
   };
 
+  // ── Cwd lifecycle ───────────────────────────────────────────────────
+  // Per-chat project path. Stored on the attachment (live) and persisted to
+  // mirror-attachments.json so /pwd survives reload. `pendingCwd` is the
+  // user-requested next cwd — applied only on /new (or /clear when it differs
+  // from the running cwd). Decoupling means /pwd can show truth even after
+  // the AI sets a new path but the user hasn't /new'd yet.
+  const expandedDefaultCwd = expandHome(cfg.wrc.cwd);
+
+  const renderProjectInfo = (target: string): string => {
+    const a = byTarget.get(target);
+    const rec = a ? undefined : deps.store.get(target);
+    const running = (a?.runningCwd?.trim()) || rec?.cwd?.trim() || expandedDefaultCwd;
+    const pending = (a?.pendingCwd?.trim()) || rec?.pendingCwd?.trim() || "";
+    const lines = [`📂 当前项目: \`${running}\``];
+    if (pending && pending !== running) {
+      lines.push(`下次切换: \`${pending}\` (使用 /new 或 /clear 生效)`);
+    }
+    lines.push("> 切换其他项目: 在对话中告诉 AI 调用 `set_project_path` MCP 工具");
+    return lines.join("\n");
+  };
+
+  const pushProjectInfo = (target: string): void => {
+    const md = renderProjectInfo(target);
+    const a = byTarget.get(target);
+    if (a) {
+      sendStandalone(a, md);
+      return;
+    }
+    // No attachment (rare — newSession always re-attaches before pushing).
+    // Send via plain sendMessage so the user still gets the info.
+    const chatId = stripPrincipalPrefix(target);
+    void client
+      .sendMessage(chatId, { msgtype: "markdown", markdown: { content: md } })
+      .catch((e: unknown) => log.warn({ err: (e as Error).message, target }, "pushProjectInfo (no attach) failed"));
+  };
+
+  // /new path: kill the old pane (so we don't leak orphan tmux windows) and
+  // spawn a fresh claude in pendingCwd ?? runningCwd ?? default. Returns the
+  // new sessionId/cwd so callers can render the user-facing reply.
+  const newSession = async (
+    target: string,
+    windowName?: string,
+  ): Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }> => {
+    const prev = byTarget.get(target);
+    // Honor persisted cwd/pendingCwd when no live attachment yet — otherwise
+    // a fresh-chat /new in a daemon-just-rebooted state would lose the user's
+    // bound project. Same precedence as getCwd: live > stored, pending > running.
+    const rec = !prev ? deps.store.get(target) : undefined;
+    const eff =
+      (prev?.pendingCwd?.trim()) ||
+      (rec?.pendingCwd?.trim()) ||
+      (prev?.runningCwd?.trim()) ||
+      (rec?.cwd?.trim()) ||
+      expandedDefaultCwd;
+    if (prev?.tmuxPane) {
+      // Best-effort kill; ignore errors (pane may already be dead).
+      void tmuxRun(["kill-pane", "-t", prev.tmuxPane]);
+    }
+    if (prev) detach(prev, "/new respawn");
+    const r = await spawnTmuxClaude({
+      cfg,
+      log: log.child({ sub: "new-session", target }),
+      windowName: windowName ?? target,
+      cwdOverride: eff,
+    });
+    if (!r.ok) return { ok: false, reason: r.reason };
+    const att = attach({
+      sessionId: r.sessionId!,
+      jsonlPath: r.jsonlPath!,
+      target,
+      tmuxPane: r.tmuxPane,
+      tmuxSession: r.tmuxSession,
+      cwd: r.cwd,
+      // Explicit "" clears any carried-over pending — it has just been applied.
+      pendingCwd: "",
+    });
+    if (!att.ok) return { ok: false, reason: att.reason };
+    pushProjectInfo(target);
+    return { ok: true, sessionId: r.sessionId, cwd: r.cwd };
+  };
+
+  const getCwd = (target: string): { runningCwd: string; pendingCwd: string; defaultCwd: string } => {
+    const a = byTarget.get(target);
+    if (a) return { runningCwd: a.runningCwd || expandedDefaultCwd, pendingCwd: a.pendingCwd || "", defaultCwd: expandedDefaultCwd };
+    const rec = deps.store.get(target);
+    if (rec) return { runningCwd: rec.cwd?.trim() || expandedDefaultCwd, pendingCwd: rec.pendingCwd?.trim() || "", defaultCwd: expandedDefaultCwd };
+    return { runningCwd: expandedDefaultCwd, pendingCwd: "", defaultCwd: expandedDefaultCwd };
+  };
+
+  const setPendingCwd = (
+    target: string,
+    cwd: string,
+  ): { ok: boolean; reason?: string; runningCwd: string; pendingCwd: string } => {
+    const trimmed = (cwd ?? "").trim();
+    if (!trimmed) return { ok: false, reason: "empty cwd", runningCwd: "", pendingCwd: "" };
+    const expanded = expandHome(trimmed);
+    if (!expanded.startsWith("/")) return { ok: false, reason: "cwd must be absolute (or start with ~)", runningCwd: "", pendingCwd: "" };
+    const a = byTarget.get(target);
+    if (a) {
+      a.pendingCwd = expanded;
+      deps.store.set(target, {
+        sessionId: a.sessionId,
+        jsonlPath: a.jsonlPath,
+        tmuxSession: a.tmuxSession || undefined,
+        tmuxPane: a.tmuxPane || undefined,
+        cwd: a.runningCwd || undefined,
+        pendingCwd: a.pendingCwd || undefined,
+      });
+      log.info({ target, runningCwd: a.runningCwd, pendingCwd: a.pendingCwd }, "setPendingCwd (live attach)");
+      return { ok: true, runningCwd: a.runningCwd, pendingCwd: a.pendingCwd };
+    }
+    const rec = deps.store.get(target);
+    if (rec) {
+      deps.store.set(target, { ...rec, pendingCwd: expanded });
+      log.info({ target, runningCwd: rec.cwd, pendingCwd: expanded }, "setPendingCwd (persisted only)");
+      return { ok: true, runningCwd: rec.cwd?.trim() || expandedDefaultCwd, pendingCwd: expanded };
+    }
+    return { ok: false, reason: "no mirror binding for target — send a message in the WeCom chat first", runningCwd: "", pendingCwd: "" };
+  };
+
   return {
     attach,
     status: () => {
@@ -1509,11 +1663,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const paneAlive = a.tmuxPane ? await tmuxPaneAlive(a.tmuxPane) : false;
       if (!paneAlive) {
         log.warn({ target, sessionId: sid, oldPane: a.tmuxPane }, "injectText: pane not alive, respawning");
-        const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn-init", sessionId: sid }), resumeSessionId: sid, windowName: target });
+        const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn-init", sessionId: sid }), resumeSessionId: sid, windowName: target, cwdOverride: a.runningCwd });
         if (!r.ok || !r.tmuxPane) return { ok: false, reason: `respawn failed: ${r.reason ?? "unknown"}` };
         a.tmuxPane = r.tmuxPane;
         a.tmuxSession = r.tmuxSession ?? a.tmuxSession;
-        deps.store.set(target, { sessionId: sid, jsonlPath: a.jsonlPath, tmuxSession: a.tmuxSession, tmuxPane: a.tmuxPane });
+        if (r.cwd) a.runningCwd = r.cwd;
+        deps.store.set(target, { sessionId: sid, jsonlPath: a.jsonlPath, tmuxSession: a.tmuxSession, tmuxPane: a.tmuxPane, cwd: a.runningCwd || undefined, pendingCwd: a.pendingCwd || undefined });
       }
       // freshSpawn: true — the pane was just minted by /mirror/spawn, the TUI
       // is still warming up so the verifier in injectViaTmux needs the slack.
@@ -1533,6 +1688,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /stop — Esc sent to pane");
       return { ok: true };
     },
+    getCwd,
+    setPendingCwd,
+    newSession,
     shutdown: () => {
       for (const a of bySessionId.values()) {
         if (a.liveStream && !a.liveStream.closed) void finalizeStream(a, a.liveStream);
@@ -1566,6 +1724,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // own message bubble. Then open a fresh stream tied to the new frame and
       // ack immediately so WeCom doesn't time out while inject queues.
       const armMigration = isClearCommand(text);
+      // Auto-upgrade /clear → /new when the user has queued a project switch:
+      // a plain /clear would only rotate sessionId in the same pane, which sits
+      // in the OLD cwd. Killing+respawning is the only way to honor the switch.
+      const pending = (a.pendingCwd ?? "").trim();
+      if (armMigration && pending && pending !== a.runningCwd) {
+        if (a.liveStream && !a.liveStream.closed) await finalizeStream(a, a.liveStream);
+        log.info({ target: a.target, runningCwd: a.runningCwd, pendingCwd: pending }, "/clear upgraded to /new (cwd switch)");
+        const r = await newSession(a.target, a.target);
+        if (!r.ok) {
+          try { await client.replyStream(frame, streamId, `[mirror] 切换失败: ${r.reason ?? "unknown"}`, true); } catch { /* ignore */ }
+        }
+        return;
+      }
       // Snapshot the project dir BEFORE inject runs. Claude rotates the session
       // synchronously while processing /clear and writes the rotated jsonl
       // immediately — capturing baseline post-inject would already include it,
@@ -1600,16 +1771,21 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         let freshSpawn = false;
         if (!paneAlive) {
           log.warn({ target: a.target, sessionId: sid, oldPane: a.tmuxPane, oldSession: a.tmuxSession }, "mirror: no live tmux pane, respawning");
-          const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn", sessionId: sid }), resumeSessionId: sid, windowName: a.target });
+          // Respawn in the binding's runningCwd (pendingCwd doesn't apply to a
+          // mid-turn reincarnation — only /new and /clear-with-pending swap cwd).
+          const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn", sessionId: sid }), resumeSessionId: sid, windowName: a.target, cwdOverride: a.runningCwd });
           if (r.ok && r.tmuxPane && r.tmuxSession) {
             a.tmuxPane = r.tmuxPane;
             a.tmuxSession = r.tmuxSession;
+            if (r.cwd) a.runningCwd = r.cwd;
             freshSpawn = true;
             deps.store.set(a.target, {
               sessionId: sid,
               jsonlPath: a.jsonlPath,
               tmuxSession: a.tmuxSession,
               tmuxPane: a.tmuxPane,
+              cwd: a.runningCwd || undefined,
+              pendingCwd: a.pendingCwd || undefined,
             });
             log.info({ target: a.target, sessionId: sid, newPane: a.tmuxPane, newSession: a.tmuxSession }, "mirror: tmux respawned");
           } else {
@@ -1646,6 +1822,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // feedback (the skip-stream path otherwise leaves WeCom silent).
         if (armMigration) {
           sendStandalone(a, "cleared");
+          pushProjectInfo(a.target);
           startMigrationWatcher(a, preClearBaseline!);
         }
         // Don't await the stream's lifetime — it stays open until next inbound

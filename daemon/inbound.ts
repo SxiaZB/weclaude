@@ -9,7 +9,6 @@ import type { Bridge } from "./cc-bridge.js";
 import type { MirrorBridge } from "./mirror-bridge.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
 import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim } from "./claim.js";
-import { spawnTmuxClaude } from "./spawn-tmux.js";
 
 // Chat-binding key: stable id for "this conversation thread". Used as
 // session-map key, mirror target, defaultChat. NOT used for auth.
@@ -37,6 +36,7 @@ const renderIds = (msg: BaseMessage): string => {
 };
 
 const isIdCommand = (text: string): boolean => text.trim() === "/id";
+const isPwdCommand = (text: string): boolean => text.trim() === "/pwd";
 const isNewCommand = (text: string): boolean => text.trim() === "/new";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 
@@ -114,21 +114,32 @@ export const installInboundRouter = (
 ): void => {
   const inboxDir = expandHome(cfg.wrc.mirror.inboxDir);
 
-  // Mirror-only auto-spawn: create a fresh tmux+claude and attach it to `who`.
-  // Returns the user-facing status string; void when not in mirror mode.
+  // Render /pwd output. Mirror mode reads the live attachment + persisted
+  // store via bridge.getCwd; headless mode has no per-chat cwd, so it just
+  // shows cfg.wrc.cwd as the global default.
+  const renderPwd = (who: string): string => {
+    if ("getCwd" in bridge) {
+      const { runningCwd, pendingCwd, defaultCwd } = bridge.getCwd(who);
+      const lines = [`[weclaude] 📂 当前项目: \`${runningCwd}\``];
+      if (pendingCwd && pendingCwd !== runningCwd) {
+        lines.push(`下次切换: \`${pendingCwd}\` (使用 /new 或 /clear 生效)`);
+      }
+      if (runningCwd !== defaultCwd) lines.push(`(默认: \`${defaultCwd}\`)`);
+      lines.push("> 切换其他项目: 让 AI 调用 `set_project_path` MCP 工具");
+      return lines.join("\n");
+    }
+    return `[weclaude] 📂 当前项目: \`${expandHome(cfg.wrc.cwd)}\` (headless mode, 全局默认)`;
+  };
+
+  // Mirror-only auto-spawn / /new helper. Routes through bridge.newSession
+  // which kills the old pane, spawns fresh in pendingCwd ?? runningCwd ??
+  // default, attaches, and pushes "📂 当前项目" info to the chat. Returns
+  // the user-facing one-line ack.
   const autoSpawnAndAttach = async (who: string): Promise<string> => {
-    if (!("attach" in bridge)) return "[weclaude] /new only available in mirror mode";
-    const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "spawn", who }), windowName: who });
-    if (!r.ok) return `[weclaude] auto-spawn failed: ${r.reason ?? "unknown"}`;
-    const att = bridge.attach({
-      sessionId: r.sessionId!,
-      jsonlPath: r.jsonlPath!,
-      target: who,
-      tmuxPane: r.tmuxPane,
-      tmuxSession: r.tmuxSession,
-    });
-    if (!att.ok) return `[weclaude] attach failed: ${att.reason ?? "unknown"}`;
-    return `✅ tmux \`${r.tmuxSession}\` → claude session \`${r.sessionId}\` attached`;
+    if (!("newSession" in bridge)) return "[weclaude] /new only available in mirror mode";
+    const r = await bridge.newSession(who, who);
+    if (!r.ok) return `[weclaude] /new failed: ${r.reason ?? "unknown"}`;
+    return `✅ 新会话已建立 \`${r.sessionId}\``;
   };
 
   // Common gating: claim bootstrap + allowFrom check. Returns true if the
@@ -139,6 +150,11 @@ export const installInboundRouter = (
     // /id — bypass allowFrom so users can discover their ids before configuring.
     if (isIdCommand(text)) {
       try { await client.replyStream(frame, msg.msgid, renderIds(msg), true); } catch { /* ignore */ }
+      return { stop: true, who };
+    }
+    // /pwd — bypass allowFrom too. Read-only project-path lookup.
+    if (isPwdCommand(text)) {
+      try { await client.replyStream(frame, msg.msgid, renderPwd(who), true); } catch { /* ignore */ }
       return { stop: true, who };
     }
     if (tryConsumeClaim(text, who)) {

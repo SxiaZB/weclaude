@@ -132,5 +132,50 @@ server.registerTool(
   },
 );
 
+// set_project_path — bind a per-chat project cwd in the daemon's mirror
+// store. Doesn't move the live claude (cwd is set at pane spawn time);
+// instead writes to `pendingCwd` and the next /new (or /clear that's
+// upgraded into /new) respawns the pane in the new path. Tell the user
+// to send /new (or /clear) for it to take effect.
+server.registerTool(
+  "set_project_path",
+  {
+    title: "Bind project path to current chat",
+    description:
+      "Persist a project cwd binding for the WeCom chat that mirrors this Claude session. The change takes effect on the next /new (or /clear, which auto-upgrades to /new when the path differs). Use absolute paths (or paths starting with ~).",
+    inputSchema: {
+      cwd: z.string().describe("Absolute project path, e.g. /Users/foo/projects/bar. ~ is expanded."),
+      target: z
+        .string()
+        .optional()
+        .describe(
+          'Optional target override. "vid:<userid>" / "chatid:<chatid>" / raw "user:<id>"/"chat:<id>". Empty → derive from this Claude session.',
+        ),
+    },
+  },
+  async ({ cwd, target }) => {
+    const sessionId = process.env.CLAUDE_CODE_SESSION_ID ?? process.env.CLAUDE_SESSION_ID ?? "";
+    const normalizedTarget = normalizeTarget(target);
+    const resp = await fetch(`${DAEMON_BASE}/mirror/cwd`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cwd,
+        ...(normalizedTarget ? { target: normalizedTarget } : {}),
+        ...(sessionId ? { sessionId } : {}),
+      }),
+    });
+    const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; reason?: string; target?: string; runningCwd?: string; pendingCwd?: string };
+    if (!j.ok) return fail(`set_project_path failed: ${j.reason ?? "unknown"}`);
+    return ok({
+      ok: true,
+      target: j.target,
+      runningCwd: j.runningCwd,
+      pendingCwd: j.pendingCwd,
+      hint: "Send /new (or /clear) in WeCom to apply the new path.",
+    });
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

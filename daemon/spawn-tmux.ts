@@ -101,6 +101,10 @@ export interface SpawnArgs {
   /** Cosmetic tmux window name (status-bar label). Falls back to sessionId.
    *  Pass the principal (e.g. "user:xxx") to make windows easy to skim. */
   windowName?: string;
+  /** Per-chat cwd override. Empty/undefined → fall back to cfg.wrc.cwd.
+   *  Mirror mode persists this in mirror-attachments.json so /new respawns
+   *  in the user-bound project, not the global default. */
+  cwdOverride?: string;
 }
 
 export interface SpawnResult {
@@ -110,6 +114,9 @@ export interface SpawnResult {
   jsonlPath?: string;
   tmuxPane?: string;
   tmuxSession?: string;
+  /** Effective cwd the pane was launched in. Mirrors `cwdOverride ?? cfg.wrc.cwd`
+   *  after expandHome, so callers can persist it without re-resolving. */
+  cwd?: string;
 }
 
 // Pre-write the "trust this folder" + onboarding markers for `cwd` into
@@ -166,8 +173,8 @@ const trustWorkspace = (claudeBin: string, cwd: string, log: Logger): void => {
   }
 };
 
-export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName }: SpawnArgs): Promise<SpawnResult> => {
-  const cwd = expandHome(cfg.wrc.cwd);
+export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, cwdOverride }: SpawnArgs): Promise<SpawnResult> => {
+  const cwd = expandHome((cwdOverride ?? "").trim() || cfg.wrc.cwd);
   const projectDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(cwd));
   const sessionId = resumeSessionId ?? randomUUID();
   const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
@@ -230,6 +237,6 @@ export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName }:
   // a missing jsonl and starts emitting once claude writes the first line.
   await sleep(TUI_SETTLE_MS);
 
-  log.info({ tmuxName, tmuxPane, sessionId, jsonlPath }, "spawn-tmux: ready");
-  return { ok: true, sessionId, jsonlPath, tmuxPane, tmuxSession: tmuxName };
+  log.info({ tmuxName, tmuxPane, sessionId, jsonlPath, cwd }, "spawn-tmux: ready");
+  return { ok: true, sessionId, jsonlPath, tmuxPane, tmuxSession: tmuxName, cwd };
 };
