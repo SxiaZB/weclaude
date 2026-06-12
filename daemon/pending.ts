@@ -54,6 +54,17 @@ export const resolvePending = (reqId: string, decision: Decision): boolean => {
   return true;
 };
 
+// Used by batch send-failure: kicks each member's awaiting handler into its
+// catch path so it can return the configured fallbackOnError (incl. "ask").
+export const failPending = (reqId: string, err: Error): boolean => {
+  const p = store.get(reqId);
+  if (!p) return false;
+  clearTimeout(p.timer);
+  store.delete(reqId);
+  p.reject(err);
+  return true;
+};
+
 export const getPending = (reqId: string): PendingMeta | undefined => store.get(reqId)?.meta;
 
 export const listPending = (): Array<{ reqId: string; meta: PendingMeta }> =>

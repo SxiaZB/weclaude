@@ -95,6 +95,10 @@ const Approval = z.object({
   windowMinutes: z.number().int().nonnegative().default(10),
   sensitiveArgRedact: z.boolean().default(true),
   fallbackOnError: z.enum(["ask", "allow", "deny"]).default("ask"),
+  // 同 session 同 tool 的并发 PreToolUse 合流窗口: 第一次到达后等待这么久,
+  // 期间到的同类请求合成一张批量卡 (减少 N 张并发卡的轰炸)。0 = 关闭聚合,
+  // 每次立刻发卡 (旧行为)。单次到达走单卡路径, 仅多了一次性的延迟。
+  batchCoalesceMs: z.number().int().nonnegative().default(250),
 });
 
 const SyncTarget = z.object({

@@ -9,7 +9,7 @@ import type {
 } from "@wecom/aibot-node-sdk";
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
-import { createPending, getPending, getResolvedSnapshot, resolvePending, resolvePendingsBySession, type Decision } from "./pending.js";
+import { createPending, getPending, getResolvedSnapshot, resolvePending, resolvePendingsBySession, failPending, type Decision } from "./pending.js";
 import {
   cacheGet,
   cachePut,
@@ -286,10 +286,135 @@ const buildAlreadyResolvedCard = (a: CardArgs): TemplateCard => {
   };
 };
 
+// ── Batch coalescing ───────────────────────────────────────────────────
+// 同 session 同 tool 的并发 PreToolUse 在 batchCoalesceMs 窗口内合流为
+// 一张卡 — 否则用户被 N 张并发卡轰炸 (典型场景: 模型并发 3 个 Bash)。
+// 单成员的批次回落到普通 buildCard, 行为与未启用聚合一致 (仅多 ms 级延迟)。
+interface BatchMember {
+  reqId: string;
+  toolInput: unknown;
+  toolInputStr: string;
+  cwd: string;
+  transcriptTail: string;
+}
+interface ActiveBatch {
+  batchId: string;
+  sessionId: string;
+  toolName: string;
+  approver: string;
+  windowMinutes: number;
+  members: BatchMember[];
+  flushTimer: NodeJS.Timeout;
+  flushed: boolean;
+}
+const activeBatches = new Map<string, ActiveBatch>(); // 仅 collecting 期; flush 后摘除
+const batchById = new Map<string, ActiveBatch>();      // 长留, 供 click event 解析
+const BATCH_BY_ID_TTL_MS = 30 * 60_000;
+const BATCH_BY_ID_MAX = 200;
+const evictBatches = (): void => {
+  if (batchById.size <= BATCH_BY_ID_MAX) return;
+  const cutoff = Date.now() - BATCH_BY_ID_TTL_MS;
+  for (const [k, v] of batchById) {
+    // members[0].reqId 总在 createPending 之后立刻入批, 用首个 reqId 的
+    // pending meta.createdAt 也行; 这里近似用 batchId 后 8 位的时间戳。
+    const ts = parseInt(v.batchId.slice(1, 1 + 8), 36);
+    if (Number.isFinite(ts) && ts < cutoff) batchById.delete(k);
+  }
+};
+const newBatchId = (): string => `b${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+const batchKeyOf = (sessionId: string, toolName: string): string => `${sessionId}|${toolName}`;
+
+// 单条成员渲染: 展开第 N 项的输入摘要, 单行化以适配批量列表的紧凑布局。
+const PER_MEMBER_MAX = 120;
+const BATCH_MAX_VISIBLE = 8;
+const renderBatchBody = (batch: ActiveBatch): string => {
+  const visible = batch.members.slice(0, BATCH_MAX_VISIBLE);
+  const lines = visible.map((m, idx) => {
+    const r = renderInput(batch.toolName, m.toolInput, m.toolInputStr, m.cwd);
+    const flat = r.body ? oneLine(r.body) : "(no input)";
+    return `${idx + 1}. ${TRUNC(flat, PER_MEMBER_MAX)}`;
+  });
+  const overflow = batch.members.length - visible.length;
+  if (overflow > 0) lines.push(`…还有 ${overflow} 项`);
+  return TRUNC(lines.join("\n"), QUOTE_MAX);
+};
+
+const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCard => {
+  const dir = dirName(batch.members[0]?.cwd ?? "");
+  const tail = oneLine(transcriptTail).trim();
+  return {
+    card_type: "button_interaction",
+    source: buildSource(tail),
+    main_title: { title: `🔐 授权 · ${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    quote_area: quoteArea(renderBatchBody(batch)),
+    task_id: batch.batchId,
+    button_list: [
+      { text: "❌", style: 4, key: encodeBatchKey(batch.batchId, "deny") },
+      { text: "10min", style: 3, key: encodeBatchKey(batch.batchId, "allow_window") },
+      { text: "✅", style: 4, key: encodeBatchKey(batch.batchId, "allow") },
+    ],
+  };
+};
+
+const buildBatchResolvedCard = (
+  batch: ActiveBatch,
+  decision: Decision,
+  transcriptTail: string,
+): TemplateCard => {
+  const dir = dirName(batch.members[0]?.cwd ?? "");
+  const tail = oneLine(transcriptTail).trim();
+  const button = decision === "allow_window"
+    ? {
+        text: `${verbOf(decision, batch.windowMinutes)}(点击取消)`,
+        style: 4,
+        key: encodeCancelKey(batch.sessionId),
+      }
+    : {
+        text: `${emojiOf(decision)} ${verbOf(decision, batch.windowMinutes)} ×${batch.members.length}`,
+        style: 4,
+        key: encodeBatchNoopKey(batch.batchId),
+      };
+  return {
+    card_type: "button_interaction",
+    source: buildSource(tail),
+    main_title: { title: `${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    quote_area: quoteArea(renderBatchBody(batch)),
+    task_id: batch.batchId,
+    button_list: [button],
+  };
+};
+
+const buildBatchAlreadyResolvedCard = (batch: ActiveBatch, transcriptTail: string): TemplateCard => {
+  const dir = dirName(batch.members[0]?.cwd ?? "");
+  const tail = oneLine(transcriptTail).trim();
+  return {
+    card_type: "button_interaction",
+    source: buildSource(tail),
+    main_title: { title: `${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    quote_area: quoteArea(renderBatchBody(batch)),
+    task_id: batch.batchId,
+    button_list: [{ text: "已经放行", style: 4, key: encodeBatchNoopKey(batch.batchId) }],
+  };
+};
+
 const encodeKey = (reqId: string, decision: Decision): string => `${reqId}|${decision}`;
 const NOOP_PREFIX = "noop:";
 const CANCEL_PREFIX = "cancel_window:";
+const BATCH_PREFIX = "B|";
+const BATCH_NOOP_PREFIX = "B-noop:";
 const encodeCancelKey = (sessionId: string): string => `${CANCEL_PREFIX}${sessionId}`;
+const encodeBatchKey = (batchId: string, decision: Decision): string =>
+  `${BATCH_PREFIX}${batchId}|${decision}`;
+const encodeBatchNoopKey = (batchId: string): string => `${BATCH_NOOP_PREFIX}${batchId}`;
+const decodeBatchKey = (key: string): { batchId: string; decision: Decision } | undefined => {
+  if (!key.startsWith(BATCH_PREFIX)) return undefined;
+  const [batchId, d] = key.slice(BATCH_PREFIX.length).split("|");
+  if (!batchId || !d) return undefined;
+  if (d !== "allow" && d !== "allow_session" && d !== "allow_window" && d !== "deny") return undefined;
+  return { batchId, decision: d };
+};
+const decodeBatchNoopKey = (key: string): string | undefined =>
+  key.startsWith(BATCH_NOOP_PREFIX) ? key.slice(BATCH_NOOP_PREFIX.length) : undefined;
 const decodeKey = (
   key: string,
 ): { reqId?: string; decision?: Decision; cancelSessionId?: string; noopReqId?: string } => {
@@ -553,6 +678,52 @@ const resolveApprover = (
 };
 
 export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: ApprovalDeps): Handler => {
+  const detailUrlFor = (id: string): string =>
+    buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
+
+  // Flush 一个 batch: 单成员 → 普通卡 (与未启用聚合一致); 多成员 → 批量卡。
+  // 发送失败时调用 failPending 让每位成员的 handler 走 fallbackOnError 路径,
+  // 与单卡路径上 sendMessage 抛错时的语义一致。
+  const flushBatch = async (batch: ActiveBatch): Promise<void> => {
+    if (batch.flushed) return;
+    batch.flushed = true;
+    activeBatches.delete(batchKeyOf(batch.sessionId, batch.toolName));
+    const isMulti = batch.members.length > 1;
+    const card: TemplateCard = isMulti
+      ? buildBatchCard(batch, batch.members[0]?.transcriptTail ?? "")
+      : (() => {
+          const m = batch.members[0]!;
+          return buildCard({
+            reqId: m.reqId,
+            toolName: batch.toolName,
+            toolInput: m.toolInput,
+            toolInputStr: m.toolInputStr,
+            cwd: m.cwd,
+            sessionShort: batch.sessionId ? batch.sessionId.slice(-8) : "?",
+            transcriptTail: m.transcriptTail,
+            windowMinutes: batch.windowMinutes,
+            detailUrl: detailUrlFor(m.reqId),
+          });
+        })();
+    try {
+      await client.sendMessage(targetChatId(batch.approver), {
+        msgtype: "template_card",
+        template_card: card,
+      });
+      log.info(
+        { batchId: batch.batchId, count: batch.members.length, multi: isMulti, approver: batch.approver, tool: batch.toolName },
+        "batch flushed",
+      );
+    } catch (e) {
+      log.error({ batchId: batch.batchId, err: (e as Error).message }, "batch send failed");
+      const err = new Error(`send_card_fail:${(e as Error).message}`);
+      for (const m of batch.members) failPending(m.reqId, err);
+      // 单成员 batch 摘除自己的 batchById 条目, 多成员保留 (后续 click 兜底
+      // 时 build*Card 期望能找到 batch — 但失败时也没人会点了, 留着也无害)。
+      if (!isMulti) batchById.delete(batch.batchId);
+    }
+  };
+
   return async (req, res) => {
     if (!cfg.approval.enabled) {
       json(res, 200, { decision: "ask", reason: "approval_disabled" } satisfies ApproveResp);
@@ -640,7 +811,6 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: Approv
         return String(display);
       }
     })();
-    const sessionShort = sessionId ? sessionId.slice(-8) : "?";
 
     const longPollMs = cfg.approval.longPollSec * 1000;
     const { reqId, promise } = createPending({
@@ -656,12 +826,6 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: Approv
       timeoutMs: longPollMs,
     });
 
-    const detailUrl = buildDetailUrl(
-      cfg.daemon.detailPublicBase,
-      cfg.daemon.host,
-      cfg.daemon.port,
-      reqId,
-    );
     recordApproval({
       id: reqId,
       toolName,
@@ -671,28 +835,33 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: Approv
       transcriptTail,
     });
 
-    const card = buildCard({
-      reqId,
-      toolName,
-      toolInput: display,
-      toolInputStr,
-      cwd,
-      sessionShort,
-      transcriptTail,
-      windowMinutes: cfg.approval.windowMinutes,
-      detailUrl,
-    });
-
-    try {
-      await client.sendMessage(targetChatId(approver), {
-        msgtype: "template_card",
-        template_card: card,
-      });
-      log.info({ reqId, approver, toolName }, "card sent");
-    } catch (e) {
-      log.error({ err: (e as Error).message }, "send card failed");
-      json(res, 200, fallback(cfg, `send_card_fail:${(e as Error).message}`) satisfies ApproveResp);
-      return;
+    // Batch coalesce: 同 session 同 tool 的并发请求合流为一张卡。窗口内首位
+    // 创建 batch + 计时器, 后续到达者只追加成员, 不发卡。flush 时依据成员数
+    // 选择普通 buildCard 或 buildBatchCard。0 = 关闭聚合, 立即 flush。
+    const member: BatchMember = { reqId, toolInput: display, toolInputStr, cwd, transcriptTail };
+    const bk = batchKeyOf(sessionId, toolName);
+    const existing = activeBatches.get(bk);
+    if (existing && !existing.flushed) {
+      existing.members.push(member);
+      log.info({ batchId: existing.batchId, count: existing.members.length, reqId }, "batch joined");
+    } else {
+      const batch: ActiveBatch = {
+        batchId: newBatchId(),
+        sessionId,
+        toolName,
+        approver,
+        windowMinutes: cfg.approval.windowMinutes,
+        members: [member],
+        flushed: false,
+        flushTimer: undefined as unknown as NodeJS.Timeout, // set below
+      };
+      const coalesceMs = cfg.approval.batchCoalesceMs;
+      const fire = (): void => void flushBatch(batch);
+      batch.flushTimer = coalesceMs > 0 ? setTimeout(fire, coalesceMs) : setImmediate(fire) as unknown as NodeJS.Timeout;
+      activeBatches.set(bk, batch);
+      batchById.set(batch.batchId, batch);
+      evictBatches();
+      log.info({ batchId: batch.batchId, reqId, coalesceMs }, "batch opened");
     }
 
     // Long-poll
@@ -840,6 +1009,60 @@ export const installApprovalEventListener = (
 
       const detailUrlFor = (id: string): string =>
         buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
+
+      // Batch 卡分支: 一次性 resolve N 个成员 pending, 单次 update 卡片状态。
+      // 必须在普通 decodeKey 分支前匹配 — 否则 batchId 形如 "b...|allow" 也
+      // 能被 split("|") 当作 reqId|decision 误解出来。
+      const batchDec = decodeBatchKey(key);
+      if (batchDec) {
+        const batch = batchById.get(batchDec.batchId);
+        if (!batch) {
+          log.info({ batchId: batchDec.batchId }, "batch click — unknown id, ignored");
+          return;
+        }
+        const by = frame.body?.from?.userid ?? "?";
+        let resolved = 0;
+        for (const m of batch.members) {
+          recordApprovalDecision(m.reqId, batchDec.decision, by);
+          if (resolvePending(m.reqId, batchDec.decision)) resolved++;
+        }
+        // 全部成员都已被先前的 allow_window sweep 拿走 → 渲染「已经放行」形态
+        // 而非再画一遍三按钮的 resolved 卡, 跟单卡 swept 路径语义对齐。
+        const allSwept = resolved === 0 && batch.members.length > 0;
+        log.info({ batchId: batch.batchId, decision: batchDec.decision, resolved, total: batch.members.length, allSwept }, "batch resolved");
+        if (resolved > 0) onApproved?.(batch.sessionId);
+        try {
+          const tail = batch.members[0]?.transcriptTail ?? "";
+          const card = allSwept
+            ? buildBatchAlreadyResolvedCard(batch, tail)
+            : buildBatchResolvedCard(batch, batchDec.decision, tail);
+          await client.updateTemplateCard(frame, card);
+          log.info({ batchId: batch.batchId, decision: batchDec.decision, allSwept }, "batch card updated in place");
+        } catch (e) {
+          log.warn({ err: (e as Error).message, batchId: batch.batchId }, "batch updateTemplateCard failed");
+        }
+        return;
+      }
+
+      // Batch-noop: 已 resolved 的批量卡再次被点 — 仅视觉回执。
+      const batchNoopId = decodeBatchNoopKey(key);
+      if (batchNoopId !== undefined) {
+        const batch = batchById.get(batchNoopId);
+        if (batch) {
+          try {
+            await client.updateTemplateCard(
+              frame,
+              buildBatchAlreadyResolvedCard(batch, batch.members[0]?.transcriptTail ?? ""),
+            );
+            log.info({ batchId: batchNoopId }, "batch noop click — already-resolved card refreshed");
+          } catch (e) {
+            log.warn({ err: (e as Error).message, batchId: batchNoopId }, "updateTemplateCard (batch-noop) failed");
+          }
+        } else {
+          log.info({ batchId: batchNoopId }, "batch noop click — batch expired, ignored");
+        }
+        return;
+      }
 
       // Askq-noop 分支: askq 投票卡 submit 后那张「已回答」卡再次被点。
       // 必须在普通 noop 分支前匹配 — 否则会落到 buildAlreadyResolvedCard
