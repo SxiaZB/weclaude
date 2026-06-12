@@ -523,28 +523,8 @@ const buildAskqCard = (reqId: string, q: AskqQuestion, transcriptTail: string): 
 
 type AskqOutcome = { kind: "picked"; picked: number[] } | { kind: "cli" } | { kind: "empty" };
 
-// 投票卡 submit 后渲染的「已回答」卡仍可再次被点击（按钮 key=askq_noop:<id>）。
-// 普通 approval 走 resolvedStash + buildAlreadyResolvedCard 那条线 — 但 askq
-// 的 meta/outcome 不在那个 stash 里，沿用会被误渲染成「授权 · 已经放行」。
-// 单独存一份，TTL 跟 resolvedStash 对齐即可。
-interface AskqResolvedSnap { q: AskqQuestion; outcome: AskqOutcome; transcriptTail: string; at: number }
-const askqResolvedStash = new Map<string, AskqResolvedSnap>();
-const ASKQ_RESOLVED_TTL_MS = 30 * 60_000;
-const ASKQ_RESOLVED_MAX = 200;
-const stashAskqResolved = (reqId: string, snap: Omit<AskqResolvedSnap, "at">): void => {
-  askqResolvedStash.set(reqId, { ...snap, at: Date.now() });
-  if (askqResolvedStash.size > ASKQ_RESOLVED_MAX) {
-    const cutoff = Date.now() - ASKQ_RESOLVED_TTL_MS;
-    for (const [k, v] of askqResolvedStash) if (v.at < cutoff) askqResolvedStash.delete(k);
-  }
-};
-const getAskqResolved = (reqId: string): AskqResolvedSnap | undefined => {
-  const e = askqResolvedStash.get(reqId);
-  if (!e) return undefined;
-  if (Date.now() - e.at > ASKQ_RESOLVED_TTL_MS) { askqResolvedStash.delete(reqId); return undefined; }
-  return e;
-};
-
+// 投票卡 submit 后那张卡再被点 (askq_noop:<id>) → 终态 identity, 直接 return,
+// 不再 stash 任何 outcome / question 副本。
 const buildAskqResolvedCard = (
   reqId: string,
   q: AskqQuestion,
@@ -986,9 +966,6 @@ export const installApprovalEventListener = (
         const ok = resolvePending(askq.reqId, resolved as never);
         log.info({ reqId: askq.reqId, outcome, ok }, "askq event resolved");
         if (q) {
-          // 存一份给后续在 resolved 卡上重复点击 askq_noop 用 — resolvePending
-          // 已经把 pending entry 删掉了,不再 stash 这次拿不到原 question。
-          stashAskqResolved(askq.reqId, { q, outcome, transcriptTail: meta?.transcriptTail ?? "" });
           try {
             await client.updateTemplateCard(
               frame,
@@ -1045,106 +1022,19 @@ export const installApprovalEventListener = (
         return;
       }
 
-      // Batch-noop: 已 resolved 的批量卡再次被点 — 仅视觉回执。
-      const batchNoopId = decodeBatchNoopKey(key);
-      if (batchNoopId !== undefined) {
-        const batch = batchById.get(batchNoopId);
-        if (batch) {
-          try {
-            await client.updateTemplateCard(
-              frame,
-              buildBatchAlreadyResolvedCard(batch, batch.members[0]?.transcriptTail ?? ""),
-            );
-            log.info({ batchId: batchNoopId }, "batch noop click — already-resolved card refreshed");
-          } catch (e) {
-            log.warn({ err: (e as Error).message, batchId: batchNoopId }, "updateTemplateCard (batch-noop) failed");
-          }
-        } else {
-          log.info({ batchId: batchNoopId }, "batch noop click — batch expired, ignored");
-        }
+      // Batch-noop / Askq-noop: 终态再点 = identity, 见下方统一 noop 分支。
+      // 这里把分支提前吃掉, 防止 decodeKey 把 B-noop / askq_noop 误解成普通 noop。
+      if (decodeBatchNoopKey(key) !== undefined || decodeAskqNoopKey(key) !== undefined) {
+        log.info({ key }, "terminal re-click (batch/askq) — identity, no update");
         return;
       }
 
-      // Askq-noop 分支: askq 投票卡 submit 后那张「已回答」卡再次被点。
-      // 必须在普通 noop 分支前匹配 — 否则会落到 buildAlreadyResolvedCard
-      // 渲染成「授权 · 已经放行」,污染原卡。
-      const askqNoopReqId = decodeAskqNoopKey(key);
-      if (askqNoopReqId !== undefined) {
-        const snap = getAskqResolved(askqNoopReqId);
-        if (snap) {
-          try {
-            await client.updateTemplateCard(
-              frame,
-              buildAskqResolvedCard(cbTaskId || askqNoopReqId, snap.q, snap.outcome, snap.transcriptTail),
-            );
-            log.info({ reqId: askqNoopReqId }, "askq noop click — resolved card refreshed");
-          } catch (e) {
-            log.warn({ err: (e as Error).message, reqId: askqNoopReqId }, "updateTemplateCard (askq-noop) failed");
-          }
-        } else {
-          log.info({ reqId: askqNoopReqId }, "askq noop click — stash expired, ignored");
-        }
-        return;
-      }
-
-      // Noop branch: 卡片已 resolved, 用户再次点击 — 给一次视觉反馈。
+      // Noop branch: 任意 *_noop 前缀 = 终态卡再点 = identity。
+      // 卡面已是 buildResolvedCard / buildBatchResolvedCard / buildCancelledCard
+      // 渲染出的最终形态, 重画只会丢信息(把"✅ 已通过"糊成"已经放行")。
+      // 不更新, 让 WeCom 端的卡面保持不变。
       if (decoded.noopReqId !== undefined) {
-        const reqId = decoded.noopReqId;
-        // 终态: 已取消自动通过 (noop:cancelled:<id>) — 卡面已经是最终形态,
-        // 再点不要触发 buildAlreadyResolvedCard 把内容糊成"已经放行" 空卡。
-        if (reqId.startsWith("cancelled:")) {
-          log.info({ key }, "cancelled card re-click — terminal, no update");
-          return;
-        }
-        const snap = getResolvedSnapshot(reqId);
-        // 没拍到快照 (daemon 重启 / TTL 过期) — 任何 update 都会用空字段把
-        // 原卡覆盖成 "授权 · /" + "已经放行", 比保留原卡更糟, 直接放弃。
-        if (!snap) {
-          log.info({ reqId }, "noop click but snapshot missing — skip update");
-          return;
-        }
-        const meta = snap.meta;
-        const toolInputStr = (() => {
-          try { return JSON.stringify(meta.toolInput ?? {}, null, 2); }
-          catch { return String(meta.toolInput); }
-        })();
-        const sessionShort = meta.sessionId ? meta.sessionId.slice(-8) : "?";
-        // allow_window 的 resolved 卡用 cancel 按钮, 理论不会进 noop;
-        // 真撞上(SDK 行为变更等)兜底渲染成「已经放行」, 别画出会取消整窗口
-        // 的「点击取消」按钮误导用户。其它 decision 用 buildResolvedCard
-        // 保留 "✅ 已通过" / "❌ 已拒绝" / "本会话通过" 原文案。
-        const card = snap.decision === "allow_window"
-          ? buildAlreadyResolvedCard({
-              reqId: cbTaskId || reqId,
-              toolName: meta.toolName ?? "授权",
-              toolInput: meta.toolInput ?? {},
-              toolInputStr,
-              cwd: meta.cwd ?? "",
-              sessionShort,
-              transcriptTail: meta.transcriptTail ?? "",
-              windowMinutes: cfg.approval.windowMinutes,
-              detailUrl: detailUrlFor(reqId),
-            })
-          : buildResolvedCard({
-              reqId: cbTaskId || reqId,
-              toolName: meta.toolName ?? "授权",
-              toolInput: meta.toolInput,
-              toolInputStr,
-              cwd: meta.cwd ?? "",
-              sessionShort,
-              transcriptTail: meta.transcriptTail ?? "",
-              windowMinutes: cfg.approval.windowMinutes,
-              decision: snap.decision,
-              by: frame.body?.from?.userid ?? "?",
-              sessionId: meta.sessionId ?? "",
-              detailUrl: detailUrlFor(reqId),
-            });
-        try {
-          await client.updateTemplateCard(frame, card);
-          log.info({ reqId, decision: snap.decision }, "noop click — resolved card refreshed");
-        } catch (e) {
-          log.warn({ err: (e as Error).message, reqId }, "updateTemplateCard (noop) failed");
-        }
+        log.info({ key }, "terminal re-click — identity, no update");
         return;
       }
 
