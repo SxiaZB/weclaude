@@ -1,6 +1,6 @@
 {
   "name": "weclaude",
-  "version": "0.1.4",
+  "version": "0.1.8",
   "description": "Bridge Claude Code and WeCom: PreToolUse approval cards + bidirectional tmux session mirror with image paste",
   "type": "module",
   "license": "MIT",
@@ -20,6 +20,8 @@
     "weclaude-init": "./dist/cli/init.js"
   },
   "files": [
+    ".claude-plugin/marketplace.json",
+    ".claude-plugin/plugin.json",
     "cli/weclaude.sh",
     "dist/cli/init.js",
     "dist/cli/init.js.map",
