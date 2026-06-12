@@ -86,6 +86,7 @@ const buildSource = (tail: string): TemplateCard["source"] => {
 
 interface Rendered {
   body: string;  // wrapped in quote_area as the parameters block
+  desc?: string; // 渲染到 sub_title_text — 跟 quote_area 里的命令/参数体分离
 }
 
 const prefixLines = (s: string, prefix: string): string =>
@@ -123,7 +124,7 @@ const renderInput = (
   if (toolName === "Bash") {
     const cmd = typeof i.command === "string" ? i.command : "";
     const desc = typeof i.description === "string" ? i.description : "";
-    return { body: TRUNC(join(desc ? `# ${desc}` : "", cmd), QUOTE_MAX) };
+    return { body: TRUNC(cmd, QUOTE_MAX), desc: desc || undefined };
   }
   if (toolName === "Read") {
     const fp = typeof i.file_path === "string" ? relToCwd(i.file_path, cwd) : "";
@@ -164,13 +165,17 @@ const renderInput = (
     const sa = typeof i.subagent_type === "string" ? i.subagent_type : "";
     const prompt = typeof i.prompt === "string" ? i.prompt : "";
     const head = [sa, desc].filter(Boolean).join(": ");
-    return { body: TRUNC(join(head ? `# ${head}` : "", prompt), QUOTE_MAX) };
+    return { body: TRUNC(prompt, QUOTE_MAX), desc: head || undefined };
   }
   return { body: summarizeUnknown(i) };
 };
 
 const quoteArea = (text: string): TemplateCard["quote_area"] =>
   ({ type: 0, quote_text: text } as TemplateCard["quote_area"]);
+
+const SUB_DESC_MAX = 200;
+const subTitle = (desc?: string): { sub_title_text: string } | Record<string, never> =>
+  desc ? { sub_title_text: TRUNC(desc, SUB_DESC_MAX) } : {};
 
 const dirName = (cwd: string): string => cwd.replace(/^.*\//, "") || cwd;
 
@@ -188,6 +193,7 @@ const buildCard = (a: CardArgs): TemplateCard => {
     main_title: {
       title: `🔐 授权 · ${a.toolName} · ${dir}/`,
     },
+    ...subTitle(r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -244,6 +250,7 @@ const buildResolvedCard = (
     main_title: {
       title: `${a.toolName} · ${dir}/`,
     },
+    ...subTitle(r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -260,6 +267,7 @@ const buildCancelledCard = (a: CardArgs): TemplateCard => {
     card_type: "button_interaction",
     source: buildSource(tail),
     main_title: { title: `${a.toolName} · ${dir}/` },
+    ...subTitle(r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -279,6 +287,7 @@ const buildAlreadyResolvedCard = (a: CardArgs): TemplateCard => {
     card_type: "button_interaction",
     source: buildSource(tail),
     main_title: { title: `${a.toolName} · ${dir}/` },
+    ...subTitle(r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
