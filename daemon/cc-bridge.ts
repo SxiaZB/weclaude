@@ -83,12 +83,15 @@ interface RunArgs {
   client: WSClient;
   frame: WsFrameHeaders;
   streamId: string;
+  /** 用于 stream 终止后补发预览消息的目标 (chatid)。WeCom 对 stream 类型硬编码 "…" 列表预览，
+   *  发一条 markdown 才能覆盖。principal 形如 "user:xxx" / "chat:xxx"，剥前缀后即 chatid。 */
+  principal: string;
   /** Called once we observe `system/init` with the (possibly fresh) session_id. */
   onSession: (sid: string) => void;
 }
 
 const runOne = async (args: RunArgs): Promise<void> => {
-  const { text, resumeSid, cfg, log, client, frame, streamId, onSession } = args;
+  const { text, resumeSid, cfg, log, client, frame, streamId, principal, onSession } = args;
 
   const cliArgs = [
     "-p",
@@ -200,6 +203,17 @@ const runOne = async (args: RunArgs): Promise<void> => {
         acc = fallback;
       }
       await sendFlush(true);
+      // WeCom 列表对 stream 消息硬编码 "…" 预览，唯一覆盖方式是在 stream 终止后补发一条普通消息。
+      // 取 acc 按空行切分的最后一段——对应"最后一段话"，多段冗长输出不会全压进列表。
+      const tail = acc.split(/\n{2,}/).filter((s) => s.trim()).pop();
+      if (tail) {
+        const chatId = principal.includes(":") ? principal.slice(principal.indexOf(":") + 1) : principal;
+        try {
+          await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content: tail } });
+        } catch (e) {
+          log.warn({ err: (e as Error).message }, "preview push failed");
+        }
+      }
       log.info({ code, chars: acc.length }, "claude done");
       resolve();
     });
@@ -254,6 +268,7 @@ export const makeBridge = (deps: BridgeDeps) => {
           client: deps.client,
           frame,
           streamId,
+          principal,
           onSession: (sid) => deps.sessions.set(principal, sid),
         });
       }),

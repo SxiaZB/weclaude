@@ -55,13 +55,9 @@ const main = async (): Promise<void> => {
     fatalExit("bridge failed to start");
   }
   installInboundRouter(ws.client, cfg, log, bridge, sourcePath);
-  // In mirror mode, approval clicks should also finalize the live stream so
-  // post-click tool output falls through to the debounced standalone path.
-  const onApprovalClicked =
-    cfg.wrc.mode === "mirror"
-      ? (sid: string): void => (bridge as MirrorBridge).terminateLiveStream(sid)
-      : undefined;
-  installApprovalEventListener(ws.client, log.child({ mod: "approval" }), cfg, onApprovalClicked);
+  // approval click 不再终结 liveStream:让 stream 持续到本轮自然结束(下一次 inbound 或 hardTimer),
+  // 避免点击后剩余 tool 调用被踢出气泡、单独以 standalone markdown 显示——视觉上像"多截断了一个 toolcall"。
+  installApprovalEventListener(ws.client, log.child({ mod: "approval" }), cfg);
   // In mirror mode, route approval cards to the WeCom chat bound to the requesting session.
   // Falls back to cfg.approval.approvers / cfg.defaultChat when no mirror is attached.
   const getMirrorTarget =
