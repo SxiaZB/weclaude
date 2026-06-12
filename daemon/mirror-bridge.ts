@@ -830,9 +830,6 @@ interface ActiveStream {
   hardTimer?: NodeJS.Timeout;
   cardSent: boolean;
   tools: ToolEntry[];
-  /** 最后一段连续的助手文本：text 块累加，tool_use/tool_result 重置。
-   *  finalize 后单独补发一条 markdown,  覆盖 WeCom 会话列表对 stream 消息硬编码的 "…" 预览。 */
-  lastText: string;
 }
 
 interface AttachState {
@@ -981,16 +978,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       });
       evictTurns();
     }
-    // 会话列表对 stream 类型消息硬编码 "…" 预览，仅"发新消息"能覆盖。
-    // 仅当本轮真有工具调用时才补发——纯文本回复 stream 已自带可读预览，免得多一条冗余气泡。
-    if (!s.dead && s.tools.length > 0 && s.lastText) {
-      const chatId = stripPrincipalPrefix(a.target);
-      try {
-        await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content: s.lastText } });
-      } catch (e) {
-        log.warn({ sessionId: a.sessionId, turnId: s.turnId, err: (e as Error).message }, "preview push failed");
-      }
-    }
     if (a.liveStream === s) a.liveStream = undefined;
   };
 
@@ -1001,7 +988,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       acc: "", lastSent: "",
       capped: false, closed: false, dead: false, cardSent: false,
       tools: [],
-      lastText: "",
     };
     s.hardTimer = setTimeout(() => void finalizeStream(a, s), HARD_TIMEOUT_MS);
     log.info({ sessionId: a.sessionId, turnId: s.turnId, streamId }, "stream open");
@@ -1084,11 +1070,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         s.capped = true;
       } else {
         s.acc = next;
-      }
-      if (item.kind === "text") {
-        s.lastText = (s.lastText ? `${s.lastText}\n\n` : "") + item.body;
-      } else if (item.kind === "tool_use" || item.kind === "tool_result") {
-        s.lastText = "";
       }
       if (item.kind !== "text") recordToolEntry(s, item);
       log.debug({ sessionId: a.sessionId, turnId: s.turnId, kind: item.kind, accLen: s.acc.length }, "stream append");

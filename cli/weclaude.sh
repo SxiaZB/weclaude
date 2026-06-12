@@ -7,6 +7,18 @@ LABEL="com.weclaude.daemon"
 HOME_DIR="$HOME"
 OS="$(uname -s)"
 
+# Resolve symlinks so REPO_ROOT points at the real package dir even when this
+# script is invoked via the npm-installed bin symlink (e.g. ~/.npm-global/bin/weclaude).
+# macOS ships BSD readlink without -f, so chase the chain by hand.
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  d="$(cd -P "$(dirname "$self")" && pwd)"
+  t="$(readlink "$self")"
+  [[ "$t" != /* ]] && t="$d/$t"
+  self="$t"
+done
+REPO_ROOT="$(cd -P "$(dirname "$self")/.." && pwd)"
+
 cmd="${1:-status}"
 shift || true
 
@@ -28,6 +40,7 @@ weclaude <subcommand>
   sync                   write hooks/MCP/env into sync.targets settings.json
   unsync                 remove our entries from sync.targets settings.json
   uninstall              full teardown: unsync + remove daemon (run before `npm uninstall -g`)
+  version                print weclaude version
   help
 EOF
 }
@@ -69,11 +82,18 @@ require_claude_internal() {
 case "$cmd" in
   init)
     NODE_BIN="$(command -v node)"
-    REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
     SCRIPT="$REPO_ROOT/dist/cli/init.js"
     if [[ ! -f "$SCRIPT" ]]; then
-      echo "[weclaude init] building..."
-      (cd "$REPO_ROOT" && npm install --silent && npx tsc -p tsconfig.json) || { echo "build failed"; exit 1; }
+      # Dev repo: tsconfig.json present → build. npm install: tarball ships dist/,
+      # so a missing init.js means a broken install — fail clearly instead of
+      # invoking tsc against a non-existent tsconfig.
+      if [[ -f "$REPO_ROOT/tsconfig.json" ]]; then
+        echo "[weclaude init] building..."
+        (cd "$REPO_ROOT" && npm install --silent && npx tsc -p tsconfig.json) || { echo "build failed"; exit 1; }
+      else
+        echo "[weclaude init] missing $SCRIPT — try 'npm install -g weclaude' to reinstall" >&2
+        exit 1
+      fi
     fi
     exec "$NODE_BIN" "$SCRIPT" "$@"
     ;;
@@ -112,7 +132,6 @@ case "$cmd" in
     ;;
   config-path) http_get /status | jq -r '.sourcePath // empty' ;;
   uninstall)
-    REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
     NODE_BIN="$(command -v node)"
     SYNC_SCRIPT="$REPO_ROOT/dist/cli/sync.js"
     [[ -f "$SYNC_SCRIPT" ]] && "$NODE_BIN" "$SYNC_SCRIPT" --remove || true
@@ -169,16 +188,22 @@ case "$cmd" in
     ;;
   sync)
     NODE_BIN="$(command -v node)"
-    SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/dist/cli/sync.js"
+    SCRIPT="$REPO_ROOT/dist/cli/sync.js"
     [[ -f "$SCRIPT" ]] || { echo "build first: npm run build"; exit 1; }
     exec "$NODE_BIN" "$SCRIPT" "$@"
     ;;
   unsync)
     NODE_BIN="$(command -v node)"
-    SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/dist/cli/sync.js"
+    SCRIPT="$REPO_ROOT/dist/cli/sync.js"
     [[ -f "$SCRIPT" ]] || { echo "build first: npm run build"; exit 1; }
     exec "$NODE_BIN" "$SCRIPT" --remove "$@"
     ;;
   help|-h|--help) usage ;;
+  version|-v|--version)
+    # Read version straight from the package manifest — no jq dep, regex is enough.
+    pkg="$REPO_ROOT/package.json"
+    [[ -f "$pkg" ]] || { echo "package.json not found at $pkg" >&2; exit 1; }
+    sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$pkg" | head -1
+    ;;
   *) echo "unknown subcommand: $cmd"; usage; exit 2 ;;
 esac

@@ -40,6 +40,7 @@ const step = (n: number, title: string): void =>
 
 // ── Agent kind → settings.json path ──────────────────────────────────
 type AgentKind = "claude" | "claude-internal" | "custom";
+type WrcMode = "headless" | "mirror";
 const settingsPathFor = (kind: AgentKind, custom?: string): string => {
   switch (kind) {
     case "claude": return "~/.claude/settings.json";
@@ -84,6 +85,24 @@ const installDaemon = (): void => {
   log(c.dim("  installing resident daemon..."));
   const r = spawnSync("bash", [`${REPO}/scripts/install.sh`], { stdio: "inherit" });
   if (r.status !== 0) throw new Error("install.sh failed");
+};
+
+// Register the local repo as a Claude Code marketplace and install the
+// `weclaude` plugin from it. This is what wires up `hooks/hooks.json` (so
+// `${CLAUDE_PLUGIN_ROOT}` resolves) + `commands/wrc.md` + the MCP server
+// declared in `.claude-plugin/plugin.json`. Idempotent: marketplace add
+// re-uses the existing entry, install upgrades in place.
+const installPlugin = (claudeBin: string): void => {
+  log(c.dim(`  注册 marketplace + 安装插件 (${claudeBin}) ...`));
+  const m = spawnSync(claudeBin, ["plugin", "marketplace", "add", REPO], { stdio: "inherit" });
+  if (m.status !== 0) {
+    log(c.yellow(`  ⚠ plugin marketplace add 失败 (退出码 ${m.status}) — hook 可能未注册，可手动:\n     ${claudeBin} plugin marketplace add ${REPO}\n     ${claudeBin} plugin install weclaude@weclaude-local`));
+    return;
+  }
+  const i = spawnSync(claudeBin, ["plugin", "install", "weclaude@weclaude-local", "--scope", "user"], { stdio: "inherit" });
+  if (i.status !== 0) {
+    log(c.yellow(`  ⚠ plugin install 失败 (退出码 ${i.status}) — 可手动: ${claudeBin} plugin install weclaude@weclaude-local`));
+  }
 };
 
 const waitDaemonReady = async (timeoutMs: number): Promise<void> => {
@@ -133,6 +152,20 @@ const main = async (): Promise<void> => {
     agentKind === "custom"
       ? await input({ message: "settings.json 绝对路径:", required: true })
       : "";
+  const wrcMode = (await select({
+    message: "选择 wrc 模式：",
+    choices: [
+      {
+        name: "mirror (推荐：远程消息注入到本地 tmux 里的 claude 会话，CLI 可见双向同步)",
+        value: "mirror",
+      },
+      {
+        name: "headless (远程消息触发新的 `claude -p` 子进程，CLI 不可见)",
+        value: "headless",
+      },
+    ],
+    default: "mirror",
+  })) as WrcMode;
   const enableHook = await confirm({
     message: "开启 PreToolUse 授权拦截 hook？(IM 按钮卡片授权)",
     default: true,
@@ -146,9 +179,9 @@ const main = async (): Promise<void> => {
   patchJsonc(CONFIG, [
     { path: ["bot", "websocketUrl"], value: "wss://openws.work.weixin.qq.com" },
     { path: ["defaultChat"], value: "" },
-    { path: ["wrc", "mode"], value: "headless" },
+    { path: ["wrc", "mode"], value: wrcMode },
     { path: ["wrc", "claudeBin"], value: claudeBin },
-    { path: ["wrc", "cwd"], value: "~" },
+    { path: ["wrc", "cwd"], value: "~/.weclaude/workspace" },
     { path: ["wrc", "allowFrom"], value: [] },
     { path: ["approval", "enabled"], value: enableHook },
     { path: ["approval", "matcher"], value: ".*" },
@@ -162,6 +195,7 @@ const main = async (): Promise<void> => {
 
   ensureBuild();
   if (enableHook) runSync();
+  if (enableHook) installPlugin(claudeBin);
   installDaemon();
 
   log(c.dim("  等待 daemon 上线..."));
@@ -189,9 +223,27 @@ const main = async (): Promise<void> => {
     log(c.green("\n✅ 引导完成。"));
     return;
   }
-  log(c.dim("  即将启动 claude，触发一次 Bash 授权 → 你会在 WeCom 收到按钮卡片。"));
-  log(c.dim("  点击「✅」放行即可观察后续 markdown 推送。\n"));
-  await runDemo(claimed, claudeBin);
+  if (wrcMode === "mirror") {
+    // Mirror 路径:不能用 `claude -p`(脱离 tmux),改为主动起 tmux+claude pane,
+    // 让用户立即看到 mirror 形态;之后在 WeCom 发任意消息即可走完整 mirror 流。
+    log(c.dim("  正在拉起 tmux+claude pane (mirror 模式) ..."));
+    const r = (await post("/mirror/spawn", { target: claimed })) as {
+      ok?: boolean; reason?: string; tmuxSession?: string; tmuxPane?: string; sessionId?: string;
+    };
+    if (!r.ok) {
+      log(c.red(`  ✗ /mirror/spawn 失败: ${r.reason ?? "unknown"}`));
+      log(c.yellow("  可手动: tmux new-session -s weclaude 后跑 claude;或在 WeCom 发任意消息触发 auto-spawn。"));
+      return;
+    }
+    log(c.green(`  ✓ tmux session=${c.bold(r.tmuxSession ?? "")} pane=${r.tmuxPane ?? ""} sid=${r.sessionId ?? ""}`));
+    log(c.dim(`  附加: tmux attach -t ${r.tmuxSession ?? "weclaude"}`));
+    log(c.dim("  现在在 WeCom 发任意消息,daemon 会注入到该 pane 里的 claude;首次工具调用会推授权卡片。"));
+    log(c.green("\n✅ 引导完成。后续可用 `weclaude status` / `weclaude logs -f` 观察。"));
+    return;
+  }
+  log(c.dim("  即将启动 claude (headless),触发一次 Bash 授权 → 你会在 WeCom 收到按钮卡片。"));
+  log(c.dim("  点击「✅」放行即可观察后续推送。\n"));
+  await runDemo(claudeBin);
   log(c.green("\n✅ 引导完成。后续可用 `weclaude status` / `weclaude logs -f` 观察。"));
 };
 
@@ -209,17 +261,17 @@ const pollClaim = async (timeoutMs: number): Promise<string | undefined> => {
   return undefined;
 };
 
-const DEMO_PROMPT = (chat: string): string =>
+const DEMO_PROMPT =
   [
-    "请按顺序执行，不要输出多余解释：",
-    "1. 用 Bash 运行 `echo hello world from weclaude`。",
-    "2. 用 Bash 运行 `sleep 3`。",
-    `3. 用 mcp 工具 \`weclaude__send_markdown\` 向 chat="${chat}" 发送 content="✅ weclaude 演示完成：hello world"。`,
+    "请按顺序执行,不要输出多余解释:",
+    "1. 用 Bash 工具运行 `ls ~/.weclaude/` 看一下 weclaude 的状态目录里都有哪些文件。",
+    "2. 用 Read 工具读取 ~/.weclaude/config.jsonc 的前 30 行,告诉我 wrc.mode 当前是什么值。",
+    "3. 用一句话总结。",
   ].join("\n");
 
-const runDemo = (chat: string, claudeBin: string): Promise<void> =>
+const runDemo = (claudeBin: string): Promise<void> =>
   new Promise((resolve) => {
-    const proc = spawn(claudeBin, ["-p", DEMO_PROMPT(chat)], {
+    const proc = spawn(claudeBin, ["-p", DEMO_PROMPT], {
       stdio: ["ignore", "inherit", "inherit"],
       env: { ...process.env, HOME: process.env.HOME ?? homedir() },
     });

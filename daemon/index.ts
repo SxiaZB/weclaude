@@ -8,6 +8,7 @@ import { loadSessionStore } from "./sessions.js";
 import { loadMirrorStore } from "./mirror-store.js";
 import { makeBridge } from "./cc-bridge.js";
 import { startMirror, installMirrorEventListener, type MirrorBridge } from "./mirror-bridge.js";
+import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { installApprovalEventListener, makeApproveHandler } from "./approval.js";
 import { initDetailPersistence, makeDetailHandler } from "./detail.js";
 import { initAutoWindowPersistence } from "./session-cache.js";
@@ -92,6 +93,25 @@ const main = async (): Promise<void> => {
       }
       const r = m.attach({ sessionId: body.sessionId, jsonlPath: body.jsonlPath, target: body.target, tmuxPane: body.tmuxPane, tmuxSession: body.tmuxSession });
       json(res, r.ok ? 200 : 400, r);
+    });
+    // Manual auto-spawn trigger — used by `weclaude init` to materialize a
+    // tmux+claude pane immediately after claim, instead of waiting for the
+    // first inbound. Body: { target?: "user:xxx" | "chat:xxx" }. Falls back
+    // to cfg.defaultChat. Same code path as the inbound auto-spawn so any
+    // future fix benefits both.
+    http.register("POST /mirror/spawn", async (req, res) => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as Partial<{ target: string }>;
+      const target = (body.target ?? cfg.defaultChat ?? "").trim();
+      if (!target) {
+        json(res, 400, { ok: false, reason: "target required (and cfg.defaultChat empty)" });
+        return;
+      }
+      const spawnLog = log.child({ mod: "mirror", sub: "spawn-init", target });
+      const r = await spawnTmuxClaude({ cfg, log: spawnLog, windowName: target });
+      if (!r.ok) { json(res, 500, { ok: false, reason: r.reason }); return; }
+      const att = m.attach({ sessionId: r.sessionId!, jsonlPath: r.jsonlPath!, target, tmuxPane: r.tmuxPane, tmuxSession: r.tmuxSession });
+      json(res, att.ok ? 200 : 500, att.ok ? { ok: true, sessionId: r.sessionId, tmuxSession: r.tmuxSession, tmuxPane: r.tmuxPane, target } : { ok: false, reason: att.reason });
     });
   }
 

@@ -25,8 +25,9 @@
 // before the first paste-buffer inject hits.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import { expandHome } from "../shared/paths.js";
@@ -111,6 +112,60 @@ export interface SpawnResult {
   tmuxSession?: string;
 }
 
+// Pre-write the "trust this folder" + onboarding markers for `cwd` into
+// claude's user-config json so the TUI doesn't park on the workspace-trust /
+// onboarding prompts — those would silently swallow paste-buffer injects.
+//
+//   claude          → ~/.claude.json
+//   claude-internal → ~/.claude-internal/.claude.json
+//   <other>         → first existing of {~/.<bin>/.claude.json, ~/.<bin>.json};
+//                     when neither exists we pick the dir-style path so the
+//                     write also creates the conventional layout.
+//
+// Idempotent: deep-merges into the existing file, preserves unrelated keys.
+type ClaudeProjectMeta = {
+  hasTrustDialogAccepted?: boolean;
+  projectOnboardingSeenCount?: number;
+  hasClaudeMdExternalIncludesApproved?: boolean;
+  hasClaudeMdExternalIncludesWarningShown?: boolean;
+  [k: string]: unknown;
+};
+const claudeConfigCandidates = (claudeBin: string): string[] => {
+  const home = homedir();
+  const name = basename(claudeBin);
+  if (name === "claude") return [join(home, ".claude.json")];
+  return [join(home, `.${name}`, ".claude.json"), join(home, `.${name}.json`)];
+};
+const trustWorkspace = (claudeBin: string, cwd: string, log: Logger): void => {
+  const candidates = claudeConfigCandidates(claudeBin);
+  const target: string = candidates.find(existsSync) ?? candidates[0]!;
+  let cfg: { projects?: Record<string, ClaudeProjectMeta>; [k: string]: unknown } = {};
+  try {
+    if (existsSync(target)) cfg = JSON.parse(readFileSync(target, "utf8"));
+  } catch (e) {
+    log.warn({ target, err: (e as Error).message }, "trustWorkspace: parse failed; rewriting");
+  }
+  const projects = (cfg.projects ??= {});
+  const proj: ClaudeProjectMeta = projects[cwd] ?? {};
+  if (proj.hasTrustDialogAccepted && (proj.projectOnboardingSeenCount ?? 0) >= 1 && proj.hasClaudeMdExternalIncludesApproved) {
+    return; // already trusted — no write needed
+  }
+  projects[cwd] = {
+    ...proj,
+    hasTrustDialogAccepted: true,
+    projectOnboardingSeenCount: Math.max(proj.projectOnboardingSeenCount ?? 0, 1),
+    hasClaudeMdExternalIncludesApproved: true,
+    hasClaudeMdExternalIncludesWarningShown: true,
+  };
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, JSON.stringify(cfg, null, 2));
+    log.info({ target, cwd }, "trustWorkspace: marker written");
+  } catch (e) {
+    log.warn({ target, err: (e as Error).message }, "trustWorkspace: write failed");
+  }
+};
+
 export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName }: SpawnArgs): Promise<SpawnResult> => {
   const cwd = expandHome(cfg.wrc.cwd);
   const projectDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(cwd));
@@ -134,6 +189,12 @@ export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName }:
   } catch (e) {
     return { ok: false, reason: `prepare cwd failed: ${(e as Error).message}` };
   }
+
+  // Pre-trust the workspace so claude TUI doesn't park on the "Do you trust
+  // this folder?" / onboarding prompts — those prompts swallow paste-buffer
+  // injects and the approval card never fires. Best-effort: log + continue
+  // on failure (worst case the user clicks through the prompts manually).
+  trustWorkspace(cfg.wrc.claudeBin, cwd, log);
 
   // Reuse the shared session if alive; otherwise create it. Either way, end
   // up with a fresh window whose pane id we capture via `-P -F '#{pane_id}'`.

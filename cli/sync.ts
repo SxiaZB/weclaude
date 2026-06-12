@@ -44,10 +44,12 @@ const writeJson = (p: string, obj: unknown): void => {
   writeFileSync(p, JSON.stringify(obj, null, 2) + "\n", "utf8");
 };
 
-// ── Hook strip ────────────────────────────────────────────────────────
-// Hooks are now owned by the plugin's hooks/hooks.json. We keep stripHooks
-// only to clean up legacy settings.json entries from earlier installs —
-// double-registering this hook causes every tool call to spawn two cards.
+// ── Hook strip ───────────────────────────────────────────────────────
+// Hook registration is owned by the Claude Code plugin (`hooks/hooks.json`
+// + `${CLAUDE_PLUGIN_ROOT}`). `weclaude init` runs `claude plugin install`
+// to wire it up. We keep stripHooks only to clean up legacy settings.json
+// entries from earlier installs — leaving both registered fires the hook
+// twice per tool call → duplicate approval cards.
 interface HookEntry {
   matcher?: string;
   hooks: Array<{ type: string; command: string; timeout?: number; _managedBy?: string }>;
@@ -118,9 +120,8 @@ const syncOne = (settingsPath: string, opts: SyncOpts, lock: Lock, env: EnvVals)
   const abs = expandHome(settingsPath);
   const settings = readJson(abs);
 
-  // Always strip legacy hook entries — the plugin's hooks/hooks.json owns
-  // PreToolUse registration now. Leaving both registered fires the hook
-  // twice per tool call → duplicate approval cards.
+  // Always strip first — keeps re-runs idempotent and clears any legacy
+  // hook entries from earlier installs that wrote into settings.json directly.
   stripHooks(settings);
 
   if (opts.remove) {
