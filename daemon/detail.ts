@@ -180,7 +180,7 @@ export const buildDetailUrl = (
   const params = new URLSearchParams({
     id,
     forceInnerBrowser: "1",
-    ww_vw: "1080",
+    ww_vw: "1000",
     ww_vh: "800",
   });
   return `${root}/detail?${params.toString()}`;
