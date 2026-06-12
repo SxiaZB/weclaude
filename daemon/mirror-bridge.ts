@@ -856,6 +856,10 @@ export interface MirrorBridge {
    *  loop end-to-end. Skips the live-stream/replyStream machinery — the tail
    *  pushes assistant output via the standalone path. */
   injectText: (target: string, text: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** Send Esc to the live tmux pane bound to `target` — interrupts whatever
+   *  Claude is currently doing (active generation / open prompt). No-op for
+   *  spawn-mode attachments (no live TTY to interrupt). */
+  interruptPane: (target: string) => Promise<{ ok: boolean; reason?: string }>;
 }
 
 interface ToolEntry {
@@ -1514,6 +1518,17 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         text, images: [], cfg, log: log.child({ principal: target, sessionId: sid, sub: "init-demo" }),
         sessionId: sid, tmuxTarget: a.tmuxPane, freshSpawn: true,
       });
+    },
+    interruptPane: async (target) => {
+      const a = byTarget.get(target);
+      if (!a) return { ok: false, reason: "no mirror attached for target" };
+      if (!a.tmuxPane) return { ok: false, reason: "no live tmux pane (spawn-mode attachment)" };
+      const alive = await tmuxPaneAlive(a.tmuxPane);
+      if (!alive) return { ok: false, reason: "tmux pane no longer alive" };
+      const r = await tmuxRun(["send-keys", "-t", a.tmuxPane, "Escape"]);
+      if (r.code !== 0) return { ok: false, reason: `send-keys Escape failed: ${r.stdout.slice(-200) || r.code}` };
+      log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /stop — Esc sent to pane");
+      return { ok: true };
     },
     shutdown: () => {
       for (const a of bySessionId.values()) {

@@ -38,6 +38,7 @@ const renderIds = (msg: BaseMessage): string => {
 
 const isIdCommand = (text: string): boolean => text.trim() === "/id";
 const isNewCommand = (text: string): boolean => text.trim() === "/new";
+const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 
 // Strip any "@<botname>" mention (leading, mid-text, or trailing) so it doesn't
 // leak into claude's prompt. WeCom may place the mention anywhere depending on
@@ -179,6 +180,18 @@ export const installInboundRouter = (
     if (isNewCommand(text)) {
       const reply = await autoSpawnAndAttach(who);
       try { await client.replyStream(frame, msg.msgid, reply, true); } catch { /* ignore */ }
+      return { stop: true, who };
+    }
+    // Authorized `/stop` — Esc the live pane to interrupt whatever Claude is
+    // currently doing. Mirror-mode only; bails cleanly when no attachment.
+    if (isStopCommand(text)) {
+      if (!("interruptPane" in bridge)) {
+        try { await client.replyStream(frame, msg.msgid, "[weclaude] /stop only available in mirror mode", true); } catch { /* ignore */ }
+      } else {
+        const r = await bridge.interruptPane(who);
+        const reply = r.ok ? "✅ Esc sent" : `[weclaude] /stop failed: ${r.reason ?? "unknown"}`;
+        try { await client.replyStream(frame, msg.msgid, reply, true); } catch { /* ignore */ }
+      }
       return { stop: true, who };
     }
     // Mirror mode but no Claude session attached for this chat yet. Since the
