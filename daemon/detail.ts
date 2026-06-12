@@ -1,7 +1,7 @@
 // 工具调用详情 store + 本地 HTML 渲染。
 // 两类记录:
 //   • tool      ← 镜像 tail 抓到 tool_use / tool_result 时落库, 镜像消息把工具行渲染为
-//                 [🔧 name ...](http://host:port/detail?id=<toolUseId>) 的 markdown 链接,
+//                 🔧 [name ...](http://host:port/detail?id=<toolUseId>) 的 markdown 链接,
 //                 用户在 WeCom 桌面端点链接 → 系统浏览器打开本机 URL → 看完整 input/result。
 //   • approval  ← 授权卡片落库, 卡片 jump_list 多一个 "🔍 详情", 点开看完整入参 / 决策。
 // 持久化: append-only JSONL → stateDir/details.jsonl, 启动 replay; 文件超过 COMPACT_BYTES

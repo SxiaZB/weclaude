@@ -45,8 +45,10 @@ const augmentedPath = (orig: string | undefined): string => {
 };
 
 // Claude Code encodes a project's cwd into a directory name by replacing each
-// `/` with `-`. Absolute path `/Users/foo/bar` → `-Users-foo-bar`.
-const encodeProjectDir = (absCwd: string): string => absCwd.replace(/\//g, "-");
+// `/` AND `.` with `-`. Absolute path `/Users/foo/.bar` → `-Users-foo--bar`
+// (note the double dash from the dot). Missing the dot rule sends the tail
+// to a non-existent dir → ENOENT → silent pane→chat dropout.
+const encodeProjectDir = (absCwd: string): string => absCwd.replace(/[/.]/g, "-");
 
 interface ResolvedSession {
   sessionId: string;
@@ -195,7 +197,13 @@ type RenderItem =
   // NOT originate from the still-open WeCom liveStream — onItem uses this to
   // finalize the prior bubble so the new conversation gets its own bubble.
   | { kind: "user_text"; body: string }
-  | { kind: "tool_use"; body: string; toolUseId: string; name: string; input: unknown }
+  | {
+      kind: "tool_use";
+      body: string;
+      // calls.length === 1 是普通工具调用; > 1 是同一 assistant 行里连续相同
+      // tool name 的批量调用 (e.g. 并行 3 个 Bash) 聚合后的结果。
+      calls: Array<{ toolUseId: string; name: string; input: unknown }>;
+    }
   | { kind: "tool_result"; body: string; toolUseId: string; full: string };
 
 const oneLineSummary = (s: string, max = 40): string => {
@@ -228,6 +236,34 @@ const renderToolInputCompact = (input: unknown): string => {
     if (typeof pick === "string") return oneLineSummary(pick);
   }
   return oneLineSummary(renderToolInput(input));
+};
+
+// 渲染一组同名 tool_use:
+//   • 单次  → `🔧 [Name compact](url)`            (与原行为一致)
+//   • 多次  → 聚合为一个 markdown 块:
+//       🔧 Name × N
+//       [• compact1](url1)
+//       [• compact2](url2)
+// 多次的每条仍是独立 link, 各自指向自己的 detail URL。
+const renderToolUseGroupBody = (
+  calls: Array<{ toolUseId: string; name: string; input: unknown }>,
+  deps: TailDeps,
+): string => {
+  const renderOne = (c: { toolUseId: string; input: unknown }): { compact: string; url: string } => ({
+    compact: safeForMarkdown(renderToolInputCompact(c.input)),
+    url: deps.detailUrlFor(c.toolUseId),
+  });
+  if (calls.length === 1) {
+    const c = calls[0]!;
+    const { compact, url } = renderOne(c);
+    return url ? `🔧 [${c.name} ${compact}](${url})` : `🔧 ${c.name} ${compact}`;
+  }
+  const header = `🔧 ${calls[0]!.name} × ${calls.length}`;
+  const lines = calls.map((c) => {
+    const { compact, url } = renderOne(c);
+    return url ? `[• ${compact}](${url})` : `• ${compact}`;
+  });
+  return [header, ...lines].join("\n");
 };
 
 
@@ -282,37 +318,44 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
   if (line.type === "assistant") {
     const blocks = line.message?.content;
     if (!Array.isArray(blocks)) return [];
-    for (const b of blocks) {
-      if (b?.type === "text" && typeof b.text === "string") {
-        const t = b.text.trim();
-        if (t) out.push({ kind: "text", body: t });
-      } else if (b?.type === "tool_use" && deps.includeTools) {
-        const name = b.name ?? "tool";
-        const compact = safeForMarkdown(renderToolInputCompact(b.input));
-        const toolUseId = b.id ?? "";
-        // Persist the tool record so the click-to-detail page can render
-        // before the matching tool_result arrives — the detail HTML shows
-        // a "running…" placeholder until recordToolResult fills it in.
-        if (toolUseId) {
+    let pending: Array<{ toolUseId: string; name: string; input: unknown }> = [];
+    const flushPending = (): void => {
+      if (pending.length === 0) return;
+      const calls = pending;
+      pending = [];
+      // 每个 tool_use 都要单独 recordTool, 这样点击-查看-详情可以按 id 命中。
+      for (const c of calls) {
+        if (c.toolUseId) {
           recordTool({
-            id: toolUseId,
-            toolName: name,
-            toolInput: b.input,
+            id: c.toolUseId,
+            toolName: c.name,
+            toolInput: c.input,
             sessionId: deps.sessionId,
             target: deps.target,
           });
         }
-        const url = deps.detailUrlFor(toolUseId);
-        out.push({
-          kind: "tool_use",
-          toolUseId,
-          name,
-          input: b.input,
-          body: url ? `[🔧 ${name} ${compact}](${url})` : `🔧 ${name} ${compact}`,
-        });
+      }
+      out.push({
+        kind: "tool_use",
+        calls,
+        body: renderToolUseGroupBody(calls, deps),
+      });
+    };
+    for (const b of blocks) {
+      if (b?.type === "text" && typeof b.text === "string") {
+        flushPending();
+        const t = b.text.trim();
+        if (t) out.push({ kind: "text", body: t });
+      } else if (b?.type === "tool_use" && deps.includeTools) {
+        const name = b.name ?? "tool";
+        const toolUseId = b.id ?? "";
+        // 同名扩展当前 group; 不同名先 flush 再起新组。
+        if (pending.length > 0 && pending[0]!.name !== name) flushPending();
+        pending.push({ toolUseId, name, input: b.input });
       }
       // thinking blocks intentionally skipped
     }
+    flushPending();
     return out;
   }
 
@@ -1050,7 +1093,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
 
   const recordToolEntry = (s: ActiveStream, item: RenderItem): void => {
     if (item.kind === "tool_use") {
-      s.tools.push({ toolUseId: item.toolUseId, name: item.name, input: item.input });
+      for (const c of item.calls) {
+        s.tools.push({ toolUseId: c.toolUseId, name: c.name, input: c.input });
+      }
     } else if (item.kind === "tool_result") {
       // Match by toolUseId; if not found, append a standalone result entry.
       const existing = item.toolUseId

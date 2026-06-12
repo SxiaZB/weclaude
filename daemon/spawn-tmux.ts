@@ -42,7 +42,7 @@ const augmentedPath = (orig: string | undefined): string => {
     .join(":");
 };
 
-const encodeProjectDir = (absCwd: string): string => absCwd.replace(/\//g, "-");
+const encodeProjectDir = (absCwd: string): string => absCwd.replace(/[/.]/g, "-");
 
 interface ExecResult {
   ok: boolean;

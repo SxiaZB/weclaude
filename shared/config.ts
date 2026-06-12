@@ -27,8 +27,10 @@ const Daemon = z.object({
 const Mirror = z.object({
   // Where Claude Code writes per-project transcripts. Forks like `claude-internal`
   // use a parallel dir (e.g. `~/.claude-internal/projects`). The mirror tails
-  // `<projectsDir>/<encoded(wrc.cwd)>/<sid>.jsonl`.
-  projectsDir: z.string().default("~/.claude/projects"),
+  // `<projectsDir>/<encoded(wrc.cwd)>/<sid>.jsonl`. Empty → auto-derive from
+  // `wrc.claudeBin` basename (handled by the Wrc transform below): `claude` →
+  // `~/.claude/projects`, `claude-internal` → `~/.claude-internal/projects`.
+  projectsDir: z.string().default(""),
   // Pin a specific Claude session to mirror. Empty → auto-pick latest .jsonl
   // under `<projectsDir>/<encoded(wrc.cwd)>/` by mtime.
   sessionId: z.string().default(""),
@@ -71,6 +73,16 @@ const Wrc = z.object({
   // `${prefix}-<short>`. Auto-spawn fires when an authorized inbound finds no
   // mirror attached for that chat — allowFrom IS the authorization.
   tmuxPrefix: z.string().default("weclaude"),
+}).transform((v) => {
+  // Auto-derive projectsDir from claudeBin basename when not explicitly set.
+  // `claude` → `~/.claude/projects`, `claude-internal` → `~/.claude-internal/projects`.
+  // Without this, a user running claude-internal sees the daemon tailing the
+  // wrong dir → pane→chat silently drops every reply.
+  if (!v.mirror.projectsDir) {
+    const name = v.claudeBin.split("/").pop() || "claude";
+    v.mirror.projectsDir = `~/.${name}/projects`;
+  }
+  return v;
 });
 
 const Approval = z.object({

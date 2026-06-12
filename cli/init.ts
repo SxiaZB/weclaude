@@ -249,15 +249,9 @@ const main = async (): Promise<void> => {
     log(c.dim(`  附加: tmux attach -t ${r.tmuxSession ?? "weclaude"}`));
     log(`\n  ${c.bold("→ 现在去 WeCom 给机器人发一条消息(比如 \"hi\"):")}`);
     log(c.dim("    inbound → openStream → 注入 tmux pane → 输出回流为打字机气泡"));
-    if (enableHook) {
-      log(c.dim("    若消息触发工具调用,会在 WeCom 推授权卡片"));
-    }
     log(c.green("\n✅ 引导完成。后续可用 `weclaude status` / `weclaude logs -f` 观察。"));
     return;
   }
-  log(c.dim("  即将启动 claude (headless),触发一次 Bash 授权 → 你会在 WeCom 收到按钮卡片。"));
-  log(c.dim("  点击「✅」放行即可观察后续推送。\n"));
-  await runDemo(claudeBin);
   log(c.green("\n✅ 引导完成。后续可用 `weclaude status` / `weclaude logs -f` 观察。"));
 };
 

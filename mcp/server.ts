@@ -20,8 +20,9 @@ const fail = (msg: string) => ({
   content: [{ type: "text" as const, text: msg }],
 });
 
-// claude encodes a project's cwd into a dir name by replacing each `/` with `-`
-const encodeProjectDir = (absCwd: string): string => absCwd.replace(/\//g, "-");
+// claude encodes a project's cwd into a dir name by replacing each `/` AND `.`
+// with `-`. `/Users/foo/.bar` → `-Users-foo--bar` (double dash from the dot).
+const encodeProjectDir = (absCwd: string): string => absCwd.replace(/[/.]/g, "-");
 
 const findProjectDir = (cwd: string): string | undefined => {
   const enc = encodeProjectDir(cwd);
