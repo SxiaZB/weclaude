@@ -56,9 +56,15 @@ const main = async (): Promise<void> => {
     fatalExit("bridge failed to start");
   }
   installInboundRouter(ws.client, cfg, log, bridge, sourcePath);
-  // approval click 不再终结 liveStream:让 stream 持续到本轮自然结束(下一次 inbound 或 hardTimer),
-  // 避免点击后剩余 tool 调用被踢出气泡、单独以 standalone markdown 显示——视觉上像"多截断了一个 toolcall"。
-  installApprovalEventListener(ws.client, log.child({ mod: "approval" }), cfg);
+  // approval click → finalize 当前 liveStream, 后续 tool/text 落到 standalone。
+  // 规则 2: 用户点击授权那一刻就是"上一段对话"的边界, 截断 stream 让授权后的
+  // 工作单独成块, 比让 stream 一直长到下一个 inbound / hardTimer 更清晰。
+  // headless 模式没有 liveStream 概念, onApproved 只在 mirror 模式接。
+  const onApproved =
+    cfg.wrc.mode === "mirror"
+      ? (sid: string): void => (bridge as MirrorBridge).terminateLiveStream(sid)
+      : undefined;
+  installApprovalEventListener(ws.client, log.child({ mod: "approval" }), cfg, onApproved);
   // In mirror mode, route approval cards to the WeCom chat bound to the requesting session.
   // Falls back to cfg.approval.approvers / cfg.defaultChat when no mirror is attached.
   const getMirrorTarget =

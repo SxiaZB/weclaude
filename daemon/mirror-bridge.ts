@@ -836,6 +836,9 @@ interface ActiveStream {
   hardTimer?: NodeJS.Timeout;
   cardSent: boolean;
   tools: ToolEntry[];
+  /** 本流内已追加过 tool_use/tool_result。规则 1: tool 之后的首个 text item
+   *  截断当前 stream, 让最终文本回复落到独立 standalone 气泡。 */
+  sawTool: boolean;
 }
 
 interface AttachState {
@@ -993,7 +996,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       frame, streamId,
       acc: "", lastSent: "",
       capped: false, closed: false, dead: false, cardSent: false,
-      tools: [],
+      tools: [], sawTool: false,
     };
     s.hardTimer = setTimeout(() => void finalizeStream(a, s), HARD_TIMEOUT_MS);
     log.info({ sessionId: a.sessionId, turnId: s.turnId, streamId }, "stream open");
@@ -1069,6 +1072,15 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
     const s = a.liveStream;
     if (s && !s.closed && !s.dead && !s.capped) {
+      // 规则 1: tool→text 截断。本流已经追加过 tool 项, 此刻又来 text item
+      // → 视为"工具调用阶段结束, 进入文本回复阶段"。立即 finalize 当前
+      // bubble, text 走 standalone 单独成条。视觉上 tool 调用聚成一个气泡,
+      // 最终答复独立显示, 比挤进同一个 mega-bubble 更易读。
+      if (item.kind === "text" && s.sawTool) {
+        void finalizeStream(a, s);
+        enqueueStandalone(a, item.body);
+        return;
+      }
       const sep = s.acc ? "\n\n" : "";
       const next = s.acc + sep + item.body;
       if (next.length > STREAM_SOFT_CAP) {
@@ -1077,7 +1089,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       } else {
         s.acc = next;
       }
-      if (item.kind !== "text") recordToolEntry(s, item);
+      if (item.kind !== "text") {
+        recordToolEntry(s, item);
+        s.sawTool = true;
+      }
       log.debug({ sessionId: a.sessionId, turnId: s.turnId, kind: item.kind, accLen: s.acc.length }, "stream append");
       scheduleFlush(s);
       return;
