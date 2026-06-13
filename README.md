@@ -7,6 +7,7 @@
 - 🖼 **图片直贴** — 企业微信发图，自动走 macOS 剪贴板 + tmux 粘贴，Claude 当贴图处理（不走 Read，不耗 token）。
 - 🔍 **细节页** — 工具调用 / 审批请求都生成本地 HTML 详情页，IM 里点链接看完整 input / result / git diff。
 - 📡 **MCP 主动推送** — Claude 通过 `wecom__send_markdown` / `wecom__send_card` / `wecom__ask_user` 主动汇报或问询。
+- 📄 **文档读写** — Claude 通过 `wecom_doc_list_tools` / `wecom_doc_call` 直接调企业微信智能机器人的 doc / smartsheet / smartpage MCP，新建在线文档、写 Markdown、读链接、操作智能表格——全程在内网，不需要 corp access_token。
 
 ---
 
@@ -75,6 +76,51 @@ weclaude init
 > > 把刚才那个函数改成异步的
 >
 > 这条消息自动粘进 CLI 输入框 + 回车提交。Claude 的回应、调用了哪些工具、改了哪些文件，逐字流式推回你 IM。回家打开终端，对话一字不少都在那里。
+
+**文档场景**：
+
+> 你给 Claude 说："周报给我整理成一篇企业微信文档"。Claude 自己调 `wecom_doc_list_tools` 看可用方法，再调 `wecom_doc_call` 走 `create_doc` 新建文档、`edit_doc_content` 写入 Markdown，最后把链接贴回会话——全程不离开 Claude，文档归属到你的 userid，每日 20 篇限额按 userid 计。
+
+---
+
+## 文档 / 智能表格 / 智能文档
+
+`weclaude` 把企业微信智能机器人的远端 MCP（doc / smartsheet / contact 等）桥接到本地 Claude，**不走 corp access_token**：daemon 直接复用 botId+secret 的 WS 长连，通过 `aibot_get_mcp_config` 命令拉到每个 category 的 Streamable HTTP MCP URL，再以 JSON-RPC 调 `tools/list` / `tools/call`，`x-openclaw-wecom-userid` header 透传文档归属人。
+
+**前置一次性授权**：在企业微信「工作台 - 智能机器人 - 你的机器人 - 可使用权限」里勾选「文档」「智能表格」对应能力。第一次调用如果未授权，远端会返回结构化错误（errcode 851013）+ 授权链接，原样转给 Claude，照着点同意即可。
+
+**Claude 侧自动发现**：模型先调一次 `wecom_doc_list_tools(category="doc")` 拿到工具列表（`create_doc` / `edit_doc_content` / `smartpage_create` / `upload_doc_image` ...）和入参 schema，再用 `wecom_doc_call(category, method, args)` 执行。category 当前可选：
+
+| category | 能干嘛 |
+| --- | --- |
+| `doc` | 在线文档、智能文档、文档图片上传 |
+| `smartsheet` | 智能表格的字段 / 记录读写 |
+| `contact` | 通讯录查询（按需授权） |
+
+**curl 验证**：
+
+```bash
+# 列 doc 类目下所有可用工具
+curl -sS -X POST http://127.0.0.1:17890/wedoc/list \
+  -H 'content-type: application/json' \
+  -d '{"category":"doc"}'
+
+# 创建一篇文档
+curl -sS -X POST http://127.0.0.1:17890/wedoc/call \
+  -H 'content-type: application/json' \
+  -d '{"category":"doc","method":"create_doc","args":{"doc_type":3,"doc_name":"demo"}}'
+
+# 写入 Markdown
+curl -sS -X POST http://127.0.0.1:17890/wedoc/call \
+  -H 'content-type: application/json' \
+  -d '{"category":"doc","method":"edit_doc_content",
+       "args":{"docid":"<返回的 docid>","content_type":1,"content":"# 标题\n正文"}}'
+
+# 授权变更后清缓存
+curl -sS -X POST http://127.0.0.1:17890/wedoc/invalidate -H 'content-type: application/json' -d '{}'
+```
+
+`requesterUserId` 解析顺序：调用方显式传入 → `defaultChat` 的 `user:<id>` 部分 → 不传（远端会拒，错误原样回到 Claude，比 daemon 提前判更透明）。
 
 ---
 
