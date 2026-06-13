@@ -177,5 +177,73 @@ server.registerTool(
   },
 );
 
+// 企业微信 doc / smartsheet / contact MCP 桥接。把 daemon 远端的 MCP 转发
+// 给本地 Claude: list_tools 列工具, call_tool 调用 (创建文档 / 写表格 / 读
+// 内容)。category 当前可选: "doc" | "smartsheet" | "contact"。
+// 大模型先调 list_tools 看可用方法和入参 schema, 再 call_tool。
+server.registerTool(
+  "wecom_doc_list_tools",
+  {
+    title: "List WeCom doc/smartsheet tools",
+    description:
+      "List available WeCom MCP tools for a given category. Categories: 'doc' (online documents), 'smartsheet' (smart sheets), 'contact'. Returns tool names + JSON Schema. Call this BEFORE wecom_doc_call to discover method names and required arguments.",
+    inputSchema: {
+      category: z.string().describe("MCP category: 'doc' | 'smartsheet' | 'contact'."),
+      requesterUserId: z
+        .string()
+        .optional()
+        .describe(
+          "WeCom userid that owns the resulting docs. Optional — daemon falls back to config.wedoc.requesterUserId or defaultChat. 'user:xxx' prefix accepted.",
+        ),
+    },
+  },
+  async ({ category, requesterUserId }) => {
+    const resp = await fetch(`${DAEMON_BASE}/wedoc/list`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ category, ...(requesterUserId ? { requesterUserId } : {}) }),
+    });
+    const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; error?: string; result?: unknown };
+    return j.ok ? ok(j.result) : fail(`wecom_doc_list_tools failed: ${j.error ?? `http ${resp.status}`}`);
+  },
+);
+
+server.registerTool(
+  "wecom_doc_call",
+  {
+    title: "Call WeCom doc/smartsheet tool",
+    description:
+      "Invoke a specific WeCom MCP tool (after discovering it via wecom_doc_list_tools). Typical flow: list tools for 'doc' → pick a method like 'doc_create' → call it with args matching its inputSchema. Daily quota: 20 docs per requesterUserId.",
+    inputSchema: {
+      category: z.string().describe("MCP category: 'doc' | 'smartsheet' | 'contact'."),
+      method: z.string().describe("Tool name from wecom_doc_list_tools (e.g. 'doc_create', 'smartsheet_add_records')."),
+      args: z
+        .record(z.string(), z.unknown())
+        .optional()
+        .describe("JSON object matching the tool's inputSchema. Empty object if the tool takes no params."),
+      requesterUserId: z
+        .string()
+        .optional()
+        .describe(
+          "WeCom userid acting as document owner. Optional — daemon falls back to config / defaultChat. 'user:xxx' prefix accepted.",
+        ),
+    },
+  },
+  async ({ category, method, args, requesterUserId }) => {
+    const resp = await fetch(`${DAEMON_BASE}/wedoc/call`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        category,
+        method,
+        args: args ?? {},
+        ...(requesterUserId ? { requesterUserId } : {}),
+      }),
+    });
+    const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; error?: string; result?: unknown };
+    return j.ok ? ok(j.result) : fail(`wecom_doc_call failed: ${j.error ?? `http ${resp.status}`}`);
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
