@@ -131,7 +131,7 @@ export const installInboundRouter = (
         lines.push(`下次切换: \`${pendingCwd}\` (使用 /new 或 /clear 生效)`);
       }
       if (runningCwd !== defaultCwd) lines.push(`(默认: \`${defaultCwd}\`)`);
-      lines.push("> 切换其他项目: 让 AI 调用 `set_project_path` MCP 工具");
+      lines.push("> 切换其他项目: 让 AI 调用 `cd` MCP 工具");
       return lines.join("\n");
     }
     return `[weclaude] 📂 当前项目: \`${expandHome(cfg.wrc.cwd)}\` (headless mode, 全局默认)`;

@@ -132,13 +132,13 @@ server.registerTool(
   },
 );
 
-// set_project_path — bind a per-chat project cwd in the daemon's mirror
-// store. Doesn't move the live claude (cwd is set at pane spawn time);
-// instead writes to `pendingCwd` and the next /new (or /clear that's
-// upgraded into /new) respawns the pane in the new path. Tell the user
-// to send /new (or /clear) for it to take effect.
+// cd — bind a per-chat project cwd in the daemon's mirror store. Doesn't
+// move the live claude (cwd is set at pane spawn time); instead writes to
+// `pendingCwd` and the next /new (or /clear that's upgraded into /new)
+// respawns the pane in the new path. Tell the user to send /new (or
+// /clear) for it to take effect.
 server.registerTool(
-  "set_project_path",
+  "cd",
   {
     title: "Bind project path to current chat",
     description:
@@ -166,7 +166,7 @@ server.registerTool(
       }),
     });
     const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; reason?: string; target?: string; runningCwd?: string; pendingCwd?: string };
-    if (!j.ok) return fail(`set_project_path failed: ${j.reason ?? "unknown"}`);
+    if (!j.ok) return fail(`cd failed: ${j.reason ?? "unknown"}`);
     return ok({
       ok: true,
       target: j.target,

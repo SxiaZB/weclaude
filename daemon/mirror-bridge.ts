@@ -916,7 +916,7 @@ interface AttachState {
    *  Diverges from `pendingCwd` when the user has requested a switch but
    *  hasn't yet hit /new — /clear bridges the gap by upgrading to /new. */
   runningCwd: string;
-  /** User-requested next cwd (set via set_project_path MCP tool). Applied at
+  /** User-requested next cwd (set via `cd` MCP tool). Applied at
    *  next /new (or /clear → upgraded to /new). Cleared after the spawn. */
   pendingCwd: string;
   tail: TailHandle;
@@ -1516,7 +1516,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (pending && pending !== running) {
       lines.push(`下次切换: \`${pending}\` (使用 /new 或 /clear 生效)`);
     }
-    lines.push("> 切换其他项目: 在对话中告诉 AI 调用 `set_project_path` MCP 工具");
+    lines.push("> 切换其他项目: 在对话中告诉 AI 调用 `cd` MCP 工具");
     return lines.join("\n");
   };
 
