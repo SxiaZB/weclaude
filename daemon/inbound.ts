@@ -26,13 +26,25 @@ const authPrincipals = (msg: BaseMessage): string[] => {
 
 // "会话id" = chat-binding (session/mirror key); "权限id" = either the group
 // OR the sender — allowFrom passes if any one of them is whitelisted.
-const renderIds = (msg: BaseMessage): string => {
+// Also surfaces per-id 授权状态 + 对应 `weclaude mirror` CLI 参数 (vid:/chatid:),
+// so users can copy-paste straight into a terminal to bind a Claude session.
+const renderIds = (msg: BaseMessage, cfg: Config): string => {
+  const allowed = new Set(cfg.wrc.allowFrom.map((e) => sanitizeId(e)));
+  const mark = (id: string): string => (allowed.has(id) ? "✅ 已授权" : "❌ 未授权");
   const sender = `user:${msg.from.userid}`;
   if (msg.chattype === "group" && msg.chatid) {
     const chat = `chat:${msg.chatid}`;
-    return `[weclaude] 会话id: \`${chat}\`\n发送者: \`${sender}\`\n权限id (allowFrom): \`${chat}\` 或 \`${sender}\` 任一即可`;
+    return [
+      `[weclaude] 群id: \`${chat}\` ${mark(chat)}`,
+      `发送者: \`${sender}\` ${mark(sender)}`,
+      `(allowFrom 任一通过即可)`,
+      `在已有claude会话中绑定本群聊: \`/wrc chatid:${msg.chatid}\``,
+    ].join("\n");
   }
-  return `[weclaude] 会话id / 权限id: \`${sender}\``;
+  return [
+    `[weclaude] 会话id: \`${sender}\` ${mark(sender)}`,
+    `在cli会话中绑定本单聊会话: \`weclaude mirror vid:${msg.from.userid}\``,
+  ].join("\n");
 };
 
 const isIdCommand = (text: string): boolean => text.trim() === "/id";
@@ -155,7 +167,7 @@ export const installInboundRouter = (
     const auths = authPrincipals(msg);
     // /id — bypass allowFrom so users can discover their ids before configuring.
     if (isIdCommand(text)) {
-      try { await client.replyStream(frame, msg.msgid, renderIds(msg), true); } catch { /* ignore */ }
+      try { await client.replyStream(frame, msg.msgid, renderIds(msg, cfg), true); } catch { /* ignore */ }
       return { stop: true, who };
     }
     // /pwd — bypass allowFrom too. Read-only project-path lookup.
@@ -190,7 +202,7 @@ export const installInboundRouter = (
         await client.replyStream(
           frame,
           msg.msgid,
-          `[weclaude] 未授权\n${renderIds(msg)}\n请将上述任一权限id加入 config 的 wrc.allowFrom 数组`,
+          `[weclaude] 未授权\n${renderIds(msg, cfg)}\n请将上述任一权限id加入 config 的 wrc.allowFrom 数组`,
           true,
         );
       } catch { /* ignore */ }
