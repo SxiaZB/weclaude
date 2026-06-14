@@ -489,32 +489,40 @@ const parseAskqInput = (i: unknown): AskqQuestion[] | undefined => {
   });
 };
 
-const ASKQ_OPTION_TEXT_MAX = 11;
 const ASKQ_TITLE_MAX = 26;
 const ASKQ_SUB_MAX = 480;
+const ASKQ_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const askqLabel = (idx: number): string => ASKQ_LETTERS[idx] ?? String(idx + 1);
+
+// vote_interaction 只支持 card_type/source/main_title/checkbox/submit_button/task_id,
+// sub_title_text/quote_area 等会被静默吞掉 → 题目和选项必须走前置 markdown 消息。
+const buildAskqMarkdown = (q: AskqQuestion): string => {
+  const head = q.question ? `**🤔 ${q.question}**` : `**🤔 ${q.header || "请选择"}**`;
+  const opts = q.options.map((o, idx) => {
+    const desc = o.description ? ` — ${o.description}` : "";
+    return `**${askqLabel(idx)}.** ${o.label}${desc}`;
+  });
+  return [head, "", ...opts].join("\n");
+};
 
 const buildAskqCard = (reqId: string, q: AskqQuestion, transcriptTail: string): TemplateCard => {
-  const lines: string[] = [];
-  if (q.question) lines.push(q.question);
-  q.options.forEach((o, idx) => {
-    if (o.description) lines.push(`${idx + 1}. ${o.label} — ${o.description}`);
-  });
   const tail = oneLine(transcriptTail).trim();
   return {
     card_type: "vote_interaction",
     source: buildSource(tail),
     main_title: { title: TRUNC(`🤔 ${q.header || "请选择"}`, ASKQ_TITLE_MAX) },
-    sub_title_text: TRUNC(lines.join("\n"), ASKQ_SUB_MAX),
     task_id: reqId,
     checkbox: {
       question_key: "q",
       mode: q.multiSelect ? 1 : 0,
+      // 完整文案在前置 markdown 消息里以 ABCD 编号呈现,这里只显示编号,
+      // 避免长 label 被卡片选项栏截断成无意义前缀。
       option_list: [
-        ...q.options.map((o, idx) => ({
+        ...q.options.map((_, idx) => ({
           id: String(idx),
-          text: TRUNC(o.label, ASKQ_OPTION_TEXT_MAX),
+          text: askqLabel(idx),
         })),
-        { id: ASKQ_CLI_OPTION_ID, text: "🖥️ CLI 处理" },
+        { id: ASKQ_CLI_OPTION_ID, text: "🖥️ 去 CLI 中处理" },
       ],
     },
     submit_button: { text: "提交", key: encodeAskqKey(reqId) },
@@ -532,7 +540,7 @@ const buildAskqResolvedCard = (
   transcriptTail: string,
 ): TemplateCard => {
   const summary = outcome.kind === "cli"
-    ? "🖥️ 已转 CLI 处理"
+    ? "🖥️ 已转 CLI 中处理"
     : outcome.kind === "empty"
       ? "⚠️ 未选择"
       : `✅ ${outcome.picked.map((i) => q.options[i]?.label ?? `#${i}`).join(", ")}`;
@@ -583,7 +591,18 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget }
   });
 
   try {
-    await client.sendMessage(targetChatId(approver), {
+    const target = targetChatId(approver);
+    // 先发 markdown 列出题目+ABCD 选项 (vote 卡不支持正文字段),
+    // 失败不阻断,卡片仍按字母编号显示。
+    try {
+      await client.sendMessage(target, {
+        msgtype: "markdown",
+        markdown: { content: buildAskqMarkdown(q) },
+      });
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "askq markdown prelude send failed");
+    }
+    await client.sendMessage(target, {
       msgtype: "template_card",
       template_card: buildAskqCard(reqId, q, body.transcript_tail ?? ""),
     });
