@@ -35,15 +35,15 @@ const renderIds = (msg: BaseMessage, cfg: Config): string => {
   if (msg.chattype === "group" && msg.chatid) {
     const chat = `chat:${msg.chatid}`;
     return [
-      `[weclaude] 群id: \`${chat}\` ${mark(chat)}`,
+      `群: \`${chat}\` ${mark(chat)}`,
       `发送者: \`${sender}\` ${mark(sender)}`,
       `(allowFrom 任一通过即可)`,
-      `在已有claude会话中绑定本群聊: \`/wrc chatid:${msg.chatid}\``,
+      `在已有claude会话中绑定本群聊: \`/wrc chat:${msg.chatid}\``,
     ].join("\n");
   }
   return [
-    `[weclaude] 会话id: \`${sender}\` ${mark(sender)}`,
-    `在cli会话中绑定本单聊会话: \`weclaude mirror vid:${msg.from.userid}\``,
+    `会话id: \`${sender}\` ${mark(sender)}`,
+    `在已有claude会话中绑定本单聊: \`/wrc user:${msg.from.userid}\``,
   ].join("\n");
 };
 
@@ -202,7 +202,7 @@ export const installInboundRouter = (
         await client.replyStream(
           frame,
           msg.msgid,
-          `[weclaude] 未授权\n${renderIds(msg, cfg)}\n请将上述任一权限id加入 config 的 wrc.allowFrom 数组`,
+          `未授权\n${renderIds(msg, cfg)}\n请将上述任一权限id加入 config 的 wrc.allowFrom 数组`,
           true,
         );
       } catch { /* ignore */ }
