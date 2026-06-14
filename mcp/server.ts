@@ -134,15 +134,18 @@ server.registerTool(
 
 // cd — bind a per-chat project cwd in the daemon's mirror store. Doesn't
 // move the live claude (cwd is set at pane spawn time); instead writes to
-// `pendingCwd` and the next /new (or /clear that's upgraded into /new)
-// respawns the pane in the new path. Tell the user to send /new (or
-// /clear) for it to take effect.
+// `pendingCwd`. Apply only fires for `/clear` or `/new` sent **from the
+// WeCom side** — that's the only path that goes through `dispatch` where
+// the kill-pane + respawn-in-pendingCwd upgrade lives (mirror-bridge.ts
+// `dispatch` armMigration branch). A `/clear` typed in the local REPL just
+// rotates claude's sessionId in the same pane; the daemon never sees it
+// and the pane stays in the old cwd.
 server.registerTool(
   "cd",
   {
     title: "Bind project path to current chat",
     description:
-      "Persist a project cwd binding for the WeCom chat that mirrors this Claude session. The change takes effect on the next /new (or /clear, which auto-upgrades to /new when the path differs). Use absolute paths (or paths starting with ~).",
+      "Persist a project cwd binding for the WeCom chat that mirrors this Claude session. To apply: send `/clear` or `/new` FROM THE WECOM SIDE — only WeCom-originated commands flow through the daemon's dispatch which kills+respawns the pane in the new cwd. A `/clear` typed in the local Claude REPL does NOT apply the cwd switch; it only rotates the sessionId in the existing pane (still in the old directory). Use absolute paths (or paths starting with ~).",
     inputSchema: {
       cwd: z.string().describe("Absolute project path, e.g. /Users/foo/projects/bar. ~ is expanded."),
       target: z
@@ -172,7 +175,7 @@ server.registerTool(
       target: j.target,
       runningCwd: j.runningCwd,
       pendingCwd: j.pendingCwd,
-      hint: "Send /new (or /clear) in WeCom to apply the new path.",
+      hint: "Send `/clear` or `/new` FROM THE WECOM SIDE to apply. Local-REPL `/clear` will NOT switch cwd — only WeCom-originated commands flow through the daemon's kill-pane + respawn-in-pendingCwd path.",
     });
   },
 );
