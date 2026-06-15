@@ -42,6 +42,7 @@
     "systemd/weclaude.service.template",
     "config.example.jsonc",
     "commands/wrc.md",
+    "images/demo.png",
     "README.md",
     "CLAUDE.md",
     "LICENSE"
