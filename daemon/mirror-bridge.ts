@@ -129,6 +129,12 @@ interface TranscriptLine {
   message?: {
     role?: string;
     content?: string | ContentBlock[];
+    /** Anthropic Messages API stop_reason — present on assistant turns. We
+     *  treat `end_turn` / `stop_sequence` / `max_tokens` as "turn truly done"
+     *  signals to immediately finalize the live WeCom bubble (so it's
+     *  quotable without waiting for the next inbound or the 6-min hard
+     *  timeout). `tool_use` is NOT terminal — more turns will follow. */
+    stop_reason?: string;
   };
   isMeta?: boolean;
   isSidechain?: boolean;
@@ -205,7 +211,12 @@ type RenderItem =
       // tool name 的批量调用 (e.g. 并行 3 个 Bash) 聚合后的结果。
       calls: Array<{ toolUseId: string; name: string; input: unknown }>;
     }
-  | { kind: "tool_result"; body: string; toolUseId: string; full: string };
+  | { kind: "tool_result"; body: string; toolUseId: string; full: string }
+  // Assistant turn truly ended (stop_reason ∈ {end_turn, stop_sequence,
+  // max_tokens}). Emitted AFTER any text/tool_use items from the same line so
+  // onItem can finalize the bubble once the content has been appended. Pure
+  // signal — no body to render.
+  | { kind: "turn_end" };
 
 const oneLineSummary = (s: string, max = 40): string => {
   const flat = s.replace(/\s+/g, " ").trim();
@@ -357,6 +368,13 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
       // thinking blocks intentionally skipped
     }
     flushPending();
+    // Terminal stop_reason → emit turn_end so onItem closes the live bubble.
+    // `tool_use` is intentionally excluded — more turns will follow once the
+    // tool result lands; finalizing now would split a single logical reply.
+    const sr = line.message?.stop_reason;
+    if (sr === "end_turn" || sr === "stop_sequence" || sr === "max_tokens") {
+      out.push({ kind: "turn_end" });
+    }
     return out;
   }
 
@@ -1134,6 +1152,16 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   };
 
   const onItem = (a: AttachState, item: RenderItem): void => {
+    // Assistant turn truly ended (stop_reason terminal). Finalize the live
+    // bubble synchronously so it becomes quotable in WeCom without waiting
+    // for the next inbound or the 6-min hard timeout. No body to append.
+    if (item.kind === "turn_end") {
+      if (a.liveStream && !a.liveStream.closed) {
+        log.debug({ sessionId: a.sessionId, turnId: a.liveStream.turnId }, "turn_end → finalize");
+        void finalizeStream(a, a.liveStream);
+      }
+      return;
+    }
     // CLI-side user line marks a turn boundary that did NOT come from WeCom.
     // Close any open WeCom liveStream first so the new conversation gets its
     // own bubble — otherwise the user's CLI exchange silently mutates the

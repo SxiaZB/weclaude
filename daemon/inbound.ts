@@ -99,15 +99,34 @@ const renderQuotePrefix = (q: QuoteContent | undefined): string => {
   const quoted = body.split("\n").map((l) => `> ${l}`).join("\n");
   return `> [引用]\n${quoted}\n\n`;
 };
+// Normalize for self-reply quote dedup: WeCom mangles formatting on its quote
+// bubble in unpredictable ways — strips backticks, swaps `-` bullets for `·`,
+// re-wraps whitespace, sometimes loses inline markdown. Reduce both sides to
+// just letters + digits (Unicode + CJK) and compare on that — robust against
+// any punctuation/whitespace/markup churn while keeping content fidelity.
+const canonForCompare = (s: string): string => s.replace(/[^\p{L}\p{N}]/gu, "");
+
+const isLastResponseQuote = (target: string, quoted: string): boolean => {
+  const last = getLastResponse(target);
+  if (!last || !quoted) return false;
+  const a = canonForCompare(last);
+  const b = canonForCompare(quoted);
+  if (a.length < 4 || b.length < 6) return false; // too short — false-positive risk
+  // Substring match (prefix subsumes; suffix covers tool-heavy turns where the
+  // tracked `s.acc` interleaves tool entries before the final text). Both
+  // sides are canon'd to letters+digits only, so formatting/punctuation drift
+  // can't break the match.
+  return a.includes(b);
+};
+
 const withQuote = (msg: BaseMessage, text: string): string => {
   if (!msg.quote) return text;
   // Drop the quote when the user is replying to weclaude's most recent message
   // in this chat — claude already has that turn in its context, surfacing it
   // again is redundant noise. Older self-quotes still flow through (the user
   // is genuinely pointing back to something earlier).
-  const last = getLastResponse(chatPrincipal(msg));
   const quoted = quoteToText(msg.quote).trim();
-  if (last && quoted && quoted === last.trim()) return text;
+  if (isLastResponseQuote(chatPrincipal(msg), quoted)) return text;
   const prefix = renderQuotePrefix(msg.quote);
   return prefix ? `${prefix}${text}` : text;
 };
