@@ -4,6 +4,14 @@
   "description": "Bridge Claude Code and WeCom: PreToolUse approval cards + bidirectional tmux session mirror with image paste",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guxi11/weclaude.git"
+  },
+  "homepage": "https://github.com/guxi11/weclaude#readme",
+  "bugs": {
+    "url": "https://github.com/guxi11/weclaude/issues"
+  },
   "keywords": [
     "claude",
     "claude-code",
@@ -42,7 +50,6 @@
     "systemd/weclaude.service.template",
     "config.example.jsonc",
     "commands/wrc.md",
-    "images/demo.png",
     "README.md",
     "CLAUDE.md",
     "LICENSE"
