@@ -20,6 +20,7 @@ import {
   makeClaimResetHandler,
 } from "./claim.js";
 import { makeWedocBridge } from "./wedoc.js";
+import { installResponseTracker } from "./last-response.js";
 
 // pino's file transport is async; without flush, log.fatal before process.exit
 // vanishes. Mirror anything fatal to stderr too so launchd's stderr.log captures it.
@@ -46,6 +47,9 @@ const main = async (): Promise<void> => {
   initDetailPersistence(cfg.daemon.stateDir, log.child({ mod: "detail" }));
 
   const ws = startWs(cfg, log);
+  // Wrap replyStream / replyStreamWithCard before any module sends —
+  // last-response tracker enables inbound's `quote` dedup of bot self-replies.
+  installResponseTracker(ws.client);
   const sessions = loadSessionStore(cfg.wrc.sessionMapFile);
   const mirrorStore = loadMirrorStore(cfg.wrc.mirror.attachmentsFile);
   const bridge =

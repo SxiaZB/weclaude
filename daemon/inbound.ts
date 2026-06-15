@@ -2,13 +2,14 @@
 // (mode=headless) or the mirror bridge (mode=mirror).
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { WSClient, WsFrame, TextMessage, ImageMessage, MixedMessage, BaseMessage } from "@wecom/aibot-node-sdk";
+import type { WSClient, WsFrame, TextMessage, ImageMessage, MixedMessage, BaseMessage, QuoteContent } from "@wecom/aibot-node-sdk";
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import type { Bridge } from "./cc-bridge.js";
 import type { MirrorBridge } from "./mirror-bridge.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
 import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim } from "./claim.js";
+import { getLastResponse } from "./last-response.js";
 
 // Chat-binding key: stable id for "this conversation thread". Used as
 // session-map key, mirror target, defaultChat. NOT used for auth.
@@ -69,6 +70,47 @@ const stripMentions = (text: string): string => {
 const isGroup = (msg: BaseMessage): boolean => msg.chattype === "group" && !!msg.chatid;
 const maybeStripMentions = (msg: BaseMessage, text: string): string =>
   isGroup(msg) ? stripMentions(text) : text;
+
+// Render the user's "引用" (quoted message) into a markdown blockquote so the
+// claude prompt carries the upstream context. WeCom delivers `quote` as a
+// sibling field on the message body — currently we surface text/voice (already
+// transcribed) inline; image/mixed-image/file are rendered as a placeholder
+// (download would mean an extra round-trip + clipboard paste, which is too
+// heavy for a quote — user can always send the file directly if needed).
+const quoteToText = (q: QuoteContent): string => {
+  if (q.msgtype === "text") return q.text?.content ?? "";
+  if (q.msgtype === "voice") return q.voice?.content ?? "";
+  if (q.msgtype === "mixed") {
+    return (q.mixed?.msg_item ?? [])
+      .map((it) => (it.msgtype === "text" ? it.text?.content ?? "" : "[图片]"))
+      .filter(Boolean)
+      .join(" ");
+  }
+  if (q.msgtype === "image") return "[图片]";
+  if (q.msgtype === "file") return "[文件]";
+  return "";
+};
+const renderQuotePrefix = (q: QuoteContent | undefined): string => {
+  if (!q) return "";
+  const body = quoteToText(q).trim();
+  if (!body) return "";
+  // Quote each line so multi-line引用渲染整洁; trailing blank line separates
+  // from the user's actual message.
+  const quoted = body.split("\n").map((l) => `> ${l}`).join("\n");
+  return `> [引用]\n${quoted}\n\n`;
+};
+const withQuote = (msg: BaseMessage, text: string): string => {
+  if (!msg.quote) return text;
+  // Drop the quote when the user is replying to weclaude's most recent message
+  // in this chat — claude already has that turn in its context, surfacing it
+  // again is redundant noise. Older self-quotes still flow through (the user
+  // is genuinely pointing back to something earlier).
+  const last = getLastResponse(chatPrincipal(msg));
+  const quoted = quoteToText(msg.quote).trim();
+  if (last && quoted && quoted === last.trim()) return text;
+  const prefix = renderQuotePrefix(msg.quote);
+  return prefix ? `${prefix}${text}` : text;
+};
 
 const isAllowed = (cfg: Config, principals: string[]): boolean => {
   if (cfg.wrc.allowFrom.length === 0) return false;
@@ -256,8 +298,8 @@ export const installInboundRouter = (
     const msg = frame.body;
     if (!msg) return;
     const raw = msg.text?.content ?? "";
-    const text = maybeStripMentions(msg, raw);
-    log.info({ msgid: msg.msgid, len: text.length }, "rx text");
+    const text = withQuote(msg, maybeStripMentions(msg, raw));
+    log.info({ msgid: msg.msgid, len: text.length, hasQuote: !!msg.quote }, "rx text");
     const { stop, who } = await gate(frame, msg, text);
     if (stop) return;
     await send(frame, msg, who, text);
@@ -266,7 +308,7 @@ export const installInboundRouter = (
   client.on("message.image", async (frame: WsFrame<ImageMessage>) => {
     const msg = frame.body;
     if (!msg) return;
-    log.info({ msgid: msg.msgid }, "rx image");
+    log.info({ msgid: msg.msgid, hasQuote: !!msg.quote }, "rx image");
     const { stop, who } = await gate(frame, msg, "");
     if (stop) return;
     const path = await downloadToInbox({ client, log, inboxDir }, msg.image.url, msg.image.aeskey, msg.msgid, 0);
@@ -278,13 +320,13 @@ export const installInboundRouter = (
     // each via macOS clipboard + Ctrl+V into the live TTY (matches Claude
     // Code's documented image paste flow → image content block, no Read tool
     // turn). Spawn-mode falls back to `@<path>` automatically.
-    await send(frame, msg, who, "", [path]);
+    await send(frame, msg, who, withQuote(msg, ""), [path]);
   });
 
   client.on("message.mixed", async (frame: WsFrame<MixedMessage>) => {
     const msg = frame.body;
     if (!msg) return;
-    log.info({ msgid: msg.msgid, items: msg.mixed?.msg_item?.length }, "rx mixed");
+    log.info({ msgid: msg.msgid, items: msg.mixed?.msg_item?.length, hasQuote: !!msg.quote }, "rx mixed");
     const { stop, who } = await gate(frame, msg, "");
     if (stop) return;
     const texts: string[] = [];
@@ -305,8 +347,8 @@ export const installInboundRouter = (
         if (path) images.push(path);
       }
     }
-    if (texts.length === 0 && images.length === 0) return;
-    await send(frame, msg, who, texts.join("\n"), images);
+    if (texts.length === 0 && images.length === 0 && !msg.quote) return;
+    await send(frame, msg, who, withQuote(msg, texts.join("\n")), images);
   });
 
   // template_card_event is handled in approval module; no listener here.
