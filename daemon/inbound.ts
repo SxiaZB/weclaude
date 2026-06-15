@@ -39,12 +39,12 @@ const renderIds = (msg: BaseMessage, cfg: Config): string => {
       `群: \`${chat}\` ${mark(chat)}`,
       `发送者: \`${sender}\` ${mark(sender)}`,
       `(allowFrom 任一通过即可)`,
-      `在已有claude会话中绑定本群聊: \`/wrc chat:${msg.chatid}\``,
+      `在已有claude会话中绑定本群聊: \`/weclaude:wrc chat:${msg.chatid}\``,
     ].join("\n");
   }
   return [
     `会话id: \`${sender}\` ${mark(sender)}`,
-    `在已有claude会话中绑定本单聊: \`/wrc user:${msg.from.userid}\``,
+    `在已有claude会话中绑定本单聊: \`/weclaude:wrc user:${msg.from.userid}\``,
   ].join("\n");
 };
 
