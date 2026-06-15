@@ -1643,7 +1643,20 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       if (!rec) return false;
       return existsSync(expandHome(rec.jsonlPath));
     },
-    targetForSession: (sessionId) => bySessionId.get(sessionId)?.target,
+    targetForSession: (sessionId) => {
+      // Live attach is the fast path. Fall back to scanning persisted store:
+      // an MCP tool (e.g. `cd`) called from a claude that isn't mirror-attached
+      // would otherwise miss here and silently retarget to defaultChat — that
+      // bug stranded pendingCwd on the wrong principal. Store keeps each
+      // target's sessionId in sync via migrate/attach/setPendingCwd writes.
+      const live = bySessionId.get(sessionId)?.target;
+      if (live) return live;
+      const all = deps.store.all();
+      for (const [target, rec] of Object.entries(all)) {
+        if (rec.sessionId === sessionId) return target;
+      }
+      return undefined;
+    },
     terminateLiveStream: (sessionId) => {
       const a = bySessionId.get(sessionId);
       if (a?.liveStream && !a.liveStream.closed) {
