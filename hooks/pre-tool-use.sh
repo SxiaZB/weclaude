@@ -57,12 +57,23 @@ TOOL_INPUT=$(printf '%s' "$PAYLOAD" | jq -c '.tool_input // {}')
 CWD=$(printf '%s' "$PAYLOAD" | jq -r '.cwd // ""')
 TRANSCRIPT_PATH=$(printf '%s' "$PAYLOAD" | jq -r '.transcript_path // ""')
 
+# weclaude 自家 MCP 工具(mcp__weclaude__*) 全部走 loopback 到本 daemon, 自审会
+# 把 /wrc 首次绑定卡死(还没 defaultChat, 卡片无处可推 → 鸡生蛋), 直接放行。
+if [[ "$TOOL_NAME" == mcp__weclaude__* ]]; then
+  emit "allow" "weclaude mcp self-call bypass"
+fi
+
 # Bash read-only fast-path: bypass cards for grep / rg etc.
 if [[ "$TOOL_NAME" == "Bash" ]]; then
   CMD=$(printf '%s' "$TOOL_INPUT" | jq -r '.command // ""')
   if [[ "$CMD" =~ ^[[:space:]]*(grep|egrep|fgrep|rg|ls|cat|head|tail|wc|file)([[:space:]]|$) ]] \
      && [[ ! "$CMD" =~ [\;\|\&\>\<\`\$\(] ]]; then
     emit "allow" "read-only bypass"
+  fi
+  # weclaude CLI 同理: /wrc /cd 这些 slash command 的 ! bash 都打到本 daemon,
+  # 自己审自己没意义, 也避免首次绑定时无处推卡。
+  if [[ "$CMD" =~ (^|/|[[:space:]])weclaude(\.sh)?([[:space:]]|$) ]]; then
+    emit "allow" "weclaude self-call bypass"
   fi
 fi
 
