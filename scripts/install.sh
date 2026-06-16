@@ -20,15 +20,38 @@ mkdir -p "$HOME_DIR/.weclaude"
 OS="$(uname -s)"
 case "$OS" in
   Darwin)
-    PLIST_DST="$HOME_DIR/Library/LaunchAgents/${LABEL}.plist"
+    LA_DIR="$HOME_DIR/Library/LaunchAgents"
+    PLIST_DST="$LA_DIR/${LABEL}.plist"
+    mkdir -p "$LA_DIR"
     sed \
       -e "s|__NODE__|$NODE|g" \
       -e "s|__REPO__|$REPO|g" \
       -e "s|__HOME__|$HOME_DIR|g" \
       "$REPO/launchd/${LABEL}.plist.template" > "$PLIST_DST"
-    launchctl unload "$PLIST_DST" 2>/dev/null || true
-    launchctl load -w "$PLIST_DST"
-    echo "[install] launchd loaded: $PLIST_DST"
+
+    DOMAIN="gui/$(id -u)"
+    # Modern bootstrap/bootout API. Falls back to legacy load -w. load -w stderr
+    # is unreliable on recent macOS (sporadic "Failed to connect to bus: No
+    # medium found" / "Load failed: 5: I/O error" while the plist is in fact
+    # registered). Trust `launchctl list` for verification, not $?.
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    # bootout returns synchronously but unload is async — bootstrapping too soon
+    # races into "Bootstrap failed: 5: I/O error". Poll until it's truly gone.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      launchctl list "$LABEL" >/dev/null 2>&1 || break
+      sleep 0.2
+    done
+    launchctl bootstrap "$DOMAIN" "$PLIST_DST" 2>/dev/null \
+      || launchctl load -w "$PLIST_DST" 2>/dev/null \
+      || true
+    launchctl enable "$DOMAIN/$LABEL" 2>/dev/null || true
+
+    if launchctl list "$LABEL" >/dev/null 2>&1; then
+      echo "[install] launchd loaded: $PLIST_DST"
+    else
+      echo "[install] launchctl load failed — plist at $PLIST_DST not registered" >&2
+      exit 1
+    fi
     ;;
   Linux)
     UNIT_DIR="$HOME_DIR/.config/systemd/user"
