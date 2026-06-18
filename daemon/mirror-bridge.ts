@@ -1224,19 +1224,33 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   };
 
   // Path C: turn ended inside the deferral window (fast pure-text reply).
-  // Flush as one standalone — opening a stream just to immediately finalize is
-  // wasteful and produces a flicker.
-  const exitDeferredAsStandalone = (a: AttachState): void => {
+  // The inbound's streamId is already showing a "loading" bubble in WeCom
+  // (server polls us for every msg.msgid; we haven't replied to this one).
+  // Delivering as a separate standalone leaves that loading bubble dangling
+  // until WeCom's ~6-min server-side timeout. Push the buffered content into
+  // the held streamId with finish=true so the bubble fills + closes in one
+  // shot. Empty buf still finalizes with " " to clear the indicator.
+  const exitDeferredAsFinalStream = (a: AttachState): void => {
     const out = a.outbound;
     if (out?.kind !== "deferred") return;
     clearTimeout(out.timer);
     const md = renderBuf(out.buf);
     a.outbound = undefined;
     flushPendingStandalone(a);
-    if (md) sendStandalone(a, md);
+    void (async () => {
+      try {
+        await client.replyStream(out.frame, out.streamId, md || " ", true);
+      } catch (e) {
+        log.warn(
+          { sessionId: a.sessionId, err: (e as Error).message },
+          "exit-deferred finalize failed; falling back to standalone",
+        );
+        if (md) sendStandalone(a, md);
+      }
+    })();
     log.info(
       { sessionId: a.sessionId, items: out.buf.length, mdLen: md.length },
-      "outbound: DEFERRED → IDLE (turn_end)",
+      "outbound: DEFERRED → IDLE (turn_end, finalized to streamId)",
     );
   };
 
@@ -1291,7 +1305,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const out = a.outbound;
     if (out?.kind !== "deferred") return;
     if (item.kind === "turn_end") {
-      exitDeferredAsStandalone(a);
+      exitDeferredAsFinalStream(a);
       return;
     }
     if (item.kind === "user_text") return;
