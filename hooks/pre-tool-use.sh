@@ -57,9 +57,13 @@ TOOL_INPUT=$(printf '%s' "$PAYLOAD" | jq -c '.tool_input // {}')
 CWD=$(printf '%s' "$PAYLOAD" | jq -r '.cwd // ""')
 TRANSCRIPT_PATH=$(printf '%s' "$PAYLOAD" | jq -r '.transcript_path // ""')
 
-# weclaude 自家 MCP 工具(mcp__weclaude__*) 全部走 loopback 到本 daemon, 自审会
-# 把 /wrc 首次绑定卡死(还没 defaultChat, 卡片无处可推 → 鸡生蛋), 直接放行。
-if [[ "$TOOL_NAME" == mcp__weclaude__* ]]; then
+# weclaude 自家 MCP 工具全部走 loopback 到本 daemon, 自审会把 /wrc 首次绑定卡死
+# (还没 defaultChat, 卡片无处可推 → 鸡生蛋), 直接放行。
+# 命名两条路径:
+#   1. cli/sync.ts (legacy claude-internal): mcp__weclaude__<tool>
+#   2. .claude-plugin/plugin.json:           mcp__plugin_weclaude_weclaude__<tool>
+# 用 *weclaude__* 同时覆盖两种前缀。
+if [[ "$TOOL_NAME" == mcp__*weclaude__* ]]; then
   emit "allow" "weclaude mcp self-call bypass"
 fi
 
