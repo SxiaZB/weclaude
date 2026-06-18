@@ -22,6 +22,7 @@ import { expandHome, sanitizeId } from "../shared/paths.js";
 import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, buildDetailUrl } from "./detail.js";
+import { isAutoWindowActive, cacheGet, cacheKey } from "./session-cache.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -955,7 +956,30 @@ interface AttachState {
    *  this attachment onto the new file. Cleared once migration completes or
    *  the watcher times out. */
   migrationWatcher?: { cancel: () => void };
+  /** Per-turn outbound state machine. undefined ≡ IDLE (no active turn)
+   *  / STREAMING (a.liveStream is the source of truth in that phase).
+   *  Set on dispatch when outboundDeferMs > 0; cleared on promote/exit. */
+  outbound?: OutboundState;
 }
+
+// Mirror outbound state machine. See plan: defer stream open by N ms; flush
+// buffered items as one standalone if a needs-approval tool_use shows up
+// (so it lands BEFORE the approval card); resume with a fresh stream after
+// the user clicks. Pure-text turns that complete inside the window collapse
+// to a single standalone bubble — no typewriter wasted on a finished reply.
+type OutboundState =
+  | {
+      kind: "deferred";
+      buf: RenderItem[];
+      frame: WsFrameHeaders;
+      streamId: string;
+      timer: NodeJS.Timeout;
+    }
+  | {
+      kind: "awaiting_appr";
+      frame: WsFrameHeaders;
+      streamId: string;
+    };
 
 export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const { cfg, log, client } = deps;
@@ -1157,7 +1181,124 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
   };
 
+  // ── Outbound deferral (DEFERRED / AWAITING_APPR state machine) ────────
+  // Synchronous predicate matching what approval.ts WOULD do — must include the
+  // cache check, otherwise a cache-hit tool would flush standalone but the
+  // approval handler shortcuts to allow without sending a card → no click ever
+  // → we'd be stuck in AWAITING_APPR forever.
+  const approvalMatcher = new RegExp(cfg.approval.matcher);
+  const needsApproval = (toolName: string, sid: string, toolInput: unknown): boolean => {
+    if (!cfg.approval.enabled) return false;
+    if (!approvalMatcher.test(toolName)) return false;
+    if (isAutoWindowActive(sid)) return false;
+    if (cacheGet(cacheKey(sid, toolName, toolInput))) return false;
+    return true;
+  };
+
+  const renderBuf = (buf: RenderItem[]): string =>
+    buf.map((i) => ("body" in i ? i.body : "")).filter(Boolean).join("\n\n");
+
+  // Drain any pending standalone debounce so the prior turn's tail content
+  // doesn't sandwich into our pre-card flush. Caller already ensured `outbound`
+  // points at a deferred slot.
+  const flushPendingStandalone = (a: AttachState): void => {
+    if (!a.standaloneBuf) return;
+    clearTimeout(a.standaloneBuf.timer);
+    flushStandalone(a);
+  };
+
+  // Path A: a needs-approval tool_use just landed. Aggregate the buffer as one
+  // standalone, send it BEFORE the approval card race, transition to AWAITING_APPR.
+  const promoteToStandalone = (a: AttachState): void => {
+    const out = a.outbound;
+    if (out?.kind !== "deferred") return;
+    clearTimeout(out.timer);
+    const md = renderBuf(out.buf);
+    a.outbound = { kind: "awaiting_appr", frame: out.frame, streamId: out.streamId };
+    flushPendingStandalone(a);
+    if (md) sendStandalone(a, md);
+    log.info(
+      { sessionId: a.sessionId, items: out.buf.length, mdLen: md.length },
+      "outbound: DEFERRED → AWAITING_APPR (needs-approval flush)",
+    );
+  };
+
+  // Path C: turn ended inside the deferral window (fast pure-text reply).
+  // Flush as one standalone — opening a stream just to immediately finalize is
+  // wasteful and produces a flicker.
+  const exitDeferredAsStandalone = (a: AttachState): void => {
+    const out = a.outbound;
+    if (out?.kind !== "deferred") return;
+    clearTimeout(out.timer);
+    const md = renderBuf(out.buf);
+    a.outbound = undefined;
+    flushPendingStandalone(a);
+    if (md) sendStandalone(a, md);
+    log.info(
+      { sessionId: a.sessionId, items: out.buf.length, mdLen: md.length },
+      "outbound: DEFERRED → IDLE (turn_end)",
+    );
+  };
+
+  // Path B: deferral timer fired without a needs-approval tool. Open a normal
+  // stream and replay the buffer through onItem — it'll flow through the
+  // STREAMING branch since outbound is now undefined.
+  const promoteToStream = (a: AttachState): void => {
+    const out = a.outbound;
+    if (out?.kind !== "deferred") return;
+    const { buf, frame, streamId } = out;
+    a.outbound = undefined;
+    const s = openStream(a, frame, streamId);
+    a.liveStream = s;
+    if (buf.length === 0) {
+      // Empty buffer — claude still thinking. Send the "…" ack so the user
+      // sees the bubble; subsequent items grow it as today.
+      void (async () => {
+        try {
+          await client.replyStream(frame, streamId, "…", false);
+        } catch (e) {
+          log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "stream initial ack failed");
+        }
+      })();
+    }
+    log.info(
+      { sessionId: a.sessionId, items: buf.length, turnId: s.turnId },
+      "outbound: DEFERRED → STREAMING (timer)",
+    );
+    for (const item of buf) onItem(a, item);
+  };
+
+  const enterDeferred = (a: AttachState, frame: WsFrameHeaders, streamId: string): void => {
+    const deferMs = cfg.wrc.mirror.outboundDeferMs;
+    const timer = setTimeout(() => promoteToStream(a), deferMs);
+    a.outbound = { kind: "deferred", buf: [], frame, streamId, timer };
+    log.info({ sessionId: a.sessionId, deferMs }, "outbound: IDLE → DEFERRED");
+  };
+
+  // Buffer / decide while in DEFERRED. user_text is CLI-side typing (not the
+  // WeCom inbound), unrelated to this turn — drop. tool_use triggers Path A
+  // when ANY parallel call needs approval.
+  const handleDeferredItem = (a: AttachState, item: RenderItem): void => {
+    const out = a.outbound;
+    if (out?.kind !== "deferred") return;
+    if (item.kind === "turn_end") {
+      exitDeferredAsStandalone(a);
+      return;
+    }
+    if (item.kind === "user_text") return;
+    out.buf.push(item);
+    if (item.kind === "tool_use") {
+      const sid = a.sessionId;
+      const trigger = item.calls.some((c) => needsApproval(c.name, sid, c.input));
+      if (trigger) promoteToStandalone(a);
+    }
+  };
+
   const onItem = (a: AttachState, item: RenderItem): void => {
+    if (a.outbound?.kind === "deferred") {
+      handleDeferredItem(a, item);
+      return;
+    }
     // Assistant turn truly ended (stop_reason terminal). Finalize the live
     // bubble synchronously so it becomes quotable in WeCom without waiting
     // for the next inbound or the 6-min hard timeout. No body to append.
@@ -1213,6 +1354,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // Detach an attachment: finalize any live stream, stop the tail, drop from indexes.
   const detach = (a: AttachState, reason: string): void => {
     if (a.migrationWatcher) { a.migrationWatcher.cancel(); a.migrationWatcher = undefined; }
+    if (a.outbound?.kind === "deferred") clearTimeout(a.outbound.timer);
+    a.outbound = undefined;
     if (a.liveStream && !a.liveStream.closed) void finalizeStream(a, a.liveStream);
     if (a.standaloneBuf) { clearTimeout(a.standaloneBuf.timer); flushStandalone(a); }
     a.tail.stop();
@@ -1693,9 +1836,22 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     },
     terminateLiveStream: (sessionId) => {
       const a = bySessionId.get(sessionId);
-      if (a?.liveStream && !a.liveStream.closed) {
+      if (!a) return;
+      if (a.liveStream && !a.liveStream.closed) {
         log.info({ sessionId, turnId: a.liveStream.turnId }, "approval click — terminating liveStream");
         void finalizeStream(a, a.liveStream);
+      }
+      // Promote AWAITING_APPR → STREAMING on any approval click (allow / deny /
+      // allow_window — claude resumes after each, producing tool_result + text
+      // that need a stream destination). If frame is stale (>~6min from inbound),
+      // the first flushStream will reject, mark s.dead=true, and subsequent items
+      // route to standalone via the existing :1206 fall-through. Self-healing.
+      if (a.outbound?.kind === "awaiting_appr") {
+        const { frame, streamId } = a.outbound;
+        a.outbound = undefined;
+        const s = openStream(a, frame, streamId);
+        a.liveStream = s;
+        log.info({ sessionId, turnId: s.turnId }, "outbound: AWAITING_APPR → STREAMING (approved)");
       }
     },
     injectText: async (target, text) => {
@@ -1740,6 +1896,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     newSession,
     shutdown: () => {
       for (const a of bySessionId.values()) {
+        if (a.outbound?.kind === "deferred") clearTimeout(a.outbound.timer);
+        a.outbound = undefined;
         if (a.liveStream && !a.liveStream.closed) void finalizeStream(a, a.liveStream);
         a.tail.stop();
       }
@@ -1789,13 +1947,31 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // immediately — capturing baseline post-inject would already include it,
       // and the watcher would never see a "new" candidate (the bug this fixes).
       const preClearBaseline = armMigration ? listJsonls(dirname(a.jsonlPath)) : undefined;
+      // Drop any prior turn's outbound deferral state — a new dispatch always
+      // supersedes whatever was buffered/awaiting. The old frame is dead by our
+      // own choice (we won't write to it anymore); the user might still later
+      // click an old approval card, but terminateLiveStream will find no
+      // matching outbound slot and no-op gracefully.
+      if (a.outbound) {
+        if (a.outbound.kind === "deferred") clearTimeout(a.outbound.timer);
+        a.outbound = undefined;
+      }
+      // Drain any pending standalone debounce so a prior turn's tail tail
+      // doesn't get sandwiched into this turn's pre-card flush (Path A) or
+      // race against the new stream's first content (Path B).
+      if (a.standaloneBuf) { clearTimeout(a.standaloneBuf.timer); flushStandalone(a); }
       // /clear produces no assistant output; opening a stream would leave a
       // stale "…" + quoted-user bubble in WeCom. Skip the stream entirely on
       // success path; only surface a terse "clean" if inject fails.
       if (a.liveStream && !a.liveStream.closed) {
         await finalizeStream(a, a.liveStream);
       }
-      const s = armMigration ? undefined : openStream(a, frame, streamId);
+      // Three paths from here:
+      //  • armMigration → s undefined, no defer (existing /clear behavior)
+      //  • outboundDeferMs > 0 → DEFERRED slot; stream opens later via promote
+      //  • outboundDeferMs === 0 → eager openStream + "…" ack (legacy behavior)
+      const eagerOpen = !armMigration && cfg.wrc.mirror.outboundDeferMs <= 0;
+      const s = eagerOpen ? openStream(a, frame, streamId) : undefined;
       if (s) {
         a.liveStream = s;
         try {
@@ -1804,9 +1980,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "stream initial ack failed");
         }
       }
+      if (!armMigration && !eagerOpen) {
+        enterDeferred(a, frame, streamId);
+      }
       const sid = a.sessionId;
       await enqueue(sid, async () => {
-        if (s && s.closed) return; // superseded by a newer dispatch
+        if (s && s.closed) return; // (eager path) superseded by a newer dispatch
         // Always reincarnate when no live pane: covers (a) pane closed between
         // turns, (b) daemon reload restored a binding without a live pane, AND
         // (c) /wrc'd from a non-tmux context (no tmuxSession ever stored) —
@@ -1856,10 +2035,17 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           if (s) {
             s.acc = s.acc ? `${s.acc}\n\n[mirror] ✗ ${r.reason ?? "failed"}` : `[mirror] ✗ ${r.reason ?? "failed"}`;
             await finalizeStream(a, s);
-          } else {
+          } else if (armMigration) {
             // /clear path has no live stream — surface failure as a one-shot
             // terse reply ("clean" per project convention).
             try { await client.replyStream(frame, streamId, "clean", true); } catch { /* ignore */ }
+          } else {
+            // Deferred path: tear down outbound, surface error as standalone.
+            // promote* may have already cleared the slot if a tail item raced
+            // ahead of inject completion — in that case just send the error.
+            if (a.outbound?.kind === "deferred") clearTimeout(a.outbound.timer);
+            a.outbound = undefined;
+            sendStandalone(a, `[mirror] ✗ ${r.reason ?? "failed"}`);
           }
           return;
         }

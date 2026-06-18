@@ -62,6 +62,13 @@ const Mirror = z.object({
   // (ms)。窗口内同一 attachment 的多个 item 合并为一条 markdown, 抑制连续工具
   // 调用刷屏。liveStream 仍活时不受影响——直接走 typewriter。0 = 关闭。
   standaloneDebounceMs: z.number().int().nonnegative().default(3000),
+  // dispatch 后延迟开 stream 的窗口 (ms)。窗口内 item 累积:
+  //   • 出现 needs-approval tool_use → 立刻把 buffer 聚合成单条 standalone 推出 (赶在
+  //     授权卡之前), 切到 AWAITING_APPR 等点击; 点击后再开 stream 续 tool_result+回复。
+  //   • 窗口内 turn_end (纯文本快回复) → buffer 整体作为一条 standalone, 不开 stream。
+  //   • 窗口超时 → 正常开 stream, 重放 buffer。
+  // 0 = 关闭, 退回到 dispatch 立即 ack "…" 的旧行为。
+  outboundDeferMs: z.number().int().nonnegative().default(3000),
 });
 
 const Wrc = z.object({
