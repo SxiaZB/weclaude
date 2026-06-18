@@ -200,11 +200,15 @@ const renderToolResultFull = (block: ContentBlock, max: number): string => {
 // items render as plain body lines; the full input/result is carried out
 // of band on the item so the caller can register them for click-to-detail.
 type RenderItem =
-  | { kind: "text"; body: string }
+  | { kind: "text"; body: string; final?: boolean }
   // CLI-side user line (not a WeCom inject). Marks a turn boundary that did
   // NOT originate from the still-open WeCom liveStream — onItem uses this to
   // finalize the prior bubble so the new conversation gets its own bubble.
   | { kind: "user_text"; body: string }
+  // Skill stdout (e.g. /model). Always emitted as a standalone bubble — bypasses
+  // deferred-state filtering so the user sees /model output even when no
+  // assistant turn is active.
+  | { kind: "skill_output"; body: string }
   | {
       kind: "tool_use";
       body: string;
@@ -303,6 +307,18 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
     const c = line.message?.content;
     if (typeof c === "string") {
       if (!deps.includeUser) return [];
+
+      // Mirror skill outputs like "/model" from <local-command-stdout>
+      // Match against raw content BEFORE cleanUserText strips the tag.
+      const stdoutMatch = c.match(/<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/);
+      if (stdoutMatch && stdoutMatch[1]) {
+        const skillOutput = stdoutMatch[1].replace(/\[[0-9;]*m/g, "").trim();
+        if (skillOutput) {
+          out.push({ kind: "skill_output", body: `⚙️ ${skillOutput}` });
+        }
+        return out;
+      }
+
       const text = cleanUserText(c);
       if (!text) return []; // pure slash-command meta / stdout — drop
       if (deps.isOwnInject(text)) return []; // dedupe WeCom→CLI echo
@@ -337,6 +353,14 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
   if (line.type === "assistant") {
     const blocks = line.message?.content;
     if (!Array.isArray(blocks)) return [];
+    // Mark text items emitted from a terminal-stop_reason line as `final`.
+    // Per Anthropic protocol, a line with stop_reason ∈ {end_turn, stop_sequence,
+    // max_tokens} contains only text blocks (tool_use → stop_reason="tool_use"),
+    // so these texts ARE the agent's final answer for the turn. Downstream uses
+    // `final` to decide bubble splits — mid-turn text appends; only final text
+    // after tools peels out into its own standalone (preview = real answer).
+    const sr = line.message?.stop_reason;
+    const isFinal = sr === "end_turn" || sr === "stop_sequence" || sr === "max_tokens";
     let pending: Array<{ toolUseId: string; name: string; input: unknown }> = [];
     const flushPending = (): void => {
       if (pending.length === 0) return;
@@ -364,7 +388,7 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
       if (b?.type === "text" && typeof b.text === "string") {
         flushPending();
         const t = b.text.trim();
-        if (t) out.push({ kind: "text", body: t });
+        if (t) out.push({ kind: "text", body: t, final: isFinal });
       } else if (b?.type === "tool_use" && deps.includeTools) {
         const name = b.name ?? "tool";
         const toolUseId = b.id ?? "";
@@ -378,10 +402,7 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
     // Terminal stop_reason → emit turn_end so onItem closes the live bubble.
     // `tool_use` is intentionally excluded — more turns will follow once the
     // tool result lands; finalizing now would split a single logical reply.
-    const sr = line.message?.stop_reason;
-    if (sr === "end_turn" || sr === "stop_sequence" || sr === "max_tokens") {
-      out.push({ kind: "turn_end" });
-    }
+    if (isFinal) out.push({ kind: "turn_end" });
     return out;
   }
 
@@ -1223,33 +1244,52 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     );
   };
 
-  // Path C: turn ended inside the deferral window (fast pure-text reply).
-  // The inbound's streamId is already showing a "loading" bubble in WeCom
-  // (server polls us for every msg.msgid; we haven't replied to this one).
-  // Delivering as a separate standalone leaves that loading bubble dangling
-  // until WeCom's ~6-min server-side timeout. Push the buffered content into
-  // the held streamId with finish=true so the bubble fills + closes in one
-  // shot. Empty buf still finalizes with " " to clear the indicator.
+  // Path C: turn ended inside the deferral window (fast pure-text reply, or
+  // an end-to-end tool turn that happened to fit in the window). The inbound's
+  // streamId is already showing a "loading" bubble in WeCom (server polls us
+  // for every msg.msgid; we haven't replied to this one) — sending a separate
+  // standalone leaves that loading bubble dangling until WeCom's ~6-min
+  // server-side timeout. Push the buffered content into the held streamId
+  // with finish=true so the bubble fills + closes in one shot.
+  //
+  // Split mirrors the STREAMING tool→FINAL_text rule: if buf saw a tool AND
+  // ends with a run of final-text items, peel that run out into a standalone
+  // so the answer gets its own bubble (preview = real answer, not tool noise).
+  // Pure-text turn or no trailing final text → no split, all into streamId.
   const exitDeferredAsFinalStream = (a: AttachState): void => {
     const out = a.outbound;
     if (out?.kind !== "deferred") return;
     clearTimeout(out.timer);
-    const md = renderBuf(out.buf);
+    const buf = out.buf;
+    const sawTool = buf.some((i) => i.kind === "tool_use" || i.kind === "tool_result");
+    let bubbleEnd = buf.length;
+    if (sawTool) {
+      while (bubbleEnd > 0) {
+        const it = buf[bubbleEnd - 1]!;
+        if (it.kind === "text" && it.final === true) bubbleEnd--;
+        else break;
+      }
+    }
+    const bubbleItems = buf.slice(0, bubbleEnd);
+    const trailingFinal = buf.slice(bubbleEnd);
+    const bubbleMd = renderBuf(bubbleItems);
+    const trailingMd = renderBuf(trailingFinal);
     a.outbound = undefined;
     flushPendingStandalone(a);
     void (async () => {
       try {
-        await client.replyStream(out.frame, out.streamId, md || " ", true);
+        await client.replyStream(out.frame, out.streamId, bubbleMd || " ", true);
       } catch (e) {
         log.warn(
           { sessionId: a.sessionId, err: (e as Error).message },
           "exit-deferred finalize failed; falling back to standalone",
         );
-        if (md) sendStandalone(a, md);
+        if (bubbleMd) sendStandalone(a, bubbleMd);
       }
+      if (trailingMd) sendStandalone(a, trailingMd);
     })();
     log.info(
-      { sessionId: a.sessionId, items: out.buf.length, mdLen: md.length },
+      { sessionId: a.sessionId, items: buf.length, bubbleLen: bubbleMd.length, trailingLen: trailingMd.length, sawTool },
       "outbound: DEFERRED → IDLE (turn_end, finalized to streamId)",
     );
   };
@@ -1309,6 +1349,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       return;
     }
     if (item.kind === "user_text") return;
+    // Skill outputs (e.g. /model) bypass deferred filtering — emit directly
+    // as a standalone bubble so the user sees the result immediately.
+    if (item.kind === "skill_output") {
+      enqueueStandalone(a, item.body);
+      return;
+    }
     const wasEmpty = out.buf.length === 0;
     out.buf.push(item);
     if (wasEmpty) {
@@ -1331,6 +1377,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       handleDeferredItem(a, item);
       return;
     }
+    // Skill outputs (e.g. /model) always emit as standalone — never append to
+    // an active stream so the result is independently visible.
+    if (item.kind === "skill_output") {
+      enqueueStandalone(a, item.body);
+      return;
+    }
     // Assistant turn truly ended (stop_reason terminal). Finalize the live
     // bubble synchronously so it becomes quotable in WeCom without waiting
     // for the next inbound or the 6-min hard timeout. No body to append.
@@ -1351,11 +1403,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
     const s = a.liveStream;
     if (s && !s.closed && !s.dead && !s.capped) {
-      // 规则 1: tool→text 截断。本流已经追加过 tool 项, 此刻又来 text item
-      // → 视为"工具调用阶段结束, 进入文本回复阶段"。立即 finalize 当前
-      // bubble, text 走 standalone 单独成条。视觉上 tool 调用聚成一个气泡,
-      // 最终答复独立显示, 比挤进同一个 mega-bubble 更易读。
-      if (item.kind === "text" && s.sawTool) {
+      // 规则 1: tool→FINAL_text 截断。仅当 text 是本 turn 的终态文本(line
+      // stop_reason ∈ end_turn/stop_sequence/max_tokens)且本流已出现过 tool
+      // 时, 把"最终答复"切到独立 standalone — WeCom 消息列表预览看到的就是答
+      // 案而不是中间 tool 噪声。中间过程的 text(final=false)保持 append, 多
+      // 轮 think→tool→think 不再被切碎。
+      if (item.kind === "text" && s.sawTool && item.final === true) {
         void finalizeStream(a, s);
         enqueueStandalone(a, item.body);
         return;
