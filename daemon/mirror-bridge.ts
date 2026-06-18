@@ -238,7 +238,13 @@ const safeForMarkdown = (s: string): string =>
     .replace(/</g, "＜")
     .replace(/>/g, "＞")
     .replace(/\[/g, "［")
-    .replace(/\]/g, "］");
+    .replace(/\]/g, "］")
+    // \( \) is LaTeX inline-math in WeCom desktop renderer → contents render
+    // italic and the link span breaks. Keep the backslash for fidelity, swap
+    // to full-width parens so the math tokenizer no longer recognizes it.
+    // (\[ \] is already neutralized above by the [/] replacement.)
+    .replace(/\\\(/g, "\\（")
+    .replace(/\\\)/g, "\\）");
 
 const renderToolInputCompact = (input: unknown, max: number): string => {
   // Heuristic: prefer command/file_path/pattern-like keys for the inline summary.
