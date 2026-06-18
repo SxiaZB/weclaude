@@ -67,6 +67,15 @@ if [[ "$TOOL_NAME" == mcp__*weclaude__* ]]; then
   emit "allow" "weclaude mcp self-call bypass"
 fi
 
+# weclaude 自家 Skill (slash commands like /wrc) 也是本地插件代码, 无须审批。
+# tool_input.skill 形如 "weclaude:wrc"; plugin 命名空间用冒号分隔。
+if [[ "$TOOL_NAME" == "Skill" ]]; then
+  SKILL_NAME=$(printf '%s' "$TOOL_INPUT" | jq -r '.skill // ""')
+  if [[ "$SKILL_NAME" == weclaude:* ]]; then
+    emit "allow" "weclaude skill self-call bypass"
+  fi
+fi
+
 # Bash read-only fast-path: bypass cards for grep / rg etc.
 if [[ "$TOOL_NAME" == "Bash" ]]; then
   CMD=$(printf '%s' "$TOOL_INPUT" | jq -r '.command // ""')
