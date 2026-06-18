@@ -62,24 +62,6 @@ svc_unload() {
   esac
 }
 
-# Walk the parent-process chain looking for `claude-internal`. Mirror commands
-# inject into a live Claude session; we only enable them under claude-internal
-# (the Tencent-internal CC build) for now to avoid surprising upstream Claude.
-require_claude_internal() {
-  local pid=$PPID
-  local i=0
-  while (( i < 8 )) && [[ "$pid" -gt 1 ]]; do
-    local args
-    args=$(ps -p "$pid" -o args= 2>/dev/null) || break
-    [[ "$args" == *claude-internal* ]] && return 0
-    pid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
-    [[ -z "$pid" ]] && break
-    (( i++ ))
-  done
-  echo "weclaude $cmd: only available inside claude-internal" >&2
-  exit 1
-}
-
 case "$cmd" in
   init)
     NODE_BIN="$(command -v node)"
@@ -154,12 +136,10 @@ case "$cmd" in
     echo "[weclaude] safe to 'npm uninstall -g weclaude' now"
     ;;
   mirror)
-    require_claude_internal
     cwd="${CLAUDE_PROJECT_DIR:-$(pwd)}"
     enc="$(printf %s "$cwd" | sed 's|/|-|g')"
     # claude-internal stores under ~/.claude-internal/projects/, official claude
-    # under ~/.claude/projects/. Prefer the internal one since this command is
-    # gated to claude-internal anyway.
+    # under ~/.claude/projects/.
     proj=""
     for base in "$HOME/.claude-internal/projects" "$HOME/.claude/projects"; do
       if [[ -d "$base/$enc" ]]; then proj="$base/$enc"; break; fi
@@ -198,7 +178,6 @@ case "$cmd" in
     http_post /mirror/attach "$body" | jq . 2>/dev/null || true
     ;;
   mirror-status)
-    require_claude_internal
     http_get /mirror/status | jq . 2>/dev/null || http_get /mirror/status
     ;;
   sync)
