@@ -1269,15 +1269,24 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   };
 
   const enterDeferred = (a: AttachState, frame: WsFrameHeaders, streamId: string): void => {
-    const deferMs = cfg.wrc.mirror.outboundDeferMs;
-    const timer = setTimeout(() => promoteToStream(a), deferMs);
+    // Safety net: if nothing ever arrives (inject stuck, claude crashed, or
+    // claude went silent forever), promote-to-stream after 5 min to clean up.
+    // The REAL deferral window (cfg.wrc.mirror.outboundDeferMs) is armed by
+    // handleDeferredItem when the first tail item lands — measuring from "claude
+    // starts producing" not from "dispatch starts", which would otherwise fire
+    // during inject latency (typical 1-4s for tmux paste verify) + post-inject
+    // thinking gap (often 5-15s for non-trivial prompts) and falsely promote
+    // an empty buffer before any tool_use can be evaluated for approval-needs.
+    const SAFETY_MS = 5 * 60_000;
+    const timer = setTimeout(() => promoteToStream(a), SAFETY_MS);
     a.outbound = { kind: "deferred", buf: [], frame, streamId, timer };
-    log.info({ sessionId: a.sessionId, deferMs }, "outbound: IDLE → DEFERRED");
+    log.info({ sessionId: a.sessionId, safetyMs: SAFETY_MS }, "outbound: IDLE → DEFERRED (safety net)");
   };
 
   // Buffer / decide while in DEFERRED. user_text is CLI-side typing (not the
   // WeCom inbound), unrelated to this turn — drop. tool_use triggers Path A
-  // when ANY parallel call needs approval.
+  // when ANY parallel call needs approval. First item arms the short window;
+  // subsequent items don't reset (bounded promote delay).
   const handleDeferredItem = (a: AttachState, item: RenderItem): void => {
     const out = a.outbound;
     if (out?.kind !== "deferred") return;
@@ -1286,10 +1295,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       return;
     }
     if (item.kind === "user_text") return;
+    const wasEmpty = out.buf.length === 0;
     out.buf.push(item);
+    if (wasEmpty) {
+      // First activity from claude — swap the safety net for the short defer
+      // window. From here we have at most outboundDeferMs to see a needs-approval
+      // tool_use, otherwise we promote to STREAMING and resume normal behavior.
+      clearTimeout(out.timer);
+      const deferMs = cfg.wrc.mirror.outboundDeferMs;
+      out.timer = setTimeout(() => promoteToStream(a), deferMs);
+      log.info({ sessionId: a.sessionId, deferMs, kind: item.kind }, "outbound: first item → short defer armed");
+    }
     if (item.kind === "tool_use") {
-      const sid = a.sessionId;
-      const trigger = item.calls.some((c) => needsApproval(c.name, sid, c.input));
+      const trigger = item.calls.some((c) => needsApproval(c.name, a.sessionId, c.input));
       if (trigger) promoteToStandalone(a);
     }
   };
