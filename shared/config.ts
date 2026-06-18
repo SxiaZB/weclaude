@@ -112,7 +112,9 @@ const Approval = z.object({
 });
 
 const SyncTarget = z.object({
-  kind: z.literal("claude-internal"),
+  // 仅作为 sync 日志里的标签使用; 真正决定写入位置的是 settingsPath。
+  // 留成自由字符串以兼容 claude / claude-internal / custom 等任何 fork。
+  kind: z.string().default("claude"),
   settingsPath: z.string(),
   scope: z.enum(["user", "project", "local"]).default("user"),
 });

@@ -192,7 +192,7 @@ const main = async (): Promise<void> => {
     { path: ["wrc", "allowFrom"], value: [] },
     { path: ["approval", "enabled"], value: enableHook },
     { path: ["approval", "matcher"], value: ".*" },
-    { path: ["sync", "targets"], value: [{ kind: "claude-internal", settingsPath: settings, scope: "user" }] },
+    { path: ["sync", "targets"], value: [{ kind: agentKind, settingsPath: settings, scope: "user" }] },
   ]);
   log(c.dim(`  写入 ${SECRETS} ...`));
   patchJsonc(SECRETS, [
