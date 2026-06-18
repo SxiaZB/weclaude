@@ -69,7 +69,7 @@ Three processes, all coordinating via 127.0.0.1:17890 and `~/.weclaude/`:
 - **Uninstall order**: `weclaude uninstall` *before* `npm uninstall -g weclaude`. Otherwise launchd repeatedly tries to relaunch a deleted binary. State at `~/.weclaude/` is intentionally preserved.
 - **Card update has a 5s window**: `client.updateTemplateCard` only works within 5s of the click event — `installApprovalEventListener` does the rewrite synchronously inside the event handler.
 - **Mirror mode is `claude-internal`-gated** in `cli/weclaude.sh` (`require_claude_internal` walks the parent process chain) — be aware if you add subcommands that touch live sessions.
-- **Long-poll timeouts**: hook curl `--max-time` (`approval.hookTimeoutSec`, default 1810) must be **strictly larger** than `approval.longPollSec` (default 1800), or the hook returns `ask` while the daemon is still waiting on a click.
+- **Long-poll timeouts**: hook curl `--max-time` (`approval.hookTimeoutSec`, default 7210) must be **strictly larger** than `approval.longPollSec` (default 7200), or the hook returns `ask` while the daemon is still waiting on a click.
 - **Sensitive arg redaction** (`daemon/redact.ts`) runs before card render when `approval.sensitiveArgRedact=true`. Only the redacted form is shown in WeCom and stored in pending meta.
 
 ## Project conventions
