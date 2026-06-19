@@ -1675,7 +1675,36 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return false;
   };
 
-  const migrateAttachment = (a: AttachState, newSessionId: string, newJsonlPath: string): void => {
+  // First non-meta user-line uuid of a transcript. A freshly resume-forked
+  // child (`claude --resume <sid>` interactive) is seeded with a copy of the
+  // parent transcript, so it carries a real user line the instant it appears —
+  // this distinguishes it from an empty just-touched jsonl. (We can't reuse the
+  // /clear signature: a resume fork's first user line is the actual prompt, not
+  // `/clear`.) Returns undefined for empty/garbled files.
+  const firstUserUuid = (path: string): string | undefined => {
+    try {
+      const fd = openSync(path, "r");
+      const size = statSync(path).size;
+      const cap = Math.min(size, 256 * 1024);
+      const buf = Buffer.alloc(cap);
+      readSync(fd, buf, 0, cap, 0);
+      closeSync(fd);
+      for (const line of buf.toString("utf8").split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const j = JSON.parse(line) as TranscriptLine;
+          if (j.type === "user" && !j.isMeta && !j.isSidechain && typeof j.uuid === "string") return j.uuid;
+        } catch { /* partial line */ }
+      }
+    } catch { /* unreadable */ }
+    return undefined;
+  };
+
+  // startOffset semantics differ by caller: /clear passes 0 to replay the
+  // freshly-rotated jsonl (only holds the /clear line + new content); resume
+  // migration omits it (→ tail from EOF) because the fork file is seeded with
+  // the FULL prior transcript and replaying from 0 would re-dump it to WeCom.
+  const migrateAttachment = (a: AttachState, newSessionId: string, newJsonlPath: string, startOffset?: number): void => {
     const oldSessionId = a.sessionId;
     const oldJsonlPath = a.jsonlPath;
     a.tail.stop();
@@ -1696,11 +1725,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       detailUrlFor,
       sessionId: newSessionId,
       target: a.target,
-      // Replay from the very start: by the time we migrate, the new jsonl
-      // already holds the rotated user line and possibly early assistant
-      // lines. Without this the tail would start at EOF and silently drop
-      // them, leaving the WeCom stream stuck at "…".
-      startOffset: 0,
+      startOffset,
     });
     deps.store.set(a.target, {
       sessionId: newSessionId,
@@ -1710,16 +1735,25 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       cwd: a.runningCwd || undefined,
       pendingCwd: a.pendingCwd || undefined,
     });
-    log.info({ target: a.target, oldSessionId, newSessionId, oldJsonlPath, newJsonlPath }, "mirror migrated post-/clear");
+    log.info({ target: a.target, oldSessionId, newSessionId, oldJsonlPath, newJsonlPath, startOffset }, "mirror migrated session");
   };
 
-  const startMigrationWatcher = (a: AttachState, baseline: Set<string>): void => {
-    if (a.migrationWatcher) a.migrationWatcher.cancel(); // /clear sent twice in a row
+  // Watch the project dir for a new jsonl (not in `baseline`) that satisfies
+  // `isChild`, then re-bind the attachment onto it. Used by both /clear
+  // (predicate = first user line is /clear; replay from 0) and dead-pane resume
+  // (predicate = file has real user content; tail from EOF — the fork is seeded
+  // with full history). `startOffset` flows through to migrateAttachment.
+  const startMigrationWatcher = (
+    a: AttachState,
+    baseline: Set<string>,
+    isChild: (path: string) => boolean,
+    startOffset?: number,
+  ): void => {
+    if (a.migrationWatcher) a.migrationWatcher.cancel(); // re-armed (e.g. /clear twice, or respawn during a pending watch)
     const projectDir = dirname(a.jsonlPath);
-    // baseline is captured by the caller BEFORE inject runs — claude creates
-    // the rotated jsonl synchronously while processing /clear, so a baseline
-    // taken here (post-inject) would already include it and migration would
-    // never fire.
+    // baseline is captured by the caller BEFORE inject/respawn runs — claude
+    // creates the rotated/forked jsonl while processing it, so a baseline taken
+    // here (post-inject) would already include it and migration would never fire.
     const POLL_MS = 500;
     const TIMEOUT_MS = 5 * 60_000; // generous: user may take a while to type
     const t0 = Date.now();
@@ -1729,7 +1763,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const tick = (): void => {
       if (stopped) return;
       if (Date.now() - t0 > TIMEOUT_MS) {
-        log.warn({ target: a.target, sessionId: a.sessionId }, "mirror /clear migration: timeout, giving up");
+        log.warn({ target: a.target, sessionId: a.sessionId }, "mirror migration: timeout, giving up");
         a.migrationWatcher = undefined;
         return;
       }
@@ -1743,11 +1777,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         .sort((x, y) => y.mtime - x.mtime);
       for (const c of ranked) {
         const p = join(projectDir, c.n);
-        if (jsonlIsPostClearChild(p)) {
+        if (isChild(p)) {
           stopped = true;
           a.migrationWatcher = undefined;
           const newSid = c.n.replace(/\.jsonl$/, "");
-          if (newSid !== a.sessionId) migrateAttachment(a, newSid, p);
+          if (newSid !== a.sessionId) migrateAttachment(a, newSid, p, startOffset);
           return;
         }
       }
@@ -1757,7 +1791,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     a.migrationWatcher = {
       cancel: () => { stopped = true; if (timer) clearTimeout(timer); },
     };
-    log.info({ target: a.target, sessionId: a.sessionId, projectDir, baselineCount: baseline.size }, "mirror /clear migration: watcher armed");
+    log.info({ target: a.target, sessionId: a.sessionId, projectDir, baselineCount: baseline.size }, "mirror migration: watcher armed");
     timer = setTimeout(tick, POLL_MS);
   };
 
@@ -1951,12 +1985,16 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const paneAlive = a.tmuxPane ? await tmuxPaneAlive(a.tmuxPane) : false;
       if (!paneAlive) {
         log.warn({ target, sessionId: sid, oldPane: a.tmuxPane }, "injectText: pane not alive, respawning");
+        // Same resume-fork hazard as dispatch: snapshot before spawn, re-bind
+        // onto the forked jsonl once it appears (EOF offset — fork is seeded).
+        const resumeBaseline = listJsonls(dirname(a.jsonlPath));
         const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn-init", sessionId: sid }), resumeSessionId: sid, windowName: target, cwdOverride: a.runningCwd });
         if (!r.ok || !r.tmuxPane) return { ok: false, reason: `respawn failed: ${r.reason ?? "unknown"}` };
         a.tmuxPane = r.tmuxPane;
         a.tmuxSession = r.tmuxSession ?? a.tmuxSession;
         if (r.cwd) a.runningCwd = r.cwd;
         deps.store.set(target, { sessionId: sid, jsonlPath: a.jsonlPath, tmuxSession: a.tmuxSession, tmuxPane: a.tmuxPane, cwd: a.runningCwd || undefined, pendingCwd: a.pendingCwd || undefined });
+        startMigrationWatcher(a, resumeBaseline, (p) => firstUserUuid(p) !== undefined);
       }
       // freshSpawn: true — the pane was just minted by /mirror/spawn, the TUI
       // is still warming up so the verifier in injectViaTmux needs the slack.
@@ -2082,6 +2120,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         let freshSpawn = false;
         if (!paneAlive) {
           log.warn({ target: a.target, sessionId: sid, oldPane: a.tmuxPane, oldSession: a.tmuxSession }, "mirror: no live tmux pane, respawning");
+          // Interactive `claude --resume <sid>` does NOT keep appending to the
+          // same <sid>.jsonl — it FORKS to a fresh <newSid>.jsonl seeded with a
+          // copy of the transcript. Our tail stays bound to the OLD, now-frozen
+          // jsonl, so the chat would go silent after respawn. Snapshot the
+          // project dir BEFORE spawn so the fork surfaces as a new file the
+          // watcher can re-bind onto. Skip when /clear already owns a watcher
+          // for this turn (its migration supersedes the fork).
+          const resumeBaseline = !armMigration ? listJsonls(dirname(a.jsonlPath)) : undefined;
           // Respawn in the binding's runningCwd (pendingCwd doesn't apply to a
           // mid-turn reincarnation — only /new and /clear-with-pending swap cwd).
           const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn", sessionId: sid }), resumeSessionId: sid, windowName: a.target, cwdOverride: a.runningCwd });
@@ -2099,6 +2145,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
               pendingCwd: a.pendingCwd || undefined,
             });
             log.info({ target: a.target, sessionId: sid, newPane: a.tmuxPane, newSession: a.tmuxSession }, "mirror: tmux respawned");
+            // Re-bind onto the resume fork once it appears (EOF offset: the fork
+            // already holds the full prior transcript — replaying from 0 would
+            // re-dump it). If --resume happens to keep the same jsonl, no new
+            // file appears, the watcher times out harmlessly, and the existing
+            // tail keeps working — safe under either behavior.
+            if (resumeBaseline) startMigrationWatcher(a, resumeBaseline, (p) => firstUserUuid(p) !== undefined);
           } else {
             // Drop only the stale pane id; keep tmuxSession (if any) so the
             // store still reflects "user wanted tmux" — next turn retries.
@@ -2141,7 +2193,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         if (armMigration) {
           sendStandalone(a, "cleared");
           pushProjectInfo(a.target);
-          startMigrationWatcher(a, preClearBaseline!);
+          startMigrationWatcher(a, preClearBaseline!, jsonlIsPostClearChild, 0);
         }
         // Don't await the stream's lifetime — it stays open until next inbound
         // or hard timeout. Releasing the inject queue here lets the next
