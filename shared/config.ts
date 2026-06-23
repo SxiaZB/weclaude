@@ -109,6 +109,10 @@ const Approval = z.object({
   // 期间到的同类请求合成一张批量卡 (减少 N 张并发卡的轰炸)。0 = 关闭聚合,
   // 每次立刻发卡 (旧行为)。单次到达走单卡路径, 仅多了一次性的延迟。
   batchCoalesceMs: z.number().int().nonnegative().default(250),
+  // 拦截 model 主动调用的 EnterPlanMode (deny + reason),让 Claude 不要自动进
+  // plan mode、直接干活。用户仍可在本地 Shift+Tab 手动进 plan mode(那条路径
+  // 不过 hook)。默认 true。设 false 恢复原行为(允许模型自动进 plan mode)。
+  blockAutoPlanMode: z.boolean().default(true),
 });
 
 const SyncTarget = z.object({

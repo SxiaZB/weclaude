@@ -701,7 +701,15 @@ const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget }: P
   }
 
   if (raw === `${PLAN_PICKED_PREFIX}approve`) {
-    return { decision: "allow", reason: "用户在 WeCom 同意计划" };
+    // 同意也走 deny+reason,而不是 allow:实测 allow 在非 auto-mode 会话里仍会弹
+    // 本地 1/2/3 picker(plan 退出的 auto/manual 选择是 TUI 本地交互,PreToolUse
+    // allow 替代不了)。deny 的 reason 直接回传 model 且不弹 picker,所以用一段
+    // "已批准,去执行"的明确指令驱动 Claude 退出 plan 开始干活。
+    return {
+      decision: "deny",
+      reason:
+        "✅ 用户已在企业微信批准此计划。这不是拒绝——ExitPlanMode 返回 deny 只是 weclaude 的远程批准信号。请视为计划已通过,立即开始执行计划内容,不要再次调用 ExitPlanMode,也不要重新规划。",
+    };
   }
   if (raw === `${PLAN_PICKED_PREFIX}revise`) {
     return { decision: "deny", reason: PLAN_REVISE_REASON };
@@ -900,6 +908,18 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: Approv
     // Matcher: only intercept matching tools — others pass.
     if (!new RegExp(cfg.approval.matcher).test(toolName)) {
       json(res, 200, { decision: "allow", reason: "matcher_skip" } satisfies ApproveResp);
+      return;
+    }
+
+    // EnterPlanMode: block model-initiated plan mode. deny + reason 回传 model,
+    // 让它别进 plan mode、直接干活。用户仍可在本地 Shift+Tab 手动进 plan mode
+    // (那条路径不过 hook)。由 config.approval.blockAutoPlanMode 控制(默认 true)。
+    if (toolName === "EnterPlanMode" && cfg.approval.blockAutoPlanMode) {
+      json(res, 200, {
+        decision: "deny",
+        reason:
+          "请不要进入 plan mode。直接开始执行任务;如果需要先讨论方案,用文字说明即可,不要调用 EnterPlanMode。(用户已设置:仅在其本地手动 Shift+Tab 时才进 plan mode。)",
+      } satisfies ApproveResp);
       return;
     }
 
