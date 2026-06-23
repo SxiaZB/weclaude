@@ -564,6 +564,151 @@ const buildAskqResolvedCard = (
   };
 };
 
+// ── ExitPlanMode 计划审批卡分支 ────────────────────────────────────────
+// plan mode 的 ExitPlanMode 是个交互模态(同意/继续改),TUI 里弹 1/2/3 picker,
+// 不写 jsonl → mirror 看不到。这里拦下来推一张 button_interaction 卡:
+//   ✅ 同意   → allow  (跳过本地 picker, 退出 plan mode 开始执行)
+//   ✏️ 继续改 → deny + reason (reason 回传 model, 留在 plan mode 据此调整)
+// plan 正文可能很长, vote 卡/按钮卡正文字段都吃不下 → 走前置 markdown 消息。
+const PLAN_PREFIX = "PLAN|";
+const PLAN_NOOP_PREFIX = "plan_noop:";
+type PlanAction = "approve" | "revise";
+const encodePlanKey = (reqId: string, action: PlanAction): string => `${PLAN_PREFIX}${reqId}|${action}`;
+const encodePlanNoopKey = (reqId: string): string => `${PLAN_NOOP_PREFIX}${reqId}`;
+const decodePlanKey = (key: string): { reqId: string; action: PlanAction } | undefined => {
+  if (!key.startsWith(PLAN_PREFIX)) return undefined;
+  const [reqId, action] = key.slice(PLAN_PREFIX.length).split("|");
+  if (!reqId || (action !== "approve" && action !== "revise")) return undefined;
+  return { reqId, action };
+};
+const decodePlanNoopKey = (key: string): string | undefined =>
+  key.startsWith(PLAN_NOOP_PREFIX) ? key.slice(PLAN_NOOP_PREFIX.length) : undefined;
+
+const PLAN_PICKED_PREFIX = "plan:";
+const PLAN_REVISE_REASON = "用户希望继续完善计划,请询问还需要调整哪些地方,不要直接开始执行。";
+
+const parsePlanInput = (i: unknown): string => {
+  if (!i || typeof i !== "object") return "";
+  const p = (i as { plan?: unknown }).plan;
+  return typeof p === "string" ? p : "";
+};
+
+const PLAN_TITLE_MAX = 26;
+const PLAN_PREVIEW_LINES = 25;
+const PLAN_PREVIEW_CHARS = 1500;
+// plan 正文走前置 markdown(卡片正文字段塞不下长 plan)。截断保留前若干行。
+const buildPlanMarkdown = (plan: string): string => {
+  const lines = plan.split("\n");
+  const clipped = lines.slice(0, PLAN_PREVIEW_LINES).join("\n");
+  let body = TRUNC(clipped, PLAN_PREVIEW_CHARS);
+  if (lines.length > PLAN_PREVIEW_LINES || plan.length > PLAN_PREVIEW_CHARS) {
+    body += "\n\n_…计划较长,完整内容见 CLI。_";
+  }
+  return `**📋 计划待审批**\n\n${body}`;
+};
+
+const buildPlanCard = (reqId: string, sessionId: string, cwd: string, transcriptTail: string): TemplateCard => {
+  const tail = oneLine(transcriptTail).trim();
+  const tag = sessionId ? `${labelFor(sessionId)} ` : "";
+  const dir = dirName(cwd);
+  return {
+    card_type: "button_interaction",
+    source: buildSource(tail),
+    main_title: { title: TRUNC(`📋 计划审批 · ${tag}${dir}/`, PLAN_TITLE_MAX + 12) },
+    sub_title_text: "审阅上方计划后选择:同意开始执行,或让 Claude 继续完善。",
+    task_id: reqId,
+    button_list: [
+      { text: "✏️ 继续改", style: 4, key: encodePlanKey(reqId, "revise") },
+      { text: "✅ 同意", style: 3, key: encodePlanKey(reqId, "approve") },
+    ],
+  } as TemplateCard;
+};
+
+const buildPlanResolvedCard = (
+  reqId: string,
+  action: PlanAction,
+  cwd: string,
+  transcriptTail: string,
+): TemplateCard => {
+  const tail = oneLine(transcriptTail).trim();
+  const dir = dirName(cwd);
+  const summary = action === "approve" ? "✅ 已同意 · 开始执行" : "✏️ 继续完善计划";
+  return {
+    card_type: "button_interaction",
+    source: buildSource(tail),
+    main_title: { title: TRUNC(`📋 计划 · ${dir}/`, PLAN_TITLE_MAX + 12) },
+    task_id: reqId,
+    button_list: [{ text: summary, style: 4, key: encodePlanNoopKey(reqId) }],
+  };
+};
+
+interface PlanHandleArgs {
+  cfg: Config;
+  log: Logger;
+  client: WSClient;
+  body: ApproveReq;
+  getMirrorTarget?: (sessionId: string) => string | undefined;
+}
+
+const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget }: PlanHandleArgs): Promise<ApproveResp> => {
+  const plan = parsePlanInput(body.tool_input);
+  if (!plan) return { decision: "ask", reason: "plan_unparsable" };
+
+  const approver = resolveApprover(cfg, body.session_id, getMirrorTarget);
+  if (!approver) return { decision: "ask", reason: "no_approver" };
+  if (!client.isConnected) return { decision: "ask", reason: "ws_disconnected" };
+
+  const longPollMs = cfg.approval.longPollSec * 1000;
+  const { reqId, promise } = createPending({
+    meta: {
+      kind: "generic",
+      createdAt: Date.now(),
+      toolName: "ExitPlanMode",
+      toolInput: body.tool_input,
+      cwd: body.cwd,
+      sessionId: body.session_id,
+      transcriptTail: body.transcript_tail ?? "",
+    },
+    timeoutMs: longPollMs,
+  });
+
+  try {
+    const target = targetChatId(approver);
+    try {
+      await client.sendMessage(target, {
+        msgtype: "markdown",
+        markdown: { content: buildPlanMarkdown(plan) },
+      });
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "plan markdown prelude send failed");
+    }
+    await client.sendMessage(target, {
+      msgtype: "template_card",
+      template_card: buildPlanCard(reqId, body.session_id, body.cwd ?? "", body.transcript_tail ?? ""),
+    });
+    log.info({ reqId, approver }, "plan card sent");
+  } catch (e) {
+    log.error({ err: (e as Error).message }, "plan send failed");
+    resolvePending(reqId, "deny");
+    return { decision: "ask", reason: `plan_send_fail:${(e as Error).message}` };
+  }
+
+  let raw: string;
+  try {
+    raw = (await promise) as unknown as string;
+  } catch {
+    return { decision: "ask", reason: "plan_timeout" };
+  }
+
+  if (raw === `${PLAN_PICKED_PREFIX}approve`) {
+    return { decision: "allow", reason: "用户在 WeCom 同意计划" };
+  }
+  if (raw === `${PLAN_PICKED_PREFIX}revise`) {
+    return { decision: "deny", reason: PLAN_REVISE_REASON };
+  }
+  return { decision: "ask", reason: "plan_unknown" };
+};
+
 interface AskqHandleArgs {
   cfg: Config;
   log: Logger;
@@ -761,6 +906,25 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: Approv
     // AskUserQuestion 走单独的投票卡分支(deny+reason 注入答案 / ask 转 CLI)。
     if (toolName === "AskUserQuestion") {
       const resp = await handleAskUserQuestion({
+        cfg,
+        log,
+        client,
+        getMirrorTarget,
+        body: {
+          session_id: sessionId,
+          tool_name: toolName,
+          tool_input: toolInput,
+          cwd,
+          transcript_tail: transcriptTail,
+        },
+      });
+      json(res, 200, resp satisfies ApproveResp);
+      return;
+    }
+
+    // ExitPlanMode 走计划审批卡分支(allow 同意 / deny+reason 继续改 / ask 转 CLI)。
+    if (toolName === "ExitPlanMode") {
+      const resp = await handleExitPlanMode({
         cfg,
         log,
         client,
@@ -1011,6 +1175,30 @@ export const installApprovalEventListener = (
         }
         return;
       }
+
+      // ── ExitPlanMode 计划审批卡: 在普通 approval 解码前匹配 PLAN| 前缀。
+      const planClick = decodePlanKey(key);
+      if (planClick) {
+        const meta = getPending(planClick.reqId);
+        const ok = resolvePending(planClick.reqId, `${PLAN_PICKED_PREFIX}${planClick.action}` as never);
+        log.info({ reqId: planClick.reqId, action: planClick.action, ok }, "plan event resolved");
+        try {
+          await client.updateTemplateCard(
+            frame,
+            buildPlanResolvedCard(
+              cbTaskId || planClick.reqId,
+              planClick.action,
+              meta?.cwd ?? "",
+              meta?.transcriptTail ?? "",
+            ),
+          );
+        } catch (e) {
+          log.warn({ err: (e as Error).message, reqId: planClick.reqId }, "plan updateTemplateCard failed");
+        }
+        return;
+      }
+      // 已决计划卡再次被点 (plan_noop:<id>) → 终态 identity, 直接吞掉。
+      if (decodePlanNoopKey(key) !== undefined) return;
 
       const decoded = decodeKey(key);
 
