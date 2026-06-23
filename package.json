@@ -59,6 +59,7 @@
     "dev:daemon": "tsx daemon/index.ts",
     "dev:cli": "tsx cli/weclaude.ts",
     "typecheck": "tsc --noEmit",
+    "prepare": "test -f dist/daemon/index.js || npm run build",
     "prepublishOnly": "rm -rf dist && npm run build",
     "prepack": "test -f dist/daemon/index.js || npm run build",
     "postinstall": "sh scripts/postinstall.sh"
