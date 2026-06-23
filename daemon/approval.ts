@@ -24,6 +24,7 @@ import { redact } from "./redact.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
+import { labelFor } from "./session-label.js";
 
 // ── Routing helpers ────────────────────────────────────────────────────
 const targetChatId = (principal: string): string => {
@@ -48,6 +49,8 @@ interface CardArgs {
   toolInputStr: string;
   cwd: string;
   sessionShort: string;
+  /** Full sessionId — used for the stable animal-emoji tag (matches /sessions list). */
+  sessionId?: string;
   transcriptTail: string;
   windowMinutes: number;
   detailUrl?: string;  // 空则不渲染 jump_list
@@ -182,6 +185,12 @@ const dirName = (cwd: string): string => cwd.replace(/^.*\//, "") || cwd;
 const detailJumpList = (url?: string): TemplateCard["jump_list"] | undefined =>
   url ? [{ type: 1, title: "🔍 详情", url }] : undefined;
 
+// Stable per-session animal emoji, matching list_claude_sessions, so the user
+// can tell which session a card belongs to when several un-mirrored sessions
+// fall back to the same WeCom chat. Needs the FULL sessionId; returns "" when
+// only a short id / none is available.
+const tagOf = (a: CardArgs): string => (a.sessionId ? `${labelFor(a.sessionId)} ` : "");
+
 const buildCard = (a: CardArgs): TemplateCard => {
   const r = renderInput(a.toolName, a.toolInput, a.toolInputStr, a.cwd);
   const dir = dirName(a.cwd);
@@ -190,7 +199,7 @@ const buildCard = (a: CardArgs): TemplateCard => {
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: mainTitle(`🔐 授权 · ${a.toolName} · ${dir}/`, r.desc),
+    main_title: mainTitle(`🔐 授权 · ${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -244,7 +253,7 @@ const buildResolvedCard = (
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: mainTitle(`${a.toolName} · ${dir}/`, r.desc),
+    main_title: mainTitle(`${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -260,7 +269,7 @@ const buildCancelledCard = (a: CardArgs): TemplateCard => {
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: mainTitle(`${a.toolName} · ${dir}/`, r.desc),
+    main_title: mainTitle(`${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -279,7 +288,7 @@ const buildAlreadyResolvedCard = (a: CardArgs): TemplateCard => {
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: mainTitle(`${a.toolName} · ${dir}/`, r.desc),
+    main_title: mainTitle(`${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -346,7 +355,7 @@ const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCar
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `🔐 授权 · ${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    main_title: { title: `🔐 授权 · ${batch.sessionId ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
     quote_area: quoteArea(renderBatchBody(batch)),
     task_id: batch.batchId,
     button_list: [
@@ -378,7 +387,7 @@ const buildBatchResolvedCard = (
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    main_title: { title: `${batch.sessionId ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
     quote_area: quoteArea(renderBatchBody(batch)),
     task_id: batch.batchId,
     button_list: [button],
@@ -391,7 +400,7 @@ const buildBatchAlreadyResolvedCard = (batch: ActiveBatch, transcriptTail: strin
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    main_title: { title: `${batch.sessionId ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
     quote_area: quoteArea(renderBatchBody(batch)),
     task_id: batch.batchId,
     button_list: [{ text: "已经放行", style: 4, key: encodeBatchNoopKey(batch.batchId) }],
@@ -699,6 +708,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: Approv
             toolInput: m.toolInput,
             toolInputStr: m.toolInputStr,
             cwd: m.cwd,
+            sessionId: batch.sessionId ?? "",
             sessionShort: batch.sessionId ? batch.sessionId.slice(-8) : "?",
             transcriptTail: m.transcriptTail,
             windowMinutes: batch.windowMinutes,
@@ -1073,6 +1083,7 @@ export const installApprovalEventListener = (
               toolInputStr: "",
               cwd: wmeta?.cwd ?? "",
               sessionShort: decoded.cancelSessionId.slice(-8),
+              sessionId: decoded.cancelSessionId,
               transcriptTail: wmeta?.transcriptTail ?? "",
               windowMinutes: cfg.approval.windowMinutes,
               detailUrl: cbTaskId ? detailUrlFor(cbTaskId) : undefined,
@@ -1144,6 +1155,7 @@ export const installApprovalEventListener = (
               toolInputStr,
               cwd: meta?.cwd ?? "",
               sessionShort,
+              sessionId: meta?.sessionId ?? "",
               transcriptTail: meta?.transcriptTail ?? "",
               windowMinutes: cfg.approval.windowMinutes,
               detailUrl: detailUrlFor(reqId),

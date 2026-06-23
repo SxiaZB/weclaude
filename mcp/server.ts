@@ -248,5 +248,66 @@ server.registerTool(
   },
 );
 
+// ── Session discovery / switching (conversational) ─────────────────────────
+// These let the WeCom-side Claude answer "列出所有 claude session" / "切到 xxx
+// 那个" / "在 /path 下新建一个 session" in natural language. The daemon does the
+// host-wide /proc + tmux scan (an MCP tool can only see its OWN session).
+server.registerTool(
+  "list_claude_sessions",
+  {
+    title: "List running Claude sessions",
+    description:
+      "List all Claude Code sessions currently running in tmux on this host, each with a stable animal-emoji label, its working directory, tmux location, and a short summary of what it's recently been doing. Call this whenever the user asks to see / list / switch between Claude sessions (e.g. '列出所有 claude session', '有哪些会话在跑', '我想切换 session'). Present the result to the user as a readable numbered list (emoji + dir + summary), and note which one is the current mirror target (`current: true`).",
+    inputSchema: {},
+  },
+  async () => {
+    const resp = await fetch(`${DAEMON_BASE}/sessions/list`, { method: "GET" });
+    const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+    return j.ok ? ok(j) : fail(`list_claude_sessions failed: ${j.reason ?? `http ${resp.status}`}`);
+  },
+);
+
+server.registerTool(
+  "switch_claude_session",
+  {
+    title: "Switch WeCom mirror to another Claude session",
+    description:
+      "Re-point the WeCom mirror at a different already-running Claude session, so the user's IM chat starts mirroring (and injecting into) that session instead. Call this when the user picks a session to switch to — e.g. '切到 weclaude 那个', '镜像第2个', '换到 🦊 那个会话'. First call list_claude_sessions to resolve the user's natural-language reference (emoji / directory / topic) to a concrete sessionId, then pass that sessionId here.",
+    inputSchema: {
+      sessionId: z.string().describe("The target session's sessionId (a UUID), as returned by list_claude_sessions."),
+    },
+  },
+  async ({ sessionId }) => {
+    const resp = await fetch(`${DAEMON_BASE}/sessions/switch`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId }),
+    });
+    const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+    return j.ok ? ok(j) : fail(`switch_claude_session failed: ${j.reason ?? `http ${resp.status}`}`);
+  },
+);
+
+server.registerTool(
+  "new_claude_session",
+  {
+    title: "Spawn a new Claude session and mirror it",
+    description:
+      "Spawn a brand-new Claude Code session in a fresh tmux pane rooted at the given project path, then switch the WeCom mirror to it. Call this when the user asks to start a new session somewhere — e.g. '在 /path/to/proj 下新建一个 claude session', '帮我在 xxx 目录起个新会话'. The directory is created if it doesn't exist.",
+    inputSchema: {
+      cwd: z.string().describe("Absolute project path to start the new session in, e.g. /Users/foo/projects/bar. Created if missing."),
+    },
+  },
+  async ({ cwd }) => {
+    const resp = await fetch(`${DAEMON_BASE}/sessions/new`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cwd }),
+    });
+    const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+    return j.ok ? ok(j) : fail(`new_claude_session failed: ${j.reason ?? `http ${resp.status}`}`);
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
