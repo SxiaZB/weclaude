@@ -43,6 +43,61 @@ weclaude init
 
 这是**唯一**绕过白名单的入口，10 分钟窗口，消费完立刻关。后续所有消息都按白名单鉴权。
 
+### 其它安装方式 / 内网与无 systemd 环境
+
+**从某个 fork / 分支装（自带改动的版本）**：`dist/` 不入库，但 `prepare` 脚本会在 git 安装时自动编译，所以可以直接：
+
+```bash
+npm i -g github:<你的用户名>/weclaude          # 默认分支
+npm i -g github:<你的用户名>/weclaude#<分支名>   # 指定分支
+```
+
+**内网 / 需要正向代理**：weclaude 的出站（WeCom WebSocket、智能机器人文档 MCP）会读环境变量里的代理。安装与运行都带上 `HTTPS_PROXY`：
+
+```bash
+HTTPS_PROXY=http://your-proxy:port npm i -g github:<你的用户名>/weclaude
+# 也可在 config.jsonc 写死: bot.proxy = "http://your-proxy:port"（优先级高于环境变量）
+```
+
+daemon 进程同样需要能读到代理变量（见下方守护脚本里 `export HTTPS_PROXY`）。
+
+**无 systemd 的环境（容器等）**：`init` 装 daemon 这步在 macOS 走 launchd、Linux 走 `systemd --user`。若机器没有 systemd user session（很多容器：PID 1 非 systemd、无 `XDG_RUNTIME_DIR`），这步会失败——其余配置（hook / MCP / 插件）已生效，只差 daemon 没被托管。用一个简单的重启循环守护即可，存成 `~/.weclaude/daemonctl.sh`：
+
+```bash
+#!/usr/bin/env bash
+# 无 systemd 时的 weclaude daemon 守护：setsid 脱离终端的重启循环。
+set -uo pipefail
+REPO="$(npm root -g)/weclaude"
+NODE="$(command -v node)"
+WC="$HOME/.weclaude"; PIDFILE="$WC/supervisor.pid"; LOG="$WC/daemon.log"
+mkdir -p "$WC"
+# 内网：daemon 出站要走代理。按需改成你的代理地址，或删掉这两行。
+export HTTPS_PROXY="${HTTPS_PROXY:-http://your-proxy:port}"; export https_proxy="$HTTPS_PROXY"
+export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}"; export no_proxy="$NO_PROXY"
+is_running(){ [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+case "${1:-start}" in
+  start)   is_running && { echo "already running"; exit 0; }
+           setsid bash "$0" __loop </dev/null >>"$LOG" 2>&1 & echo $! >"$PIDFILE"
+           sleep 2; echo "[daemonctl] started (pid $(cat "$PIDFILE"))" ;;
+  __loop)  while [[ -f "$PIDFILE" ]]; do "$NODE" "$REPO/dist/daemon/index.js" >>"$LOG" 2>&1
+             [[ -f "$PIDFILE" ]] || break; sleep 5; done ;;
+  stop)    [[ -f "$PIDFILE" ]] && { pid=$(cat "$PIDFILE"); rm -f "$PIDFILE"
+             pkill -P "$pid" 2>/dev/null||true; kill "$pid" 2>/dev/null||true; }
+           pkill -f "$REPO/dist/daemon/index.js" 2>/dev/null||true; echo "[daemonctl] stopped" ;;
+  restart) bash "$0" stop; sleep 1; bash "$0" start ;;
+  status)  is_running && echo "running (pid $(cat "$PIDFILE"))" || echo "stopped"
+           curl -sS -m2 http://127.0.0.1:17890/status 2>/dev/null && echo || echo "(HTTP :17890 无响应)" ;;
+esac
+```
+
+```bash
+chmod +x ~/.weclaude/daemonctl.sh
+~/.weclaude/daemonctl.sh start    # 起 daemon（自带崩溃重启）
+~/.weclaude/daemonctl.sh status   # 看状态
+```
+
+容器重启不会自动拉起 daemon——把 `~/.weclaude/daemonctl.sh start` 加进 shell profile 或容器入口即可（幂等，已在跑就 no-op）。
+
 ---
 
 ## 两种模式怎么选
