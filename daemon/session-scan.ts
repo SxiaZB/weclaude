@@ -11,7 +11,7 @@
 // pasted input, so it's not a useful mirror target). Linux-only (reads /proc);
 // returns [] elsewhere, degrading gracefully.
 import { spawn } from "node:child_process";
-import { readdirSync, readFileSync, existsSync, statSync, readlinkSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync, statSync, readlinkSync, openSync, readSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { labelFor } from "./session-label.js";
@@ -184,16 +184,20 @@ const inferByCwd = (cwd: string, taken: Set<string>): { sessionId: string; jsonl
 };
 
 // Extract the last ~3 user/assistant text turns from a transcript as a one-line
-// "what is this session doing" preview. Reads only the file tail to stay cheap.
+// "what is this session doing" preview. Reads only the file tail (bounded), so
+// huge multi-MB transcripts don't get slurped fully into memory.
 const TAIL_BYTES = 64 * 1024;
 const summarize = (jsonlPath: string): string => {
   if (!existsSync(jsonlPath)) return "(新会话 · 暂无对话)";
+  let fd: number | undefined;
   try {
     const size = statSync(jsonlPath).size;
     const start = Math.max(0, size - TAIL_BYTES);
-    const fd = readFileSync(jsonlPath);
-    const buf = start > 0 ? fd.subarray(start) : fd;
-    const lines = buf.toString("utf8").split("\n").filter((l) => l.trim());
+    const len = Math.min(size, TAIL_BYTES);
+    const buf = Buffer.allocUnsafe(len);
+    fd = openSync(jsonlPath, "r");
+    const read = readSync(fd, buf, 0, len, start);
+    const lines = buf.subarray(0, read).toString("utf8").split("\n").filter((l) => l.trim());
     const turns: string[] = [];
     for (const line of lines) {
       let row: Record<string, unknown>;
@@ -223,6 +227,14 @@ const summarize = (jsonlPath: string): string => {
     return turns.slice(-3).join(" | ") || "(暂无对话)";
   } catch {
     return "(无法读取对话)";
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
   }
 };
 
