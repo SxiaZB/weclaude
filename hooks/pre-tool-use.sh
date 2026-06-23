@@ -56,6 +56,19 @@ TOOL_NAME=$(printf '%s' "$PAYLOAD" | jq -r '.tool_name // empty')
 TOOL_INPUT=$(printf '%s' "$PAYLOAD" | jq -c '.tool_input // {}')
 CWD=$(printf '%s' "$PAYLOAD" | jq -r '.cwd // ""')
 TRANSCRIPT_PATH=$(printf '%s' "$PAYLOAD" | jq -r '.transcript_path // ""')
+PERMISSION_MODE=$(printf '%s' "$PAYLOAD" | jq -r '.permission_mode // ""')
+
+# 会话已处于"完全自动"权限模式时, 用户已经表达了"别问我"的意图 —— 直接放行,
+# 不要再把每个工具调用拦去推 IM 审批卡 (否则 auto mode 形同虚设, 用户得反复点
+# "10分钟内同意")。只认真正的全自动模式: auto / bypassPermissions / dontAsk。
+# acceptEdits 只自动接受编辑、Bash 等仍应过审批, 故不在此列, 保持推卡。
+# 可设环境变量 WECLAUDE_HONOR_AUTO_MODE=0 关掉此行为。
+if [[ "${WECLAUDE_HONOR_AUTO_MODE:-1}" != "0" ]]; then
+  case "$PERMISSION_MODE" in
+    auto|bypassPermissions|dontAsk)
+      emit "allow" "auto-mode passthrough ($PERMISSION_MODE)" ;;
+  esac
+fi
 
 # weclaude 自家 MCP 工具全部走 loopback 到本 daemon, 自审会把 /wrc 首次绑定卡死
 # (还没 defaultChat, 卡片无处可推 → 鸡生蛋), 直接放行。
