@@ -137,16 +137,22 @@ case "$cmd" in
     ;;
   mirror)
     cwd="${CLAUDE_PROJECT_DIR:-$(pwd)}"
-    enc="$(printf %s "$cwd" | sed 's|/|-|g')"
     # claude-internal stores under ~/.claude-internal/projects/, official claude
-    # under ~/.claude/projects/.
+    # under ~/.claude/projects/. Walk up parent dirs — caller may be in a
+    # subdirectory of the cwd Claude was launched in (e.g. monorepo subpackage).
     proj=""
-    for base in "$HOME/.claude-internal/projects" "$HOME/.claude/projects"; do
-      if [[ -d "$base/$enc" ]]; then proj="$base/$enc"; break; fi
+    probe="$cwd"
+    while [[ -z "$proj" && -n "$probe" ]]; do
+      enc="$(printf %s "$probe" | sed 's|[/.]|-|g')"
+      for base in "$HOME/.claude-internal/projects" "$HOME/.claude/projects"; do
+        if [[ -d "$base/$enc" ]]; then proj="$base/$enc"; break; fi
+      done
+      [[ "$probe" == "/" ]] && break
+      probe="$(dirname "$probe")"
     done
     if [[ -z "$proj" ]]; then
-      echo "no claude project dir for cwd: $cwd"
-      echo "looked in: $HOME/.claude-internal/projects/$enc and $HOME/.claude/projects/$enc"
+      echo "no claude project dir for cwd: $cwd (or any ancestor)"
+      echo "tried encodings up to $HOME/.claude{,-internal}/projects/<encoded-ancestor>"
       exit 1
     fi
     # Resolve the *calling* session via env var Claude Code injects into every

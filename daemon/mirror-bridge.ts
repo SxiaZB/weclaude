@@ -51,6 +51,33 @@ const augmentedPath = (orig: string | undefined): string => {
 // to a non-existent dir → ENOENT → silent pane→chat dropout.
 const encodeProjectDir = (absCwd: string): string => absCwd.replace(/[/.]/g, "-");
 
+// Pull the bound session's actual project cwd from its transcript head. Each
+// jsonl line carries a `cwd` field; the encoded directory name is lossy (both
+// `/` and `.` collapse to `-`) so it can't be reversed — reading the file is
+// the only faithful path. Used as the middle tier in attach()'s cwd resolution
+// so /wrc-attached sessions reflect their real project in /pwd, /clear, /new,
+// instead of falling back to the global cfg.wrc.cwd.
+const readCwdFromJsonl = (path: string): string => {
+  try {
+    if (!existsSync(path)) return "";
+    const size = statSync(path).size;
+    if (size === 0) return "";
+    const fd = openSync(path, "r");
+    const cap = Math.min(size, 64 * 1024);
+    const buf = Buffer.alloc(cap);
+    readSync(fd, buf, 0, cap, 0);
+    closeSync(fd);
+    for (const line of buf.toString("utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const j = JSON.parse(line) as { cwd?: unknown };
+        if (typeof j.cwd === "string" && j.cwd.trim()) return j.cwd.trim();
+      } catch { /* partial / non-JSON line — skip */ }
+    }
+  } catch { /* unreadable — fall through */ }
+  return "";
+};
+
 interface ResolvedSession {
   sessionId: string;
   jsonlPath: string;
@@ -1482,7 +1509,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       target,
       tmuxPane: (tmuxPane ?? "").trim(),
       tmuxSession: (tmuxSession ?? "").trim(),
-      runningCwd: expandHome(((cwd ?? "").trim()) || cfg.wrc.cwd),
+      // Explicit cwd (spawn path) wins; otherwise derive from jsonl head so
+      // /wrc attaches inherit the bound session's real project dir instead of
+      // collapsing to cfg.wrc.cwd (which would mislabel /pwd, /clear, /new).
+      runningCwd: expandHome(((cwd ?? "").trim()) || readCwdFromJsonl(jsonlPath) || cfg.wrc.cwd),
       pendingCwd: carryPending,
       tail: { stop: () => undefined }, // placeholder; replaced below
       standalonePending: Promise.resolve(),
