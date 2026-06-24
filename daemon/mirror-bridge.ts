@@ -629,7 +629,7 @@ const fingerprints = (text: string): { headFp: string; tailFp: string } => {
 //   3. narrow-window poll (last 5 rows = just the input box, NOT the echo
 //      above) for tailFp absence → submit was honored.
 //   4. on stuck-after-Enter, retry Enter once with extra settle.
-const injectViaTmux = async (target: string, text: string, images: string[], log: Logger, freshSpawn: boolean): Promise<{ ok: boolean; reason?: string }> => {
+const injectViaTmux = async (target: string, text: string, images: string[], log: Logger, freshSpawn: boolean): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
   log.info({ target, len: text.length, images: images.length, freshSpawn }, "mirror inject (tmux)");
 
   // Pump images first via clipboard+C-v so each one is attached as a separate
@@ -765,7 +765,12 @@ const injectViaTmux = async (target: string, text: string, images: string[], log
   // `[mirror] ✗` to the user when the prompt actually landed is worse than
   // accepting an extra no-op Enter on the rare true-stuck case.
   log.warn({ target, tailFp, freshSpawn }, "mirror inject: clear not observed, trusting submit");
-  return { ok: true };
+  // Input box still held our text after two Enters. Usually the prompt landed
+  // late (verifier false-positive), but it can also mean the target session is
+  // busy / not consuming input (e.g. running a long task, or context full) —
+  // the user's message would then silently go nowhere. Flag it uncertain so the
+  // caller can hint the user, without reporting a hard failure.
+  return { ok: true, uncertain: true, reason: "目标会话可能正忙或未消费输入(回车后输入框未清空)" };
 };
 
 const injectViaSpawn = (args: InjectArgs): Promise<{ ok: boolean; reason?: string }> => {
@@ -816,7 +821,7 @@ const injectViaSpawn = (args: InjectArgs): Promise<{ ok: boolean; reason?: strin
   });
 };
 
-const inject = (args: InjectArgs): Promise<{ ok: boolean; reason?: string }> => {
+const inject = (args: InjectArgs): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
   const target = (args.tmuxTarget ?? "").trim();
   return target ? injectViaTmux(target, args.text, args.images ?? [], args.log, args.freshSpawn ?? false) : injectViaSpawn(args);
 };
@@ -2185,6 +2190,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
             sendStandalone(a, `[mirror] ✗ ${r.reason ?? "failed"}`);
           }
           return;
+        }
+        // Inject "succeeded" but the input box never cleared — the target
+        // session may be busy / not consuming input (long task, full context).
+        // Hint the user once so a silently-dropped message isn't mistaken for a
+        // weclaude bug. Skip on the /clear path (armMigration), which has its
+        // own "cleared" feedback below.
+        if (r.uncertain && !armMigration) {
+          sendStandalone(a, `[mirror] ⚠️ 消息已发送,但目标会话似乎正忙或未响应(输入框未清空),可能未被处理。可稍后重试,或用 \`/sessions\` 切到其它会话。`);
         }
         // /clear was just injected — claude rotates sessionId on the next user
         // input. Arm a watcher to migrate the attachment onto the new jsonl,
