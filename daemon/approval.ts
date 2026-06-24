@@ -445,6 +445,7 @@ const decodeKey = (
 const ASKQ_PREFIX = "ASKQ|";
 const ASKQ_PICKED_PREFIX = "picked:";
 const ASKQ_CLI_OPTION_ID = "__cli__";
+const ASKQ_CHAT_OPTION_ID = "__chat__";
 const ASKQ_NOOP_PREFIX = "askq_noop:";
 type AskqAction = "submit";
 const encodeAskqKey = (reqId: string): string => `${ASKQ_PREFIX}${reqId}|submit`;
@@ -525,6 +526,7 @@ const buildAskqCard = (reqId: string, q: AskqQuestion, transcriptTail: string): 
           id: String(idx),
           text: askqLabel(idx),
         })),
+        { id: ASKQ_CHAT_OPTION_ID, text: "💬 聊聊这个" },
         { id: ASKQ_CLI_OPTION_ID, text: "🖥️ 去 CLI 中处理" },
       ],
     },
@@ -532,7 +534,7 @@ const buildAskqCard = (reqId: string, q: AskqQuestion, transcriptTail: string): 
   } as TemplateCard;
 };
 
-type AskqOutcome = { kind: "picked"; picked: number[] } | { kind: "cli" } | { kind: "empty" };
+type AskqOutcome = { kind: "picked"; picked: number[] } | { kind: "cli" } | { kind: "chat" } | { kind: "empty" };
 
 // 投票卡 submit 后那张卡再被点 (askq_noop:<id>) → 终态 identity, 直接 return,
 // 不再 stash 任何 outcome / question 副本。
@@ -544,9 +546,11 @@ const buildAskqResolvedCard = (
 ): TemplateCard => {
   const summary = outcome.kind === "cli"
     ? "🖥️ 已转 CLI 中处理"
-    : outcome.kind === "empty"
-      ? "⚠️ 未选择"
-      : `✅ ${outcome.picked.map((i) => q.options[i]?.label ?? `#${i}`).join(", ")}`;
+    : outcome.kind === "chat"
+      ? "💬 就此展开讨论"
+      : outcome.kind === "empty"
+        ? "⚠️ 未选择"
+        : `✅ ${outcome.picked.map((i) => q.options[i]?.label ?? `#${i}`).join(", ")}`;
   const tail = oneLine(transcriptTail).trim();
   return {
     card_type: "button_interaction",
@@ -624,6 +628,12 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget }
   }
 
   if (raw === "cli") return { decision: "ask", reason: "askq_cli" };
+  if (raw === "chat") {
+    return {
+      decision: "deny",
+      reason: `Instead of answering "${q.header || q.question}", the user wants to chat about it first. Discuss the question with them before re-asking.`,
+    };
+  }
   if (raw.startsWith(ASKQ_PICKED_PREFIX)) {
     const idxs = raw.slice(ASKQ_PICKED_PREFIX.length)
       .split(",")
@@ -972,19 +982,24 @@ export const installApprovalEventListener = (
           ? oids
           : (oids?.option_id ?? []);
         const cliPicked = rawIds.includes(ASKQ_CLI_OPTION_ID);
+        const chatPicked = rawIds.includes(ASKQ_CHAT_OPTION_ID);
         const numericIdxs = rawIds
-          .filter((s) => s !== ASKQ_CLI_OPTION_ID)
+          .filter((s) => s !== ASKQ_CLI_OPTION_ID && s !== ASKQ_CHAT_OPTION_ID)
           .map((s) => parseInt(s, 10))
           .filter((n) => Number.isInteger(n) && n >= 0);
-        // CLI 哨兵优先 (即便和其它选项混选,也按转 CLI 处理)。
+        // 哨兵优先级: CLI > chat > 数字选项 (混选也按哨兵语义处理)。
         const outcome: AskqOutcome = cliPicked
           ? { kind: "cli" }
-          : numericIdxs.length === 0
-            ? { kind: "empty" }
-            : { kind: "picked", picked: numericIdxs };
+          : chatPicked
+            ? { kind: "chat" }
+            : numericIdxs.length === 0
+              ? { kind: "empty" }
+              : { kind: "picked", picked: numericIdxs };
         const resolved = outcome.kind === "cli"
           ? "cli"
-          : `${ASKQ_PICKED_PREFIX}${numericIdxs.join(",")}`;
+          : outcome.kind === "chat"
+            ? "chat"
+            : `${ASKQ_PICKED_PREFIX}${numericIdxs.join(",")}`;
         const ok = resolvePending(askq.reqId, resolved as never);
         log.info({ reqId: askq.reqId, outcome, ok }, "askq event resolved");
         if (q) {
