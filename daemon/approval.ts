@@ -196,16 +196,19 @@ const buildCard = (a: CardArgs): TemplateCard => {
     task_id: a.reqId,
     button_list: [
       { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
-      { text: "10min", style: 3, key: encodeKey(a.reqId, "allow_window") },
+      { text: fmtWindow(a.windowMinutes), style: 3, key: encodeKey(a.reqId, "allow_window") },
       { text: "✅", style: 4, key: encodeKey(a.reqId, "allow") },
     ],
   };
 };
 
+const fmtWindow = (min: number): string =>
+  min % 60 === 0 ? `${min / 60}h` : `${min}min`;
+
 const verbOf = (d: Decision, windowMinutes: number): string => {
   switch (d) {
     case "deny": return "已拒绝";
-    case "allow_window": return `${windowMinutes}min会话内全过`;
+    case "allow_window": return `${fmtWindow(windowMinutes)}会话内全过`;
     case "allow_session": return "本会话通过";
     default: return "已通过";
   }
@@ -351,7 +354,7 @@ const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCar
     task_id: batch.batchId,
     button_list: [
       { text: "❌", style: 4, key: encodeBatchKey(batch.batchId, "deny") },
-      { text: "10min", style: 3, key: encodeBatchKey(batch.batchId, "allow_window") },
+      { text: fmtWindow(batch.windowMinutes), style: 3, key: encodeBatchKey(batch.batchId, "allow_window") },
       { text: "✅", style: 4, key: encodeBatchKey(batch.batchId, "allow") },
     ],
   };
