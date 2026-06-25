@@ -63,7 +63,13 @@ PERMISSION_MODE=$(printf '%s' "$PAYLOAD" | jq -r '.permission_mode // ""')
 # "10分钟内同意")。只认真正的全自动模式: auto / bypassPermissions / dontAsk。
 # acceptEdits 只自动接受编辑、Bash 等仍应过审批, 故不在此列, 保持推卡。
 # 可设环境变量 WECLAUDE_HONOR_AUTO_MODE=0 关掉此行为。
-if [[ "${WECLAUDE_HONOR_AUTO_MODE:-1}" != "0" ]]; then
+#
+# 例外: AskUserQuestion 是"用户主动决策"而非"工具放行"——即便 auto 模式也必须
+# 推到 IM, 否则选择题只在本地 TUI 弹出, 远程用户完全看不到、也答不了。它本身
+# 不是 auto 想自动化掉的"别问我"那类授权, 故不在 auto 短路之列, 始终走审批卡。
+# (ExitPlanMode 不豁免: auto 模式下 allow 即让计划自动通过、不弹本地 picker,
+#  这正是 auto 该有的语义, 强行推卡反而拧巴。)
+if [[ "$TOOL_NAME" != "AskUserQuestion" ]] && [[ "${WECLAUDE_HONOR_AUTO_MODE:-1}" != "0" ]]; then
   case "$PERMISSION_MODE" in
     auto|bypassPermissions|dontAsk)
       emit "allow" "auto-mode passthrough ($PERMISSION_MODE)" ;;
