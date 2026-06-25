@@ -102,7 +102,7 @@ const Approval = z.object({
   hookTimeoutSec: z.number().int().positive().default(7210),
   longPollSec: z.number().int().positive().default(7200),
   sessionCacheMinutes: z.number().int().nonnegative().default(30),
-  windowMinutes: z.number().int().nonnegative().default(10),
+  windowMinutes: z.number().int().nonnegative().default(600),
   sensitiveArgRedact: z.boolean().default(true),
   fallbackOnError: z.enum(["ask", "allow", "deny"]).default("ask"),
   // 同 session 同 tool 的并发 PreToolUse 合流窗口: 第一次到达后等待这么久,
