@@ -211,17 +211,19 @@ const renderToolInput = (input: unknown): string => {
   }
 };
 
-const renderToolResultFull = (block: ContentBlock, max: number): string => {
+const extractToolResultText = (block: ContentBlock): string => {
   const c = block.content;
-  if (typeof c === "string") return truncate(c, max);
+  if (typeof c === "string") return c;
   if (!Array.isArray(c)) return "";
-  return truncate(
-    c.map((b) => (typeof b?.text === "string" ? b.text : b?.tool_name ? `→ ${b.tool_name}` : ""))
-      .filter(Boolean)
-      .join("\n"),
-    max,
-  );
+  return c
+    .map((b) => (typeof b?.text === "string" ? b.text : b?.tool_name ? `→ ${b.tool_name}` : ""))
+    .filter(Boolean)
+    .join("\n");
 };
+
+// detail 页用的存储上限 — 远大于聊天气泡的 toolResultMaxChars(默认 400),
+// 确保点开"详情"能看到工具调用的完整 result, 不再受气泡截断的影响。
+const DETAIL_RESULT_MAX = 64 * 1024;
 
 // Tagged render output: items append in-order into the live replyStream. Tool
 // items render as plain body lines; the full input/result is carried out
@@ -351,27 +353,25 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
       if (deps.isOwnInject(text)) return []; // dedupe WeCom→CLI echo
       const quoted = text.split("\n").map((l) => `> ${l}`).join("\n");
       out.push({ kind: "user_text", body: quoted });
-    } else if (Array.isArray(c) && deps.includeToolResults) {
+    } else if (Array.isArray(c)) {
       for (const b of c) {
-        if (b?.type === "tool_result") {
-          const full = renderToolResultFull(b, deps.toolResultMaxChars);
-          if (!full) continue;
-          const compact = safeForMarkdown(oneLineSummary(full, 40));
-          const toolUseId = b.tool_use_id ?? "";
-          // Persist the result onto the matching tool record so the detail
-          // page renders both input and result. recordTool may not have run
-          // yet if tool_use is in a not-yet-flushed assistant line, so the
-          // result is also kept on the RenderItem for the in-stream "查看详情"
-          // card fallback.
-          if (toolUseId) recordToolResult(toolUseId, full);
-          const url = deps.detailUrlFor(toolUseId);
-          out.push({
-            kind: "tool_result",
-            toolUseId,
-            full,
-            body: url ? `[↩ ${compact}](${url})` : `↩ ${compact}`,
-          });
-        }
+        if (b?.type !== "tool_result") continue;
+        const raw = extractToolResultText(b);
+        if (!raw) continue;
+        const toolUseId = b.tool_use_id ?? "";
+        // 始终把完整 result 落 detail 库 — 与 includeToolResults(气泡推送开关)解耦,
+        // 否则关掉气泡时点"详情"看不到 result。
+        if (toolUseId) recordToolResult(toolUseId, truncate(raw, DETAIL_RESULT_MAX));
+        if (!deps.includeToolResults) continue;
+        const full = truncate(raw, deps.toolResultMaxChars);
+        const compact = safeForMarkdown(oneLineSummary(full, 40));
+        const url = deps.detailUrlFor(toolUseId);
+        out.push({
+          kind: "tool_result",
+          toolUseId,
+          full,
+          body: url ? `[↩ ${compact}](${url})` : `↩ ${compact}`,
+        });
       }
     }
     return out;
