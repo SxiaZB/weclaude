@@ -184,7 +184,19 @@ const stripPrincipalPrefix = (s: string): string => {
 // Returns "" when the message is purely meta — caller filters.
 const SLASH_TAG_RE = /<command-name>([\s\S]*?)<\/command-name>/;
 const SLASH_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
-const META_TAG_RE = /<(command-message|command-name|command-args|local-command-stdout|local-command-caveat|system-reminder)>[\s\S]*?<\/\1>/g;
+const META_TAG_RE = /<(command-message|command-name|command-args|local-command-stdout|local-command-caveat|system-reminder|task-notification)>[\s\S]*?<\/\1>/g;
+const TASK_NOTIF_RE = /<task-notification>([\s\S]*?)<\/task-notification>/;
+
+// Background task completion notification (Claude Code emits these into the
+// user channel when a backgrounded Bash/Agent task finishes). Render the
+// summary + status as a single styled line; drop the noisy tool-use-id /
+// output-file fields.
+const renderTaskNotification = (block: string): string => {
+  const summary = block.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.trim() ?? "";
+  const status = block.match(/<status>([\s\S]*?)<\/status>/)?.[1]?.trim() ?? "";
+  const icon = status === "completed" ? "✅" : status === "failed" || status === "error" ? "❌" : "🏁";
+  return `${icon} ${summary || `后台任务 ${status || "完成"}`}`;
+};
 
 const cleanUserText = (raw: string): string => {
   const nameMatch = raw.match(SLASH_TAG_RE);
@@ -345,6 +357,14 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
         if (skillOutput) {
           out.push({ kind: "skill_output", body: `⚙️ ${skillOutput}` });
         }
+        return out;
+      }
+
+      // Background task completion — strip the raw tag soup and render
+      // a single styled line.
+      const taskMatch = c.match(TASK_NOTIF_RE);
+      if (taskMatch && taskMatch[1]) {
+        out.push({ kind: "skill_output", body: renderTaskNotification(taskMatch[1]) });
         return out;
       }
 
