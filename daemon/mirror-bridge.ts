@@ -2196,7 +2196,15 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // Hint the user once so a silently-dropped message isn't mistaken for a
         // weclaude bug. Skip on the /clear path (armMigration), which has its
         // own "cleared" feedback below.
-        if (r.uncertain && !armMigration) {
+        //
+        // OFF by default: the clear-check has a structural false-positive (the
+        // tailFp can match the message's own echo line just above the input box
+        // when it falls in the 5-row capture window), so in the common mirror
+        // case this fires on essentially every message even though it landed
+        // fine — pure noise. A genuinely dropped message still surfaces as the
+        // `[mirror] ✗` hard failure above. Opt back in with
+        // WECLAUDE_WARN_UNCERTAIN_INJECT=1 if you want the (noisy) heads-up.
+        if (r.uncertain && !armMigration && process.env.WECLAUDE_WARN_UNCERTAIN_INJECT === "1") {
           sendStandalone(a, `[mirror] ⚠️ 消息已发送,但目标会话似乎正忙或未响应(输入框未清空),可能未被处理。可稍后重试,或用 \`/sessions\` 切到其它会话。`);
         }
         // /clear was just injected — claude rotates sessionId on the next user
