@@ -10,6 +10,7 @@ import type { MirrorBridge } from "./mirror-bridge.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
 import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim } from "./claim.js";
 import { getLastResponse } from "./last-response.js";
+import { scanClaudeSessions, type SessionInfo } from "./session-scan.js";
 
 // Chat-binding key: stable id for "this conversation thread". Used as
 // session-map key, mirror target, defaultChat. NOT used for auth.
@@ -52,6 +53,38 @@ const isIdCommand = (text: string): boolean => text.trim() === "/id";
 const isPwdCommand = (text: string): boolean => text.trim() === "/pwd";
 const isNewCommand = (text: string): boolean => text.trim() === "/new";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
+
+// /session(s) [arg] — list live Claude sessions, or switch the mirror to one.
+// Bare "/sessions" (or "/session") lists; an arg (animal emoji, sessionId, or
+// sessionId prefix) switches. Tolerates an optional trailing "s" and any spacing.
+const parseSessionsCommand = (text: string): { arg: string } | undefined => {
+  const m = /^\/sessions?(?:\s+(.+))?$/u.exec(text.trim());
+  if (!m) return undefined;
+  return { arg: (m[1] ?? "").trim() };
+};
+
+// Render the scanned session list into a WeCom-friendly markdown block. The
+// session currently mirrored to this chat's target (if any) is flagged.
+const renderSessionsList = (sessions: SessionInfo[], currentSid: string): string => {
+  if (sessions.length === 0) return "[weclaude] 未发现正在运行的 Claude 会话";
+  const lines = sessions.map((s) => {
+    const here = s.sessionId === currentSid ? " ⬅️ 当前" : "";
+    const dir = s.cwd.replace(/^.*\//, "") || s.cwd || "?";
+    return `${s.label || "▫️"} \`${s.sessionId.slice(0, 8)}\` ${dir}${here}`;
+  });
+  return [
+    "[weclaude] 正在运行的会话：",
+    ...lines,
+    "> 切换：`/sessions <emoji 或 id>`，如 `/sessions 🐼`",
+  ].join("\n");
+};
+
+// Match a switch arg against a scanned session: animal emoji label, full
+// sessionId, or a ≥6 char sessionId prefix. Returns the session or undefined.
+const matchSession = (sessions: SessionInfo[], arg: string): SessionInfo | undefined =>
+  sessions.find((s) => s.label === arg) ??
+  sessions.find((s) => s.sessionId === arg) ??
+  (arg.length >= 6 ? sessions.find((s) => s.sessionId.startsWith(arg)) : undefined);
 
 // Strip any "@<botname>" mention (leading, mid-text, or trailing) so it doesn't
 // leak into claude's prompt. WeCom may place the mention anywhere depending on
@@ -287,6 +320,45 @@ export const installInboundRouter = (
         const reply = r.ok ? "✅ Esc sent" : `[weclaude] /stop failed: ${r.reason ?? "unknown"}`;
         try { await client.replyStream(frame, msg.msgid, reply, true); } catch { /* ignore */ }
       }
+      return { stop: true, who };
+    }
+    // /sessions [arg] — list live Claude sessions, or switch the mirror to one.
+    // Bare lists; with an arg (emoji / sessionId / ≥6-char prefix) it re-points
+    // THIS chat's mirror at the matched session. Reuses the same scan+attach
+    // path as the /sessions/switch route so IM and MCP behave identically.
+    const sc = parseSessionsCommand(text);
+    if (sc) {
+      if (!("attach" in bridge)) {
+        try { await client.replyStream(frame, msg.msgid, "[weclaude] /sessions only available in mirror mode", true); } catch { /* ignore */ }
+        return { stop: true, who };
+      }
+      let sessions: SessionInfo[] = [];
+      try {
+        sessions = await scanClaudeSessions();
+      } catch (e) {
+        log.error({ err: (e as Error).message }, "/sessions scan failed");
+      }
+      // Resolve which session is currently mirrored to THIS chat.
+      const currentSid = bridge.status().mirrors.find((mm) => mm.target === who)?.sessionId ?? "";
+      if (!sc.arg) {
+        try { await client.replyStream(frame, msg.msgid, renderSessionsList(sessions, currentSid), true); } catch { /* ignore */ }
+        return { stop: true, who };
+      }
+      const hit = matchSession(sessions, sc.arg);
+      if (!hit) {
+        const avail = sessions.map((s) => `${s.label || "▫️"} ${s.sessionId.slice(0, 8)}`).join("、") || "无";
+        try { await client.replyStream(frame, msg.msgid, `[weclaude] 未找到会话 \`${sc.arg}\`。可用：${avail}`, true); } catch { /* ignore */ }
+        return { stop: true, who };
+      }
+      if (hit.sessionId === currentSid) {
+        try { await client.replyStream(frame, msg.msgid, `[weclaude] 已经在该会话 ${hit.label} \`${hit.sessionId.slice(0, 8)}\``, true); } catch { /* ignore */ }
+        return { stop: true, who };
+      }
+      const att = bridge.attach({ sessionId: hit.sessionId, jsonlPath: hit.jsonlPath, target: who, tmuxPane: hit.tmuxPane, tmuxSession: hit.tmuxSession, cwd: hit.cwd });
+      const reply = att.ok
+        ? `✅ 已切到 ${hit.label} \`${hit.sessionId.slice(0, 8)}\` (${hit.cwd})`
+        : `[weclaude] 切换失败: ${att.reason ?? "unknown"}`;
+      try { await client.replyStream(frame, msg.msgid, reply, true); } catch { /* ignore */ }
       return { stop: true, who };
     }
     // Mirror mode but no Claude session attached for this chat yet. Since the

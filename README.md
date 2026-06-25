@@ -5,11 +5,13 @@
 ![demo](images/demo.png)
 
 - 🛎 **远程审批** — Claude 要跑 `Bash` / `Edit`？审批卡片直推 IM，点 ✅/❌/⏱（放行 N 分钟）。
+- 📋 **计划审批** — Claude 在 plan mode 结束（`ExitPlanMode`）时，把计划摘要 + 审批卡推到 IM：点 ✅同意 让它退出 plan mode 开始执行，或 ✏️继续改 让它留在 plan mode 继续完善。同 `AskUserQuestion` 多选题也镜像为投票卡。
 - 🪞 **会话镜像** — 你电脑上跑的 Claude 流式打字、tool_use、思考过程，实时同步到企业微信；IM 里发消息原样落进 CLI 输入框。
 - 🖼 **图片直贴** — 企业微信发图，自动走 macOS 剪贴板 + tmux 粘贴，Claude 当贴图处理（不走 Read，不耗 token）。
 - 🔍 **细节页** — 工具调用 / 审批请求都生成本地 HTML 详情页，IM 里点链接看完整 input / result / git diff。
 - 📡 **MCP 主动推送** — Claude 通过 `wecom__send_markdown` / `wecom__send_card` / `wecom__ask_user` 主动汇报或问询。
 - 📄 **文档读写** — Claude 通过 `wecom_doc_list_tools` / `wecom_doc_call` 直接调企业微信智能机器人的 doc / smartsheet / smartpage MCP，新建在线文档、写 Markdown、读链接、操作智能表格——全程在内网，不需要 corp access_token。
+- 🗂 **多会话发现/切换** — Claude 通过 `list_claude_sessions` / `switch_claude_session` / `new_claude_session` 列出本机 tmux 内所有在跑的 Claude 会话（带摘要 + 稳定动物 emoji 标签）、把 IM 镜像切到其中任一个、或在指定路径新开一个会话。审批卡标题也带同一枚 emoji，多个会话兜底到同一 IM 时一眼区分。
 
 ---
 
@@ -40,6 +42,61 @@ weclaude init
 ```
 
 这是**唯一**绕过白名单的入口，10 分钟窗口，消费完立刻关。后续所有消息都按白名单鉴权。
+
+### 其它安装方式 / 内网与无 systemd 环境
+
+**从某个 fork / 分支装（自带改动的版本）**：`dist/` 不入库，但 `prepare` 脚本会在 git 安装时自动编译，所以可以直接：
+
+```bash
+npm i -g github:<你的用户名>/weclaude          # 默认分支
+npm i -g github:<你的用户名>/weclaude#<分支名>   # 指定分支
+```
+
+**内网 / 需要正向代理**：weclaude 的出站（WeCom WebSocket、智能机器人文档 MCP）会读环境变量里的代理。安装与运行都带上 `HTTPS_PROXY`：
+
+```bash
+HTTPS_PROXY=http://your-proxy:port npm i -g github:<你的用户名>/weclaude
+# 也可在 config.jsonc 写死: bot.proxy = "http://your-proxy:port"（优先级高于环境变量）
+```
+
+daemon 进程同样需要能读到代理变量（见下方守护脚本里 `export HTTPS_PROXY`）。
+
+**无 systemd 的环境（容器等）**：`init` 装 daemon 这步在 macOS 走 launchd、Linux 走 `systemd --user`。若机器没有 systemd user session（很多容器：PID 1 非 systemd、无 `XDG_RUNTIME_DIR`），这步会失败——其余配置（hook / MCP / 插件）已生效，只差 daemon 没被托管。用一个简单的重启循环守护即可，存成 `~/.weclaude/daemonctl.sh`：
+
+```bash
+#!/usr/bin/env bash
+# 无 systemd 时的 weclaude daemon 守护：setsid 脱离终端的重启循环。
+set -uo pipefail
+REPO="$(npm root -g)/weclaude"
+NODE="$(command -v node)"
+WC="$HOME/.weclaude"; PIDFILE="$WC/supervisor.pid"; LOG="$WC/daemon.log"
+mkdir -p "$WC"
+# 内网：daemon 出站要走代理。按需改成你的代理地址，或删掉这两行。
+export HTTPS_PROXY="${HTTPS_PROXY:-http://your-proxy:port}"; export https_proxy="$HTTPS_PROXY"
+export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}"; export no_proxy="$NO_PROXY"
+is_running(){ [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+case "${1:-start}" in
+  start)   is_running && { echo "already running"; exit 0; }
+           setsid bash "$0" __loop </dev/null >>"$LOG" 2>&1 & echo $! >"$PIDFILE"
+           sleep 2; echo "[daemonctl] started (pid $(cat "$PIDFILE"))" ;;
+  __loop)  while [[ -f "$PIDFILE" ]]; do "$NODE" "$REPO/dist/daemon/index.js" >>"$LOG" 2>&1
+             [[ -f "$PIDFILE" ]] || break; sleep 5; done ;;
+  stop)    [[ -f "$PIDFILE" ]] && { pid=$(cat "$PIDFILE"); rm -f "$PIDFILE"
+             pkill -P "$pid" 2>/dev/null||true; kill "$pid" 2>/dev/null||true; }
+           pkill -f "$REPO/dist/daemon/index.js" 2>/dev/null||true; echo "[daemonctl] stopped" ;;
+  restart) bash "$0" stop; sleep 1; bash "$0" start ;;
+  status)  is_running && echo "running (pid $(cat "$PIDFILE"))" || echo "stopped"
+           curl -sS -m2 http://127.0.0.1:17890/status 2>/dev/null && echo || echo "(HTTP :17890 无响应)" ;;
+esac
+```
+
+```bash
+chmod +x ~/.weclaude/daemonctl.sh
+~/.weclaude/daemonctl.sh start    # 起 daemon（自带崩溃重启）
+~/.weclaude/daemonctl.sh status   # 看状态
+```
+
+容器重启不会自动拉起 daemon——把 `~/.weclaude/daemonctl.sh start` 加进 shell profile 或容器入口即可（幂等，已在跑就 no-op）。
 
 ---
 

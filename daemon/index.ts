@@ -21,6 +21,7 @@ import {
 } from "./claim.js";
 import { makeWedocBridge } from "./wedoc.js";
 import { installResponseTracker } from "./last-response.js";
+import { scanClaudeSessions } from "./session-scan.js";
 
 // pino's file transport is async; without flush, log.fatal before process.exit
 // vanishes. Mirror anything fatal to stderr too so launchd's stderr.log captures it.
@@ -191,6 +192,76 @@ const main = async (): Promise<void> => {
       if (!r.ok) { json(res, 500, { ok: false, reason: r.reason }); return; }
       const att = m.attach({ sessionId: r.sessionId!, jsonlPath: r.jsonlPath!, target, tmuxPane: r.tmuxPane, tmuxSession: r.tmuxSession });
       json(res, att.ok ? 200 : 500, att.ok ? { ok: true, sessionId: r.sessionId, tmuxSession: r.tmuxSession, tmuxPane: r.tmuxPane, target } : { ok: false, reason: att.reason });
+    });
+    // ── Session discovery / switching (conversational, via MCP tools) ───────
+    // GET /sessions/list — enumerate live claude sessions in tmux + a one-line
+    // "what is it doing" summary each, with a stable animal-emoji label. The
+    // session currently mirrored to defaultChat (if any) is flagged `current`.
+    http.register("GET /sessions/list", async (_req, res) => {
+      try {
+        const sessions = await scanClaudeSessions();
+        const cur = m.status();
+        const currentSid = cur?.attached ? cur.sessionId : "";
+        json(res, 200, {
+          ok: true,
+          current: currentSid,
+          sessions: sessions.map((s) => ({ ...s, current: s.sessionId === currentSid })),
+        });
+      } catch (e) {
+        json(res, 500, { ok: false, reason: (e as Error).message });
+      }
+    });
+    // POST /sessions/switch { sessionId, target? } — re-point the WeCom mirror
+    // at an already-running session. We re-scan to recover its live pane/jsonl
+    // (the caller MCP tool only knows its OWN session), then attach — which
+    // replaces any existing binding for the target.
+    http.register("POST /sessions/switch", async (req, res) => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as Partial<{ sessionId: string; target: string }>;
+      const sessionId = (body.sessionId ?? "").trim();
+      if (!sessionId) {
+        json(res, 400, { ok: false, reason: "sessionId required" });
+        return;
+      }
+      const target = (body.target ?? cfg.defaultChat ?? "").trim();
+      if (!target) {
+        json(res, 400, { ok: false, reason: "target required (and cfg.defaultChat empty)" });
+        return;
+      }
+      const sessions = await scanClaudeSessions();
+      const hit = sessions.find((s) => s.sessionId === sessionId);
+      if (!hit) {
+        json(res, 404, { ok: false, reason: `session ${sessionId} not found among live tmux sessions` });
+        return;
+      }
+      const att = m.attach({ sessionId: hit.sessionId, jsonlPath: hit.jsonlPath, target, tmuxPane: hit.tmuxPane, tmuxSession: hit.tmuxSession, cwd: hit.cwd });
+      json(res, att.ok ? 200 : 500, att.ok
+        ? { ok: true, sessionId: hit.sessionId, label: hit.label, target, cwd: hit.cwd, tmuxSession: hit.tmuxSession }
+        : { ok: false, reason: att.reason });
+    });
+    // POST /sessions/new { cwd, target? } — spawn a fresh claude in a tmux pane
+    // rooted at `cwd`, then attach the WeCom mirror to it. Reuses the same
+    // spawn+attach path as /mirror/spawn, just with an explicit cwdOverride.
+    http.register("POST /sessions/new", async (req, res) => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as Partial<{ cwd: string; target: string }>;
+      const cwd = (body.cwd ?? "").toString().trim();
+      if (!cwd) {
+        json(res, 400, { ok: false, reason: "cwd required" });
+        return;
+      }
+      const target = (body.target ?? cfg.defaultChat ?? "").trim();
+      if (!target) {
+        json(res, 400, { ok: false, reason: "target required (and cfg.defaultChat empty)" });
+        return;
+      }
+      const spawnLog = log.child({ mod: "mirror", sub: "sessions-new", target });
+      const r = await spawnTmuxClaude({ cfg, log: spawnLog, windowName: target, cwdOverride: cwd });
+      if (!r.ok) { json(res, 500, { ok: false, reason: r.reason }); return; }
+      const att = m.attach({ sessionId: r.sessionId!, jsonlPath: r.jsonlPath!, target, tmuxPane: r.tmuxPane, tmuxSession: r.tmuxSession, cwd: r.cwd });
+      json(res, att.ok ? 200 : 500, att.ok
+        ? { ok: true, sessionId: r.sessionId, target, cwd: r.cwd, tmuxSession: r.tmuxSession, tmuxPane: r.tmuxPane }
+        : { ok: false, reason: att.reason });
     });
     // Frame-less inject — used by `weclaude init` to fire a demo prompt right
     // after /mirror/spawn so first-time users see the full PreToolUse → card

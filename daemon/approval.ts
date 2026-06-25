@@ -24,6 +24,7 @@ import { redact } from "./redact.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
+import { labelFor } from "./session-label.js";
 
 // ── Routing helpers ────────────────────────────────────────────────────
 const targetChatId = (principal: string): string => {
@@ -48,6 +49,8 @@ interface CardArgs {
   toolInputStr: string;
   cwd: string;
   sessionShort: string;
+  /** Full sessionId — used for the stable animal-emoji tag (matches /sessions list). */
+  sessionId?: string;
   transcriptTail: string;
   windowMinutes: number;
   detailUrl?: string;  // 空则不渲染 jump_list
@@ -182,6 +185,12 @@ const dirName = (cwd: string): string => cwd.replace(/^.*\//, "") || cwd;
 const detailJumpList = (url?: string): TemplateCard["jump_list"] | undefined =>
   url ? [{ type: 1, title: "🔍 详情", url }] : undefined;
 
+// Stable per-session animal emoji, matching list_claude_sessions, so the user
+// can tell which session a card belongs to when several un-mirrored sessions
+// fall back to the same WeCom chat. Needs the FULL sessionId; returns "" when
+// only a short id / none is available.
+const tagOf = (a: CardArgs): string => (a.sessionId ? `${labelFor(a.sessionId)} ` : "");
+
 const buildCard = (a: CardArgs): TemplateCard => {
   const r = renderInput(a.toolName, a.toolInput, a.toolInputStr, a.cwd);
   const dir = dirName(a.cwd);
@@ -190,7 +199,7 @@ const buildCard = (a: CardArgs): TemplateCard => {
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: mainTitle(`🔐 授权 · ${a.toolName} · ${dir}/`, r.desc),
+    main_title: mainTitle(`🔐 授权 · ${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -247,7 +256,7 @@ const buildResolvedCard = (
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: mainTitle(`${a.toolName} · ${dir}/`, r.desc),
+    main_title: mainTitle(`${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -263,7 +272,7 @@ const buildCancelledCard = (a: CardArgs): TemplateCard => {
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: mainTitle(`${a.toolName} · ${dir}/`, r.desc),
+    main_title: mainTitle(`${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -282,7 +291,7 @@ const buildAlreadyResolvedCard = (a: CardArgs): TemplateCard => {
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: mainTitle(`${a.toolName} · ${dir}/`, r.desc),
+    main_title: mainTitle(`${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -349,7 +358,7 @@ const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCar
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `🔐 授权 · ${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    main_title: { title: `🔐 授权 · ${batch.sessionId ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
     quote_area: quoteArea(renderBatchBody(batch)),
     task_id: batch.batchId,
     button_list: [
@@ -381,7 +390,7 @@ const buildBatchResolvedCard = (
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    main_title: { title: `${batch.sessionId ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
     quote_area: quoteArea(renderBatchBody(batch)),
     task_id: batch.batchId,
     button_list: [button],
@@ -394,7 +403,7 @@ const buildBatchAlreadyResolvedCard = (batch: ActiveBatch, transcriptTail: strin
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    main_title: { title: `${batch.sessionId ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
     quote_area: quoteArea(renderBatchBody(batch)),
     task_id: batch.batchId,
     button_list: [{ text: "已经放行", style: 4, key: encodeBatchNoopKey(batch.batchId) }],
@@ -561,6 +570,159 @@ const buildAskqResolvedCard = (
     task_id: reqId,
     button_list: [{ text: TRUNC(summary, 30), style: 4, key: encodeAskqNoopKey(reqId) }],
   };
+};
+
+// ── ExitPlanMode 计划审批卡分支 ────────────────────────────────────────
+// plan mode 的 ExitPlanMode 是个交互模态(同意/继续改),TUI 里弹 1/2/3 picker,
+// 不写 jsonl → mirror 看不到。这里拦下来推一张 button_interaction 卡:
+//   ✅ 同意   → allow  (跳过本地 picker, 退出 plan mode 开始执行)
+//   ✏️ 继续改 → deny + reason (reason 回传 model, 留在 plan mode 据此调整)
+// plan 正文可能很长, vote 卡/按钮卡正文字段都吃不下 → 走前置 markdown 消息。
+const PLAN_PREFIX = "PLAN|";
+const PLAN_NOOP_PREFIX = "plan_noop:";
+type PlanAction = "approve" | "revise";
+const encodePlanKey = (reqId: string, action: PlanAction): string => `${PLAN_PREFIX}${reqId}|${action}`;
+const encodePlanNoopKey = (reqId: string): string => `${PLAN_NOOP_PREFIX}${reqId}`;
+const decodePlanKey = (key: string): { reqId: string; action: PlanAction } | undefined => {
+  if (!key.startsWith(PLAN_PREFIX)) return undefined;
+  const [reqId, action] = key.slice(PLAN_PREFIX.length).split("|");
+  if (!reqId || (action !== "approve" && action !== "revise")) return undefined;
+  return { reqId, action };
+};
+const decodePlanNoopKey = (key: string): string | undefined =>
+  key.startsWith(PLAN_NOOP_PREFIX) ? key.slice(PLAN_NOOP_PREFIX.length) : undefined;
+
+const PLAN_PICKED_PREFIX = "plan:";
+const PLAN_REVISE_REASON = "用户希望继续完善计划,请询问还需要调整哪些地方,不要直接开始执行。";
+
+const parsePlanInput = (i: unknown): string => {
+  if (!i || typeof i !== "object") return "";
+  const p = (i as { plan?: unknown }).plan;
+  return typeof p === "string" ? p : "";
+};
+
+const PLAN_TITLE_MAX = 26;
+const PLAN_PREVIEW_LINES = 25;
+const PLAN_PREVIEW_CHARS = 1500;
+// plan 正文走前置 markdown(卡片正文字段塞不下长 plan)。截断保留前若干行。
+const buildPlanMarkdown = (plan: string): string => {
+  const lines = plan.split("\n");
+  const clipped = lines.slice(0, PLAN_PREVIEW_LINES).join("\n");
+  let body = TRUNC(clipped, PLAN_PREVIEW_CHARS);
+  if (lines.length > PLAN_PREVIEW_LINES || plan.length > PLAN_PREVIEW_CHARS) {
+    body += "\n\n_…计划较长,完整内容见 CLI。_";
+  }
+  return `**📋 计划待审批**\n\n${body}`;
+};
+
+const buildPlanCard = (reqId: string, sessionId: string, cwd: string, transcriptTail: string): TemplateCard => {
+  const tail = oneLine(transcriptTail).trim();
+  const tag = sessionId ? `${labelFor(sessionId)} ` : "";
+  const dir = dirName(cwd);
+  return {
+    card_type: "button_interaction",
+    source: buildSource(tail),
+    main_title: { title: TRUNC(`📋 计划审批 · ${tag}${dir}/`, PLAN_TITLE_MAX + 12) },
+    sub_title_text: "审阅上方计划后选择:同意开始执行,或让 Claude 继续完善。",
+    task_id: reqId,
+    button_list: [
+      { text: "✏️ 继续改", style: 4, key: encodePlanKey(reqId, "revise") },
+      { text: "✅ 同意", style: 3, key: encodePlanKey(reqId, "approve") },
+    ],
+  } as TemplateCard;
+};
+
+const buildPlanResolvedCard = (
+  reqId: string,
+  action: PlanAction,
+  cwd: string,
+  transcriptTail: string,
+): TemplateCard => {
+  const tail = oneLine(transcriptTail).trim();
+  const dir = dirName(cwd);
+  const summary = action === "approve" ? "✅ 已同意 · 开始执行" : "✏️ 继续完善计划";
+  return {
+    card_type: "button_interaction",
+    source: buildSource(tail),
+    main_title: { title: TRUNC(`📋 计划 · ${dir}/`, PLAN_TITLE_MAX + 12) },
+    task_id: reqId,
+    button_list: [{ text: summary, style: 4, key: encodePlanNoopKey(reqId) }],
+  };
+};
+
+interface PlanHandleArgs {
+  cfg: Config;
+  log: Logger;
+  client: WSClient;
+  body: ApproveReq;
+  getMirrorTarget?: (sessionId: string) => string | undefined;
+}
+
+const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget }: PlanHandleArgs): Promise<ApproveResp> => {
+  const plan = parsePlanInput(body.tool_input);
+  if (!plan) return { decision: "ask", reason: "plan_unparsable" };
+
+  const approver = resolveApprover(cfg, body.session_id, getMirrorTarget);
+  if (!approver) return { decision: "ask", reason: "no_approver" };
+  if (!client.isConnected) return { decision: "ask", reason: "ws_disconnected" };
+
+  const longPollMs = cfg.approval.longPollSec * 1000;
+  const { reqId, promise } = createPending({
+    meta: {
+      kind: "generic",
+      createdAt: Date.now(),
+      toolName: "ExitPlanMode",
+      toolInput: body.tool_input,
+      cwd: body.cwd,
+      sessionId: body.session_id,
+      transcriptTail: body.transcript_tail ?? "",
+    },
+    timeoutMs: longPollMs,
+  });
+
+  try {
+    const target = targetChatId(approver);
+    try {
+      await client.sendMessage(target, {
+        msgtype: "markdown",
+        markdown: { content: buildPlanMarkdown(plan) },
+      });
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "plan markdown prelude send failed");
+    }
+    await client.sendMessage(target, {
+      msgtype: "template_card",
+      template_card: buildPlanCard(reqId, body.session_id, body.cwd ?? "", body.transcript_tail ?? ""),
+    });
+    log.info({ reqId, approver }, "plan card sent");
+  } catch (e) {
+    log.error({ err: (e as Error).message }, "plan send failed");
+    resolvePending(reqId, "deny");
+    return { decision: "ask", reason: `plan_send_fail:${(e as Error).message}` };
+  }
+
+  let raw: string;
+  try {
+    raw = (await promise) as unknown as string;
+  } catch {
+    return { decision: "ask", reason: "plan_timeout" };
+  }
+
+  if (raw === `${PLAN_PICKED_PREFIX}approve`) {
+    // 同意也走 deny+reason,而不是 allow:实测 allow 在非 auto-mode 会话里仍会弹
+    // 本地 1/2/3 picker(plan 退出的 auto/manual 选择是 TUI 本地交互,PreToolUse
+    // allow 替代不了)。deny 的 reason 直接回传 model 且不弹 picker,所以用一段
+    // "已批准,去执行"的明确指令驱动 Claude 退出 plan 开始干活。
+    return {
+      decision: "deny",
+      reason:
+        "✅ 用户已在企业微信批准此计划。这不是拒绝——ExitPlanMode 返回 deny 只是 weclaude 的远程批准信号。请视为计划已通过,立即开始执行计划内容,不要再次调用 ExitPlanMode,也不要重新规划。",
+    };
+  }
+  if (raw === `${PLAN_PICKED_PREFIX}revise`) {
+    return { decision: "deny", reason: PLAN_REVISE_REASON };
+  }
+  return { decision: "ask", reason: "plan_unknown" };
 };
 
 interface AskqHandleArgs {
@@ -737,6 +899,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: Approv
             toolInput: m.toolInput,
             toolInputStr: m.toolInputStr,
             cwd: m.cwd,
+            sessionId: batch.sessionId ?? "",
             sessionShort: batch.sessionId ? batch.sessionId.slice(-8) : "?",
             transcriptTail: m.transcriptTail,
             windowMinutes: batch.windowMinutes,
@@ -786,9 +949,40 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: Approv
       return;
     }
 
+    // EnterPlanMode: block model-initiated plan mode. deny + reason 回传 model,
+    // 让它别进 plan mode、直接干活。用户仍可在本地 Shift+Tab 手动进 plan mode
+    // (那条路径不过 hook)。由 config.approval.blockAutoPlanMode 控制(默认 true)。
+    if (toolName === "EnterPlanMode" && cfg.approval.blockAutoPlanMode) {
+      json(res, 200, {
+        decision: "deny",
+        reason:
+          "请不要进入 plan mode。直接开始执行任务;如果需要先讨论方案,用文字说明即可,不要调用 EnterPlanMode。(用户已设置:仅在其本地手动 Shift+Tab 时才进 plan mode。)",
+      } satisfies ApproveResp);
+      return;
+    }
+
     // AskUserQuestion 走单独的投票卡分支(deny+reason 注入答案 / ask 转 CLI)。
     if (toolName === "AskUserQuestion") {
       const resp = await handleAskUserQuestion({
+        cfg,
+        log,
+        client,
+        getMirrorTarget,
+        body: {
+          session_id: sessionId,
+          tool_name: toolName,
+          tool_input: toolInput,
+          cwd,
+          transcript_tail: transcriptTail,
+        },
+      });
+      json(res, 200, resp satisfies ApproveResp);
+      return;
+    }
+
+    // ExitPlanMode 走计划审批卡分支(allow 同意 / deny+reason 继续改 / ask 转 CLI)。
+    if (toolName === "ExitPlanMode") {
+      const resp = await handleExitPlanMode({
         cfg,
         log,
         client,
@@ -1045,6 +1239,30 @@ export const installApprovalEventListener = (
         return;
       }
 
+      // ── ExitPlanMode 计划审批卡: 在普通 approval 解码前匹配 PLAN| 前缀。
+      const planClick = decodePlanKey(key);
+      if (planClick) {
+        const meta = getPending(planClick.reqId);
+        const ok = resolvePending(planClick.reqId, `${PLAN_PICKED_PREFIX}${planClick.action}` as never);
+        log.info({ reqId: planClick.reqId, action: planClick.action, ok }, "plan event resolved");
+        try {
+          await client.updateTemplateCard(
+            frame,
+            buildPlanResolvedCard(
+              cbTaskId || planClick.reqId,
+              planClick.action,
+              meta?.cwd ?? "",
+              meta?.transcriptTail ?? "",
+            ),
+          );
+        } catch (e) {
+          log.warn({ err: (e as Error).message, reqId: planClick.reqId }, "plan updateTemplateCard failed");
+        }
+        return;
+      }
+      // 已决计划卡再次被点 (plan_noop:<id>) → 终态 identity, 直接吞掉。
+      if (decodePlanNoopKey(key) !== undefined) return;
+
       const decoded = decodeKey(key);
 
       const detailUrlFor = (id: string): string =>
@@ -1116,6 +1334,7 @@ export const installApprovalEventListener = (
               toolInputStr: "",
               cwd: wmeta?.cwd ?? "",
               sessionShort: decoded.cancelSessionId.slice(-8),
+              sessionId: decoded.cancelSessionId,
               transcriptTail: wmeta?.transcriptTail ?? "",
               windowMinutes: cfg.approval.windowMinutes,
               detailUrl: cbTaskId ? detailUrlFor(cbTaskId) : undefined,
@@ -1187,6 +1406,7 @@ export const installApprovalEventListener = (
               toolInputStr,
               cwd: meta?.cwd ?? "",
               sessionShort,
+              sessionId: meta?.sessionId ?? "",
               transcriptTail: meta?.transcriptTail ?? "",
               windowMinutes: cfg.approval.windowMinutes,
               detailUrl: detailUrlFor(reqId),
