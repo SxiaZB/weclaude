@@ -8,7 +8,7 @@
 // 时按 store 重写以丢弃过期 / 被覆盖的旧行。TTL 24h, 上限 1000 条 LRU。
 import { mkdirSync, existsSync, readFileSync, appendFileSync, writeFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { structuredPatch } from "diff";
+import { structuredPatch, parsePatch, type StructuredPatchHunk } from "diff";
 import type { Logger } from "pino";
 import type { Decision } from "./pending.js";
 import type { Handler } from "./http.js";
@@ -297,12 +297,9 @@ const SHARED_CSS = `
 // 输出形如 { hunks: [{ oldStart, oldLines, newStart, newLines, lines: [' eq','+add','-del'] }] }.
 interface DiffBlock { path: string; oldStr: string; newStr: string; label?: string }
 
-const renderDiffBlock = (b: DiffBlock): string => {
-  // structuredPatch 要求两端都以 \n 收尾, 否则会在 hunk 末尾追加 "\\ No newline at end of file"
-  const norm = (s: string): string => (s === "" || s.endsWith("\n") ? s : `${s}\n`);
-  const patch = structuredPatch("a", "b", norm(b.oldStr), norm(b.newStr), "", "", { context: 3 });
+const renderHunks = (hunks: readonly StructuredPatchHunk[], label: string | undefined, path: string): string => {
   let adds = 0, dels = 0;
-  const rowsHtml = patch.hunks.flatMap((h) => {
+  const rowsHtml = hunks.flatMap((h) => {
     const header = `<div class="row hunk">@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines} @@</div>`;
     let oa = h.oldStart, nb = h.newStart;
     const body = h.lines
@@ -320,11 +317,40 @@ const renderDiffBlock = (b: DiffBlock): string => {
       .join("");
     return [header, body];
   }).join("");
-  const head = b.label ? `${escHtml(b.label)} · ` : "";
+  const head = label ? `${escHtml(label)} · ` : "";
   return `<section>
-    <h2>${head}<span style="color:#1a7f37">+${adds}</span> <span style="color:#cf222e">-${dels}</span>${b.path ? ` · <span style="color:#1f2328;text-transform:none;letter-spacing:0">${escHtml(b.path)}</span>` : ""}</h2>
+    <h2>${head}<span style="color:#1a7f37">+${adds}</span> <span style="color:#cf222e">-${dels}</span>${path ? ` · <span style="color:#1f2328;text-transform:none;letter-spacing:0">${escHtml(path)}</span>` : ""}</h2>
     <div class="diff">${rowsHtml}</div>
   </section>`;
+};
+
+const renderDiffBlock = (b: DiffBlock): string => {
+  // structuredPatch 要求两端都以 \n 收尾, 否则会在 hunk 末尾追加 "\\ No newline at end of file"
+  const norm = (s: string): string => (s === "" || s.endsWith("\n") ? s : `${s}\n`);
+  const patch = structuredPatch("a", "b", norm(b.oldStr), norm(b.newStr), "", "", { context: 3 });
+  return renderHunks(patch.hunks, b.label, b.path);
+};
+
+// 工具结果里如果是 unified diff(git diff/diff -u/...), 用同款 hunk 高亮渲染。
+// 检测到才返回 sections, 否则返回 "" → 调用方走原来的 <pre> 路径。
+const tryRenderUnifiedDiff = (text: string): string => {
+  if (!/(^|\n)(diff --git |@@ -\d)/.test(text)) return "";
+  let patches: ReturnType<typeof parsePatch>;
+  try {
+    patches = parsePatch(text);
+  } catch {
+    return "";
+  }
+  const sections = patches
+    .filter((p) => p.hunks && p.hunks.length > 0)
+    .map((p, idx, arr) => {
+      const path = p.newFileName || p.oldFileName || "";
+      // 多文件 patch 加序号 label, 方便定位
+      const label = arr.length > 1 ? `file ${idx + 1}/${arr.length}` : undefined;
+      return renderHunks(p.hunks, label, path);
+    })
+    .join("");
+  return sections;
 };
 
 // 从 Edit / MultiEdit / Write 入参里抽 DiffBlock 列表。识别失败返回 [] → 走通用 JSON 渲染。
@@ -358,8 +384,12 @@ const extractDiffBlocks = (toolName: string, input: unknown): DiffBlock[] => {
 const renderToolPage = (r: ToolDetailRecord): string => {
   const inputJson = highlightJson(toJson(r.toolInput));
   const hasResult = typeof r.toolResult === "string" && r.toolResult.length > 0;
+  const diffResultHtml = hasResult ? tryRenderUnifiedDiff(r.toolResult!) : "";
   const resultBlock = hasResult
-    ? `<section><h2>result</h2><pre><code>${escHtml(r.toolResult!)}</code></pre></section>`
+    ? (diffResultHtml
+      // diff 高亮主显, 原文藏到 details 折叠里, 偶尔需要复制 raw 时还能拿到。
+      ? `${diffResultHtml}<section><details><summary>result (raw)</summary><pre><code>${escHtml(r.toolResult!)}</code></pre></details></section>`
+      : `<section><h2>result</h2><pre><code>${escHtml(r.toolResult!)}</code></pre></section>`)
     : `<section><h2>result</h2><pre style="color:#656d76;font-style:italic"><code>(尚未捕获)</code></pre></section>`;
   const status = hasResult
     ? `<span class="badge allow">完成${r.resultAt ? ` · ${fmtDuration(r.resultAt - r.createdAt)}` : ""}</span>`
