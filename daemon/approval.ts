@@ -500,8 +500,9 @@ const askqLabel = (idx: number): string => ASKQ_LETTERS[idx] ?? String(idx + 1);
 
 // vote_interaction 只支持 card_type/source/main_title/checkbox/submit_button/task_id,
 // sub_title_text/quote_area 等会被静默吞掉 → 题目和选项必须走前置 markdown 消息。
-const buildAskqMarkdown = (q: AskqQuestion): string => {
-  const head = q.question ? `**🤔 ${q.question}**` : `**🤔 ${q.header || "请选择"}**`;
+const buildAskqMarkdown = (q: AskqQuestion, prefix = ""): string => {
+  const title = q.question || q.header || "请选择";
+  const head = `**🤔 ${prefix}${title}**`;
   const opts = q.options.map((o, idx) => {
     const desc = o.description ? ` — ${o.description}` : "";
     return `**${askqLabel(idx)}.** ${o.label}${desc}`;
@@ -570,83 +571,107 @@ interface AskqHandleArgs {
   getMirrorTarget?: (sessionId: string) => string | undefined;
 }
 
-const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget }: AskqHandleArgs): Promise<ApproveResp> => {
-  const questions = parseAskqInput(body.tool_input);
-  if (!questions || questions.length === 0) return { decision: "ask", reason: "askq_unparsable" };
-  if (questions.length > 1) return { decision: "ask", reason: "askq_multi_unsupported" };
-  const q = questions[0]!;
-  if (q.options.length === 0) return { decision: "ask", reason: "askq_no_options" };
+type AskqAnswer =
+  | { kind: "cli" }
+  | { kind: "chat" }
+  | { kind: "empty" }
+  | { kind: "picked"; labels: string };
 
-  const approver = resolveApprover(cfg, body.session_id, getMirrorTarget);
-  if (!approver) return { decision: "ask", reason: "no_approver" };
-  if (!client.isConnected) return { decision: "ask", reason: "ws_disconnected" };
-
-  const longPollMs = cfg.approval.longPollSec * 1000;
-  // toolInput 存原始 input,事件 listener 通过 getPending 重解析。
-  // transcriptTail 一并存进 meta, resolved 卡渲染时复用同一份 source。
-  const { reqId, promise } = createPending({
-    meta: {
-      kind: "generic",
-      createdAt: Date.now(),
-      toolName: "AskUserQuestion",
-      toolInput: body.tool_input,
-      cwd: body.cwd,
-      sessionId: body.session_id,
-      transcriptTail: body.transcript_tail ?? "",
-    },
-    timeoutMs: longPollMs,
-  });
-
-  try {
-    const target = targetChatId(approver);
-    // 先发 markdown 列出题目+ABCD 选项 (vote 卡不支持正文字段),
-    // 失败不阻断,卡片仍按字母编号显示。
-    try {
-      await client.sendMessage(target, {
-        msgtype: "markdown",
-        markdown: { content: buildAskqMarkdown(q) },
-      });
-    } catch (e) {
-      log.warn({ err: (e as Error).message }, "askq markdown prelude send failed");
-    }
-    await client.sendMessage(target, {
-      msgtype: "template_card",
-      template_card: buildAskqCard(reqId, q, body.transcript_tail ?? ""),
-    });
-    log.info({ reqId, approver }, "askq card sent");
-  } catch (e) {
-    log.error({ err: (e as Error).message }, "askq send failed");
-    resolvePending(reqId, "deny"); // 释放 pending 槽
-    return { decision: "ask", reason: `askq_send_fail:${(e as Error).message}` };
-  }
-
-  let raw: string;
-  try {
-    raw = (await promise) as unknown as string;
-  } catch {
-    return { decision: "ask", reason: "askq_timeout" };
-  }
-
-  if (raw === "cli") return { decision: "ask", reason: "askq_cli" };
-  if (raw === "chat") {
-    return {
-      decision: "deny",
-      reason: `Instead of answering "${q.header || q.question}", the user wants to chat about it first. Discuss the question with them before re-asking.`,
-    };
-  }
+// raw 是 click 事件 listener 塞回 pending 的字符串编码 (cli / chat / picked:i,j)。
+const interpretAskqRaw = (raw: string, q: AskqQuestion): AskqAnswer => {
+  if (raw === "cli") return { kind: "cli" };
+  if (raw === "chat") return { kind: "chat" };
   if (raw.startsWith(ASKQ_PICKED_PREFIX)) {
     const idxs = raw.slice(ASKQ_PICKED_PREFIX.length)
       .split(",")
       .map((s) => parseInt(s, 10))
       .filter((n) => Number.isInteger(n) && n >= 0 && n < q.options.length);
-    if (idxs.length === 0) return { decision: "ask", reason: "askq_empty_pick" };
-    const labels = idxs.map((i) => q.options[i]!.label).join(", ");
-    return {
-      decision: "deny",
-      reason: `User answered "${q.header || q.question}" via WeCom: ${labels}`,
-    };
+    if (idxs.length === 0) return { kind: "empty" };
+    return { kind: "picked", labels: idxs.map((i) => q.options[i]!.label).join(", ") };
   }
-  return { decision: "ask", reason: "askq_unknown" };
+  return { kind: "empty" };
+};
+
+// 多问题: 逐题顺序发卡 → 收答 → 下一题。任一题选「CLI」整体转 CLI,选「聊聊」
+// 整体转讨论; 全部答完合并成单个 deny+reason 注入。卡不会一次性轰炸 N 张。
+const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget }: AskqHandleArgs): Promise<ApproveResp> => {
+  const questions = parseAskqInput(body.tool_input);
+  if (!questions || questions.length === 0) return { decision: "ask", reason: "askq_unparsable" };
+  if (questions.some((q) => q.options.length === 0)) return { decision: "ask", reason: "askq_no_options" };
+
+  const approver = resolveApprover(cfg, body.session_id, getMirrorTarget);
+  if (!approver) return { decision: "ask", reason: "no_approver" };
+  if (!client.isConnected) return { decision: "ask", reason: "ws_disconnected" };
+
+  const target = targetChatId(approver);
+  const longPollMs = cfg.approval.longPollSec * 1000;
+  const total = questions.length;
+  const answers: string[] = [];
+
+  for (let i = 0; i < total; i++) {
+    const q = questions[i]!;
+    // 每题独立 pending: meta.toolInput 只塞本题(包成单题 wrapper),click 事件
+    // listener 里的 parseAskqInput(meta.toolInput)?.[0] 渲染的就是当前题 — 监听
+    // 侧零改动。transcriptTail 一并存进 meta, resolved 卡复用同一份 source。
+    const { reqId, promise } = createPending({
+      meta: {
+        kind: "generic",
+        createdAt: Date.now(),
+        toolName: "AskUserQuestion",
+        toolInput: { questions: [q] },
+        cwd: body.cwd,
+        sessionId: body.session_id,
+        transcriptTail: body.transcript_tail ?? "",
+      },
+      timeoutMs: longPollMs,
+    });
+
+    const prefix = total > 1 ? `(${i + 1}/${total}) ` : "";
+    try {
+      // 先发 markdown 列出题目+ABCD 选项 (vote 卡不支持正文字段),
+      // 失败不阻断,卡片仍按字母编号显示。
+      try {
+        await client.sendMessage(target, {
+          msgtype: "markdown",
+          markdown: { content: buildAskqMarkdown(q, prefix) },
+        });
+      } catch (e) {
+        log.warn({ err: (e as Error).message }, "askq markdown prelude send failed");
+      }
+      await client.sendMessage(target, {
+        msgtype: "template_card",
+        template_card: buildAskqCard(reqId, q, body.transcript_tail ?? ""),
+      });
+      log.info({ reqId, approver, idx: i, total }, "askq card sent");
+    } catch (e) {
+      log.error({ err: (e as Error).message }, "askq send failed");
+      resolvePending(reqId, "deny"); // 释放 pending 槽
+      return { decision: "ask", reason: `askq_send_fail:${(e as Error).message}` };
+    }
+
+    let raw: string;
+    try {
+      raw = (await promise) as unknown as string;
+    } catch {
+      return { decision: "ask", reason: "askq_timeout" };
+    }
+
+    const ans = interpretAskqRaw(raw, q);
+    if (ans.kind === "cli") return { decision: "ask", reason: "askq_cli" };
+    if (ans.kind === "chat") {
+      return {
+        decision: "deny",
+        reason: `Instead of answering "${q.header || q.question}", the user wants to chat about it first. Discuss the question with them before re-asking.`,
+      };
+    }
+    if (ans.kind === "empty") return { decision: "ask", reason: "askq_empty_pick" };
+    answers.push(`"${q.header || q.question}": ${ans.labels}`);
+  }
+
+  const reason = total === 1
+    ? `User answered ${answers[0]} via WeCom`
+    : `User answered ${total} questions via WeCom — ${answers.join("; ")}`;
+  return { decision: "deny", reason };
 };
 
 // ── /approve handler ───────────────────────────────────────────────────
