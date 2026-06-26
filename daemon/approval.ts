@@ -656,9 +656,10 @@ interface PlanHandleArgs {
   client: WSClient;
   body: ApproveReq;
   getMirrorTarget?: (sessionId: string) => string | undefined;
+  flushBeforeCard?: (sessionId: string) => Promise<void>;
 }
 
-const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget }: PlanHandleArgs): Promise<ApproveResp> => {
+const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flushBeforeCard }: PlanHandleArgs): Promise<ApproveResp> => {
   const plan = parsePlanInput(body.tool_input);
   if (!plan) return { decision: "ask", reason: "plan_unparsable" };
 
@@ -682,6 +683,11 @@ const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget }: P
 
   try {
     const target = targetChatId(approver);
+    // 发卡前先把 mirror 那条管道里同 turn 的"思考过程"text 推到 WeCom — 否则
+    // hook 直发的卡片可能赛过 mirror 的 250ms/3s 防抖, 用户看到先卡片后解释。
+    try { await flushBeforeCard?.(body.session_id); } catch (e) {
+      log.warn({ err: (e as Error).message }, "plan flushBeforeCard failed; sending card anyway");
+    }
     try {
       await client.sendMessage(target, {
         msgtype: "markdown",
@@ -731,6 +737,7 @@ interface AskqHandleArgs {
   client: WSClient;
   body: ApproveReq;
   getMirrorTarget?: (sessionId: string) => string | undefined;
+  flushBeforeCard?: (sessionId: string) => Promise<void>;
 }
 
 type AskqAnswer =
@@ -756,7 +763,7 @@ const interpretAskqRaw = (raw: string, q: AskqQuestion): AskqAnswer => {
 
 // 多问题: 逐题顺序发卡 → 收答 → 下一题。任一题选「CLI」整体转 CLI,选「聊聊」
 // 整体转讨论; 全部答完合并成单个 deny+reason 注入。卡不会一次性轰炸 N 张。
-const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget }: AskqHandleArgs): Promise<ApproveResp> => {
+const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, flushBeforeCard }: AskqHandleArgs): Promise<ApproveResp> => {
   const questions = parseAskqInput(body.tool_input);
   if (!questions || questions.length === 0) return { decision: "ask", reason: "askq_unparsable" };
   if (questions.some((q) => q.options.length === 0)) return { decision: "ask", reason: "askq_no_options" };
@@ -790,6 +797,11 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget }
 
     const prefix = total > 1 ? `(${i + 1}/${total}) ` : "";
     try {
+      // 发卡前先把同 turn 在 mirror 那条管道里 pending 的 assistant 文本推干净 —
+      // hook 直发的卡片如果赛过 mirror 的防抖, 用户会先看到卡片再看到为什么。
+      try { await flushBeforeCard?.(body.session_id); } catch (e) {
+        log.warn({ err: (e as Error).message }, "askq flushBeforeCard failed; sending card anyway");
+      }
       // 先发 markdown 列出题目+ABCD 选项 (vote 卡不支持正文字段),
       // 失败不阻断,卡片仍按字母编号显示。
       try {
@@ -866,6 +878,11 @@ interface ApprovalDeps {
    *  instead of cfg.approval.approvers[0] / cfg.defaultChat — keeps the conversation and
    *  its approval prompts in the same WeCom chat. */
   getMirrorTarget?: (sessionId: string) => string | undefined;
+  /** Optional: drain mirror's pending text/tool markdown for this session AND wait
+   *  for the per-attachment FIFO so `client.sendMessage(card)` can't overtake the
+   *  "thinking" bubble. Mirror mode wires this through; headless mode leaves it
+   *  undefined (no mirror pipe to drain). */
+  flushBeforeCard?: (sessionId: string) => Promise<void>;
 }
 
 const resolveApprover = (
@@ -877,7 +894,7 @@ const resolveApprover = (
   return mirror || pickApprover(cfg);
 };
 
-export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: ApprovalDeps): Handler => {
+export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBeforeCard }: ApprovalDeps): Handler => {
   const detailUrlFor = (id: string): string =>
     buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
 
@@ -907,6 +924,12 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: Approv
           });
         })();
     try {
+      // 卡片直发会赛过 mirror 那条管道里 pending 的 assistant 文本(防抖窗内),
+      // 先 await 排干 — 不然用户先看到卡片再看到为什么。批量卡按 batch 第一位
+      // 成员的 sessionId 走(同 sessionId 才会被合到一起, 任取一个都对)。
+      try { await flushBeforeCard?.(batch.sessionId); } catch (e) {
+        log.warn({ batchId: batch.batchId, err: (e as Error).message }, "flushBatch flushBeforeCard failed; sending card anyway");
+      }
       await client.sendMessage(targetChatId(batch.approver), {
         msgtype: "template_card",
         template_card: card,
@@ -968,6 +991,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: Approv
         log,
         client,
         getMirrorTarget,
+        flushBeforeCard,
         body: {
           session_id: sessionId,
           tool_name: toolName,
@@ -987,6 +1011,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget }: Approv
         log,
         client,
         getMirrorTarget,
+        flushBeforeCard,
         body: {
           session_id: sessionId,
           tool_name: toolName,

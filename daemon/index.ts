@@ -77,10 +77,17 @@ const main = async (): Promise<void> => {
     cfg.wrc.mode === "mirror"
       ? (sid: string): string | undefined => (bridge as MirrorBridge).targetForSession(sid)
       : undefined;
+  // Pre-card barrier: drain pending mirror text/tool markdown for this session
+  // and await its FIFO so vote/approval cards never overtake the "thinking" bubble.
+  // Headless mode has no mirror pipe — leave undefined so approval skips the call.
+  const flushBeforeCard =
+    cfg.wrc.mode === "mirror"
+      ? (sid: string): Promise<void> => (bridge as MirrorBridge).flushBeforeCard(sid)
+      : undefined;
   const http = startHttp({ cfg, ws, log, sourcePath });
   http.register(
     "POST /approve",
-    makeApproveHandler({ cfg, log: log.child({ mod: "approval" }), client: ws.client, getMirrorTarget }),
+    makeApproveHandler({ cfg, log: log.child({ mod: "approval" }), client: ws.client, getMirrorTarget, flushBeforeCard }),
   );
   http.register("POST /message", makeMessageHandler(ws.client, log.child({ mod: "outbound" })));
   http.register("POST /card", makeCardHandler(ws.client, log.child({ mod: "outbound" })));

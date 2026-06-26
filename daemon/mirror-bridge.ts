@@ -479,6 +479,11 @@ const splitChunks = (s: string, max: number): string[] => {
 
 interface TailHandle {
   stop: () => void;
+  /** Synchronously pull and emit any newly-appended jsonl lines. fs.watch
+   *  usually fires fast enough but the approval card path needs a hard barrier
+   *  before sending: callers can force the tail to catch up so any pending
+   *  assistant text is queued onto the mirror's outbound paths first. */
+  drain: () => void;
 }
 
 export const startMirrorTail = (deps: TailDeps): TailHandle => {
@@ -547,6 +552,7 @@ export const startMirrorTail = (deps: TailDeps): TailHandle => {
       watcher?.close();
       clearInterval(poll);
     },
+    drain,
   };
 };
 
@@ -954,6 +960,12 @@ export interface MirrorBridge {
    *  standalone path instead of growing the same bubble. No-op when no live
    *  stream exists. */
   terminateLiveStream: (sessionId: string) => void;
+  /** Pre-card hook: drain any pending assistant text/tool markdown for this
+   *  session and await the per-attachment FIFO so the card race never lets the
+   *  vote/approval card overtake the "thinking" bubble. Resolves once all
+   *  outbound mirror sends queued so far have hit WeCom. No-op when no
+   *  attachment exists for the session. */
+  flushBeforeCard: (sessionId: string) => Promise<void>;
   /** Inject text into an attached mirror without an originating WeCom frame.
    *  Used by `weclaude init` to fire a demo prompt right after auto-spawn so
    *  the user sees the full PreToolUse → approval card → assistant mirror
@@ -1539,7 +1551,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // collapsing to cfg.wrc.cwd (which would mislabel /pwd, /clear, /new).
       runningCwd: expandHome(((cwd ?? "").trim()) || readCwdFromJsonl(jsonlPath) || cfg.wrc.cwd),
       pendingCwd: carryPending,
-      tail: { stop: () => undefined }, // placeholder; replaced below
+      tail: { stop: () => undefined, drain: () => undefined }, // placeholder; replaced below
       standalonePending: Promise.resolve(),
     };
     a.tail = startMirrorTail({
@@ -2026,6 +2038,45 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         const s = openStream(a, frame, streamId);
         a.liveStream = s;
         log.info({ sessionId, turnId: s.turnId }, "outbound: AWAITING_APPR → STREAMING (approved)");
+      }
+    },
+    // 解决"卡片先于思考过程到达 WeCom"的赛跑: hook 触发的 /approve 直接走
+    // client.sendMessage 发卡, 而 mirror 这条管道里同一 turn 的 text/tool_use 还
+    // 可能卡在三处 — DEFERRED 的 buf、standaloneBuf 的 3s 防抖、liveStream 的
+    // 250ms flush。逐一强制 drain, 再 await standalonePending FIFO, 让发卡前 mirror
+    // 已经把"为什么发这张卡"推完。
+    flushBeforeCard: async (sessionId) => {
+      const a = bySessionId.get(sessionId);
+      if (!a) return;
+      // 1) fs.watch 通常即时, 但本调用是发卡前最后一道屏障 — 主动拽一次 tail,
+      //    把刚落盘的 assistant 行(可能含 text + tool_use)立刻喂给 onItem。
+      try { a.tail.drain(); } catch (e) { log.warn({ sessionId, err: (e as Error).message }, "flushBeforeCard tail drain failed"); }
+      // 2) DEFERRED 状态如果还在 buffering(needsApproval 因任何原因没触发就走到这),
+      //    这里手动提升 → 立刻把 buf 当 standalone 推出, 进入 AWAITING_APPR。
+      if (a.outbound?.kind === "deferred" && a.outbound.buf.length > 0) {
+        promoteToStandalone(a);
+      }
+      // 3) standalone 防抖里 (3s 默认) 还压着的合并文案 — 强制立刻发。
+      if (a.standaloneBuf) {
+        clearTimeout(a.standaloneBuf.timer);
+        flushStandalone(a);
+      }
+      // 4) liveStream 半成品: 当前 acc 里有内容但还没 flush 出去 — 同步刷一刀,
+      //    保留 stream 不 finalize (后续 tool_result 还要继续 append 同一气泡)。
+      const ls = a.liveStream;
+      if (ls && !ls.closed && !ls.dead && ls.acc && ls.acc !== ls.lastSent) {
+        if (ls.flushTimer) {
+          clearTimeout(ls.flushTimer);
+          ls.flushTimer = undefined;
+        }
+        await flushStream(ls);
+      }
+      // 5) 上面的 sendStandalone 都串在 standalonePending FIFO 上, 等它把 WeCom
+      //    投递落地, 才算前奏到位 — 这步是关键, 确保返回时卡片可以安心发。
+      try {
+        await a.standalonePending;
+      } catch {
+        // 队列内单条失败已在 sendStandalone 里 warn 过, 这里吞掉, 不阻塞发卡。
       }
     },
     injectText: async (target, text) => {
