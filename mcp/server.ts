@@ -158,6 +158,10 @@ server.registerTool(
   },
   async ({ cwd, target }) => {
     const sessionId = process.env.CLAUDE_CODE_SESSION_ID ?? process.env.CLAUDE_SESSION_ID ?? "";
+    // sessionId in our env is frozen at MCP spawn; a `/clear` rotates the live
+    // session, stranding pendingCwd on defaultChat. TMUX_PANE is stable across
+    // clears, so send it as the reliable fallback key.
+    const tmuxPane = process.env.TMUX_PANE?.trim();
     const normalizedTarget = normalizeTarget(target);
     const resp = await fetch(`${DAEMON_BASE}/mirror/cwd`, {
       method: "POST",
@@ -166,6 +170,7 @@ server.registerTool(
         cwd,
         ...(normalizedTarget ? { target: normalizedTarget } : {}),
         ...(sessionId ? { sessionId } : {}),
+        ...(tmuxPane ? { tmuxPane } : {}),
       }),
     });
     const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; reason?: string; target?: string; runningCwd?: string; pendingCwd?: string };

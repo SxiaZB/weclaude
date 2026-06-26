@@ -953,6 +953,10 @@ export interface MirrorBridge {
   hasMirrorTarget: (principal: string) => boolean;
   /** Look up the mirror target (e.g. "chat:xxx") bound to a Claude sessionId. Used by approval to route cards to the originating WeCom chat. */
   targetForSession: (sessionId: string) => string | undefined;
+  /** Look up the mirror target bound to a tmux pane id (e.g. "%20"). Pane id is
+   *  stable across `/clear` (which rotates sessionId), so MCP tools whose env
+   *  sessionId went stale after a clear can still resolve their own chat. */
+  targetForPane: (tmuxPane: string) => string | undefined;
   /** Returns full tool detail markdown for a turnId, or undefined if expired/unknown. */
   resolveToolDetail: (turnId: string) => { target: string; markdown: string[] } | undefined;
   /** Approval-click hook: finalize any open liveStream for this Claude sessionId
@@ -2017,6 +2021,17 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const all = deps.store.all();
       for (const [target, rec] of Object.entries(all)) {
         if (rec.sessionId === sessionId) return target;
+      }
+      return undefined;
+    },
+    targetForPane: (tmuxPane) => {
+      const pane = (tmuxPane ?? "").trim();
+      if (!pane) return undefined;
+      for (const a of bySessionId.values()) {
+        if (a.tmuxPane === pane) return a.target;
+      }
+      for (const [target, rec] of Object.entries(deps.store.all())) {
+        if ((rec.tmuxPane ?? "") === pane) return target;
       }
       return undefined;
     },

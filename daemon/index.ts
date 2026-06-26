@@ -291,11 +291,17 @@ const main = async (): Promise<void> => {
     // sessionId is the cleanest way to identify the right chat.
     http.register("POST /mirror/cwd", async (req, res) => {
       const { readBody } = await import("./http.js");
-      const body = (await readBody(req)) as Partial<{ target: string; sessionId: string; cwd: string }>;
+      const body = (await readBody(req)) as Partial<{ target: string; sessionId: string; tmuxPane: string; cwd: string }>;
       const cwd = (body.cwd ?? "").toString();
       let target = (body.target ?? "").trim();
       if (!target && body.sessionId) {
         const t = m.targetForSession(body.sessionId.trim());
+        if (t) target = t;
+      }
+      // sessionId rotates on /clear; the MCP caller's env sessionId may be stale.
+      // Pane id is stable, so resolve by it before falling back to defaultChat.
+      if (!target && body.tmuxPane) {
+        const t = m.targetForPane(body.tmuxPane.trim());
         if (t) target = t;
       }
       if (!target) target = (cfg.defaultChat ?? "").trim();
@@ -308,8 +314,13 @@ const main = async (): Promise<void> => {
       const u = new URL(req.url ?? "", "http://x");
       let target = (u.searchParams.get("target") ?? "").trim();
       const sid = (u.searchParams.get("sessionId") ?? "").trim();
+      const pane = (u.searchParams.get("tmuxPane") ?? "").trim();
       if (!target && sid) {
         const t = m.targetForSession(sid);
+        if (t) target = t;
+      }
+      if (!target && pane) {
+        const t = m.targetForPane(pane);
         if (t) target = t;
       }
       if (!target) target = (cfg.defaultChat ?? "").trim();
