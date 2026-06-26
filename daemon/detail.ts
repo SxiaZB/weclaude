@@ -14,6 +14,7 @@ import type { Decision } from "./pending.js";
 import type { Handler } from "./http.js";
 import { expandHome } from "../shared/paths.js";
 import { resolvePublicHost } from "../shared/lan-ip.js";
+import { highlightCode, langFromPath } from "./highlight.js";
 
 type Kind = "tool" | "approval";
 
@@ -267,6 +268,14 @@ const SHARED_CSS = `
   pre{margin:0;padding:12px;overflow:auto;font-size:12.5px;line-height:1.5;
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}
   .jk{color:#953800}.js{color:#0a3069}.jb{color:#9a6700}.jn{color:#8250df}
+  .hc{color:#6e7781;font-style:italic}.hs{color:#0a3069}.hk{color:#cf222e}
+  .hl{color:#8250df}.hn{color:#0550ae}.hv{color:#953800}
+  .codeview{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:12.5px;line-height:1.5;overflow:auto;padding:8px 0}
+  .codeview .row{display:grid;grid-template-columns:56px 1fr}
+  .codeview .ln{color:#8c959f;text-align:right;padding:0 8px;
+    user-select:none;font-variant-numeric:tabular-nums}
+  .codeview .txt{padding:0 8px;white-space:pre}
   .diff{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
     font-size:12.5px;line-height:1.5;overflow:auto}
   .diff .row{display:grid;grid-template-columns:44px 44px 14px 1fr}
@@ -297,8 +306,10 @@ const SHARED_CSS = `
 // 输出形如 { hunks: [{ oldStart, oldLines, newStart, newLines, lines: [' eq','+add','-del'] }] }.
 interface DiffBlock { path: string; oldStr: string; newStr: string; label?: string }
 
-const renderHunks = (hunks: readonly StructuredPatchHunk[], label: string | undefined, path: string): string => {
+const renderHunks = (hunks: readonly StructuredPatchHunk[], label: string | undefined, path: string, lang?: string): string => {
   let adds = 0, dels = 0;
+  const renderText = (t: string): string =>
+    t === "" ? "&nbsp;" : (lang ? highlightCode(t, lang) : escHtml(t));
   const rowsHtml = hunks.flatMap((h) => {
     const header = `<div class="row hunk">@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines} @@</div>`;
     let oa = h.oldStart, nb = h.newStart;
@@ -312,7 +323,7 @@ const renderHunks = (hunks: readonly StructuredPatchHunk[], label: string | unde
         const newLn = tag === "del" ? "" : nb++;
         if (tag === "add") adds++;
         else if (tag === "del") dels++;
-        return `<div class="row ${tag}"><div class="ln">${oldLn}</div><div class="ln">${newLn}</div><div class="sign">${sign}</div><div class="txt">${escHtml(text) || "&nbsp;"}</div></div>`;
+        return `<div class="row ${tag}"><div class="ln">${oldLn}</div><div class="ln">${newLn}</div><div class="sign">${sign}</div><div class="txt">${renderText(text)}</div></div>`;
       })
       .join("");
     return [header, body];
@@ -328,7 +339,7 @@ const renderDiffBlock = (b: DiffBlock): string => {
   // structuredPatch 要求两端都以 \n 收尾, 否则会在 hunk 末尾追加 "\\ No newline at end of file"
   const norm = (s: string): string => (s === "" || s.endsWith("\n") ? s : `${s}\n`);
   const patch = structuredPatch("a", "b", norm(b.oldStr), norm(b.newStr), "", "", { context: 3 });
-  return renderHunks(patch.hunks, b.label, b.path);
+  return renderHunks(patch.hunks, b.label, b.path, langFromPath(b.path));
 };
 
 // 工具结果里如果是 unified diff(git diff/diff -u/...), 用同款 hunk 高亮渲染。
@@ -347,7 +358,7 @@ const tryRenderUnifiedDiff = (text: string): string => {
       const path = p.newFileName || p.oldFileName || "";
       // 多文件 patch 加序号 label, 方便定位
       const label = arr.length > 1 ? `file ${idx + 1}/${arr.length}` : undefined;
-      return renderHunks(p.hunks, label, path);
+      return renderHunks(p.hunks, label, path, langFromPath(path));
     })
     .join("");
   return sections;
@@ -381,22 +392,68 @@ const extractDiffBlocks = (toolName: string, input: unknown): DiffBlock[] => {
 };
 
 
+// ── Bash / Read 专用渲染 ─────────────────────────────────────────────
+// Bash: 单独把 command 字段抽出来按 bash 高亮, description 作为副标题。
+const renderBashCommand = (input: unknown): string => {
+  if (!input || typeof input !== "object") return "";
+  const i = input as Record<string, unknown>;
+  const cmd = typeof i.command === "string" ? i.command : "";
+  if (!cmd) return "";
+  const desc = typeof i.description === "string" ? i.description : "";
+  const subtitle = desc ? ` · <span style="color:#1f2328;text-transform:none;letter-spacing:0;font-weight:400">${escHtml(desc)}</span>` : "";
+  return `<section><h2>command${subtitle}</h2><pre><code>${highlightCode(cmd, "bash")}</code></pre></section>`;
+};
+
+// Read 结果按 cat -n 格式拆行 → 行号列 + 代码列, 内容按文件扩展名识别语言后高亮。
+// 不识别 cat -n 前缀的行 (例如 system reminder 包裹) 留空行号格, 内容也走高亮 (失败回退 esc)。
+const CAT_N_RE = /^\s*(\d+)\t(.*)$/;
+const renderReadContent = (text: string, filePath: string): string => {
+  const lang = langFromPath(filePath);
+  const lines = text.split("\n");
+  // 末尾如果是空行 (文件以 \n 结尾), 去掉避免多一行空白
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  const rows = lines
+    .map((line) => {
+      const m = CAT_N_RE.exec(line);
+      const num = m ? m[1]! : "";
+      const content = m ? m[2]! : line;
+      const txt = content === "" ? "&nbsp;" : highlightCode(content, lang);
+      return `<div class="row"><div class="ln">${num}</div><div class="txt">${txt}</div></div>`;
+    })
+    .join("");
+  const langLabel = lang ? ` · <span style="color:#1f2328;text-transform:none;letter-spacing:0;font-weight:400">${escHtml(lang)}</span>` : "";
+  const head = filePath ? `<span style="color:#1f2328;text-transform:none;letter-spacing:0;font-weight:400">${escHtml(filePath)}</span>${langLabel}` : `content${langLabel}`;
+  return `<section><h2>${head}</h2><div class="codeview">${rows}</div></section>`;
+};
+
 const renderToolPage = (r: ToolDetailRecord): string => {
   const inputJson = highlightJson(toJson(r.toolInput));
   const hasResult = typeof r.toolResult === "string" && r.toolResult.length > 0;
-  const diffResultHtml = hasResult ? tryRenderUnifiedDiff(r.toolResult!) : "";
-  const resultBlock = hasResult
-    ? (diffResultHtml
-      // diff 高亮主显, 原文藏到 details 折叠里, 偶尔需要复制 raw 时还能拿到。
-      ? `${diffResultHtml}<section><details><summary>result (raw)</summary><pre><code>${escHtml(r.toolResult!)}</code></pre></details></section>`
-      : `<section><h2>result</h2><pre><code>${escHtml(r.toolResult!)}</code></pre></section>`)
-    : `<section><h2>result</h2><pre style="color:#656d76;font-style:italic"><code>(尚未捕获)</code></pre></section>`;
+  const isBash = r.toolName === "Bash";
+  const isRead = r.toolName === "Read";
+  // Read 结果走专用代码视图, 不再当 unified diff 解析
+  const diffResultHtml = hasResult && !isRead ? tryRenderUnifiedDiff(r.toolResult!) : "";
+  const filePath = isRead && r.toolInput && typeof r.toolInput === "object"
+    ? String((r.toolInput as Record<string, unknown>).file_path ?? "")
+    : "";
+  const readResultHtml = isRead && hasResult ? renderReadContent(r.toolResult!, filePath) : "";
+  const resultBlock = readResultHtml
+    ? `${readResultHtml}<section><details><summary>result (raw)</summary><pre><code>${escHtml(r.toolResult!)}</code></pre></details></section>`
+    : hasResult
+      ? (diffResultHtml
+        // diff 高亮主显, 原文藏到 details 折叠里, 偶尔需要复制 raw 时还能拿到。
+        ? `${diffResultHtml}<section><details><summary>result (raw)</summary><pre><code>${escHtml(r.toolResult!)}</code></pre></details></section>`
+        : `<section><h2>result</h2><pre><code>${escHtml(r.toolResult!)}</code></pre></section>`)
+      : `<section><h2>result</h2><pre style="color:#656d76;font-style:italic"><code>(尚未捕获)</code></pre></section>`;
   const status = hasResult
     ? `<span class="badge allow">完成${r.resultAt ? ` · ${fmtDuration(r.resultAt - r.createdAt)}` : ""}</span>`
     : `<span class="badge pending">运行中</span>`;
   const diffBlocks = extractDiffBlocks(r.toolName, r.toolInput);
   const diffSection = diffBlocks.map(renderDiffBlock).join("");
-  const inputSection = diffBlocks.length > 0
+  // Bash: 单独 command 段; Read: 文件名已在结果段顶部显示, input 走折叠 raw
+  const bashCommandHtml = isBash ? renderBashCommand(r.toolInput) : "";
+  const hasPrimary = diffBlocks.length > 0 || bashCommandHtml || readResultHtml;
+  const inputSection = hasPrimary
     ? `<section><details><summary>input</summary><pre><code>${inputJson}</code></pre></details></section>`
     : `<section><h2>input</h2><pre><code>${inputJson}</code></pre></section>`;
   const metaParts = [
@@ -410,6 +467,7 @@ const renderToolPage = (r: ToolDetailRecord): string => {
 <style>${SHARED_CSS}</style></head><body><div class="wrap">
 <header><h1><span class="accent">${escHtml(r.toolName)}</span></h1>${status}</header>
 <div class="meta">${metaParts.map(escHtml).join('<span class="sep">·</span>')}</div>
+${bashCommandHtml}
 ${diffSection}
 ${inputSection}
 ${resultBlock}
