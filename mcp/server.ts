@@ -47,14 +47,16 @@ const resolveCallerSession = ():
   const projectDir = findProjectDir(cwd);
   if (!projectDir) return { error: `no claude project dir for cwd ${cwd}` };
 
-  // Primary: env tells us exactly which session invoked us.
+  // Primary: env tells us exactly which session invoked us. Trust it
+  // unconditionally — claude only writes the jsonl after the first user
+  // message lands, so a fresh session (e.g. /clear-then-/wrc, or a brand-new
+  // CLI window) will have envSid set but no file yet. The daemon's tail
+  // tolerates a missing path (see mirror-bridge.ts attach()), and any
+  // existsSync gate here would mis-route to a stale jsonl picked by mtime.
   const envSid = process.env.CLAUDE_CODE_SESSION_ID ?? process.env.CLAUDE_SESSION_ID;
-  if (envSid) {
-    const p = join(projectDir, `${envSid}.jsonl`);
-    if (existsSync(p)) return { sessionId: envSid, jsonlPath: p };
-  }
-  // Fallback: most-recently-written jsonl. Imperfect when other Claude windows
-  // share the cwd, but the env-var path catches that case.
+  if (envSid) return { sessionId: envSid, jsonlPath: join(projectDir, `${envSid}.jsonl`) };
+  // Fallback: most-recently-written jsonl. Only reached when env is absent
+  // (older claude versions, exotic launchers).
   const jsonlPath = latestJsonlByMtime(projectDir);
   if (!jsonlPath) return { error: `no .jsonl under ${projectDir}` };
   return { sessionId: basename(jsonlPath, ".jsonl"), jsonlPath };
