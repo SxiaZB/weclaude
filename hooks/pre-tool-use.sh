@@ -58,13 +58,14 @@ CWD=$(printf '%s' "$PAYLOAD" | jq -r '.cwd // ""')
 TRANSCRIPT_PATH=$(printf '%s' "$PAYLOAD" | jq -r '.transcript_path // ""')
 PERMISSION_MODE=$(printf '%s' "$PAYLOAD" | jq -r '.permission_mode // ""')
 
-# 权限模式对齐 Claude 自身策略, 而非一刀切跳过 IM 卡:
-#   - bypassPermissions: 用户主动选了"全跳", emit allow 直接放掉, 不打 daemon。
-#   - auto: emit ask 让 Claude 走自己原生 auto-approve 逻辑 — 安全操作 (Read /
-#     编辑等) 静默放行, 危险操作 (rm -rf, git push, 网络等) 仍由 Claude 弹本地
-#     CLI picker。比之前的 emit allow 严格, 不会越权放过 Claude 自己也会拦的命令。
-#   - dontAsk: Claude 默认拒, 但 weclaude 用户可能希望从 IM 端覆盖, 故不在此短路,
-#     落到下面常规 daemon /approve 流程, 让卡片正常发出。
+# 权限模式短路: 只对用户主动选的"完全跳过"模式放掉, 其它一律走 daemon 发 IM
+# 卡, 让 weclaude 远端用户能在 IM 上点决策。
+#   - bypassPermissions: 用户已经主动选了"全跳", emit allow 直接放, 不打 daemon。
+#   - auto: 不在此短路。第一次发卡用户点 10min 后, daemon 的 isAutoWindowActive
+#     会接管, 后续 tool 自动放行不再发卡, 既不丢 IM 控制权也不会变成"卡刷屏"。
+#     若 emit "ask" 让 Claude 自己处理, 不安全 tool 会弹本地 CLI picker, 远端用户
+#     完全看不见也答不了 — 那是 v0.1.35 的回退原因。
+#   - dontAsk: Claude 默认拒, 但 weclaude 用户可能希望从 IM 端覆盖, 不在此短路。
 # acceptEdits / default / plan 不在此列, 维持 daemon 流程。AskUserQuestion 始终
 # 走卡 (远端用户的主动决策), 故任何 mode 都不在此短路。
 # WECLAUDE_HONOR_AUTO_MODE=0 关掉本段对齐行为。
@@ -72,8 +73,6 @@ if [[ "$TOOL_NAME" != "AskUserQuestion" ]] && [[ "${WECLAUDE_HONOR_AUTO_MODE:-1}
   case "$PERMISSION_MODE" in
     bypassPermissions)
       emit "allow" "bypass-mode passthrough" ;;
-    auto)
-      emit "ask" "auto-mode defer to Claude native auto-approve" ;;
   esac
 fi
 
