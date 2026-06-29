@@ -22,7 +22,6 @@ import { expandHome, sanitizeId } from "../shared/paths.js";
 import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, buildDetailUrl } from "./detail.js";
-import { isAutoWindowActive, cacheGet, cacheKey } from "./session-cache.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -1271,18 +1270,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   };
 
   // ── Outbound deferral (DEFERRED / AWAITING_APPR state machine) ────────
-  // Synchronous predicate matching what approval.ts WOULD do — must include the
-  // cache check, otherwise a cache-hit tool would flush standalone but the
-  // approval handler shortcuts to allow without sending a card → no click ever
-  // → we'd be stuck in AWAITING_APPR forever.
-  const approvalMatcher = new RegExp(cfg.approval.matcher);
-  const needsApproval = (toolName: string, sid: string, toolInput: unknown): boolean => {
-    if (!cfg.approval.enabled) return false;
-    if (!approvalMatcher.test(toolName)) return false;
-    if (isAutoWindowActive(sid)) return false;
-    if (cacheGet(cacheKey(sid, toolName, toolInput))) return false;
-    return true;
-  };
+  // 进入 AWAITING_APPR 的唯一触发口是 daemon 真要发卡前调的 flushBeforeCard。
+  // 历史上 mirror 这边还做过一次本地 needsApproval 预判直接早闪 standalone, 但那
+  // 条路无法预知 hook 会不会被 auto / bypass / 自定义 self-call 放行 — 预判错时
+  // 就会出现 standalone 已经发出、随即又新开 stream 的"气泡分裂"。现在去掉,
+  // 让 flushBeforeCard 作为单一信号: 发卡的真实路径 → flush as standalone,
+  // 不发卡的所有路径 (auto mode、cache、bypass) → deferMs 计时器原地促进到 STREAMING。
 
   const renderBuf = (buf: RenderItem[]): string =>
     buf.map((i) => ("body" in i ? i.body : "")).filter(Boolean).join("\n\n");
@@ -1427,16 +1420,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     out.buf.push(item);
     if (wasEmpty) {
       // First activity from claude — swap the safety net for the short defer
-      // window. From here we have at most outboundDeferMs to see a needs-approval
-      // tool_use, otherwise we promote to STREAMING and resume normal behavior.
+      // window. flushBeforeCard 会在真要发卡前把 buf 转 AWAITING_APPR; 没卡可发
+      // 时这个计时器到点就 promoteToStream, 让 bypass/auto 场景也只走一条 stream。
       clearTimeout(out.timer);
       const deferMs = cfg.wrc.mirror.outboundDeferMs;
       out.timer = setTimeout(() => promoteToStream(a), deferMs);
       log.info({ sessionId: a.sessionId, deferMs, kind: item.kind }, "outbound: first item → short defer armed");
-    }
-    if (item.kind === "tool_use") {
-      const trigger = item.calls.some((c) => needsApproval(c.name, a.sessionId, c.input));
-      if (trigger) promoteToStandalone(a);
     }
   };
 
@@ -1444,6 +1433,22 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (a.outbound?.kind === "deferred") {
       handleDeferredItem(a, item);
       return;
+    }
+    // AWAITING_APPR 兜底: needsApproval 是 mirror 这一侧的预判, hook (pre-tool-use.sh)
+    // 那边在 permission_mode=auto/bypassPermissions/dontAsk 时直接放行, daemon 根本
+    // 收不到 /approve, 也就永远不会有 card 点击 → onApproved 永远不触发 → AWAITING_APPR
+    // 卡住, 后续 tool/text 全走 standalone fallback。这里只要看到任何新 item 到达就
+    // 说明 claude 已继续执行 (hook 必然已返回 / 根本没拦), 把状态提升回 STREAMING,
+    // 复用原 frame/streamId 让本轮回到打字机气泡。
+    if (a.outbound?.kind === "awaiting_appr") {
+      const { frame, streamId } = a.outbound;
+      a.outbound = undefined;
+      const s = openStream(a, frame, streamId);
+      a.liveStream = s;
+      log.info(
+        { sessionId: a.sessionId, kind: item.kind, turnId: s.turnId },
+        "outbound: AWAITING_APPR → STREAMING (hook bypassed, item arrived)",
+      );
     }
     // Skill outputs (e.g. /model) always emit as standalone — never append to
     // an active stream so the result is independently visible.
