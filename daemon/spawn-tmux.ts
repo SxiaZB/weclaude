@@ -219,11 +219,14 @@ export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, c
   }
   log.info({ tmuxName, winName, tmuxPane, cwd, sessionId, reused: has.code === 0 }, "spawn-tmux: pane created");
 
+  // DISABLE_AUTOUPDATER=1 防止新 pane 启动时弹出 "An update is available" 询问 ——
+  // 该交互会吞掉首条 paste-buffer 注入，导致仅落字符不进入 claude 输入框。
   const cmd = [
+    "DISABLE_AUTOUPDATER=1",
     cfg.wrc.claudeBin,
     ...(resumeSessionId ? ["--resume", sessionId] : ["--session-id", sessionId]),
     ...cfg.wrc.extraArgs,
-  ].map(shQuote).join(" ");
+  ].map((a, i) => (i === 0 ? a : shQuote(a))).join(" ");
   const sent = await runTmux(["send-keys", "-t", tmuxPane, cmd, "Enter"]);
   if (!sent.ok) {
     // Kill only this window/pane, never the shared session.
