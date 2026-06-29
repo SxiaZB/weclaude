@@ -58,21 +58,22 @@ CWD=$(printf '%s' "$PAYLOAD" | jq -r '.cwd // ""')
 TRANSCRIPT_PATH=$(printf '%s' "$PAYLOAD" | jq -r '.transcript_path // ""')
 PERMISSION_MODE=$(printf '%s' "$PAYLOAD" | jq -r '.permission_mode // ""')
 
-# 会话已处于"完全自动"权限模式时, 用户已经表达了"别问我"的意图 —— 直接放行,
-# 不要再把每个工具调用拦去推 IM 审批卡 (否则 auto mode 形同虚设, 用户得反复点
-# "10分钟内同意")。只认真正的全自动模式: auto / bypassPermissions / dontAsk。
-# acceptEdits 只自动接受编辑、Bash 等仍应过审批, 故不在此列, 保持推卡。
-# 可设环境变量 WECLAUDE_HONOR_AUTO_MODE=0 关掉此行为。
-#
-# 例外: AskUserQuestion 是"用户主动决策"而非"工具放行"——即便 auto 模式也必须
-# 推到 IM, 否则选择题只在本地 TUI 弹出, 远程用户完全看不到、也答不了。它本身
-# 不是 auto 想自动化掉的"别问我"那类授权, 故不在 auto 短路之列, 始终走审批卡。
-# (ExitPlanMode 不豁免: auto 模式下 allow 即让计划自动通过、不弹本地 picker,
-#  这正是 auto 该有的语义, 强行推卡反而拧巴。)
+# 权限模式对齐 Claude 自身策略, 而非一刀切跳过 IM 卡:
+#   - bypassPermissions: 用户主动选了"全跳", emit allow 直接放掉, 不打 daemon。
+#   - auto: emit ask 让 Claude 走自己原生 auto-approve 逻辑 — 安全操作 (Read /
+#     编辑等) 静默放行, 危险操作 (rm -rf, git push, 网络等) 仍由 Claude 弹本地
+#     CLI picker。比之前的 emit allow 严格, 不会越权放过 Claude 自己也会拦的命令。
+#   - dontAsk: Claude 默认拒, 但 weclaude 用户可能希望从 IM 端覆盖, 故不在此短路,
+#     落到下面常规 daemon /approve 流程, 让卡片正常发出。
+# acceptEdits / default / plan 不在此列, 维持 daemon 流程。AskUserQuestion 始终
+# 走卡 (远端用户的主动决策), 故任何 mode 都不在此短路。
+# WECLAUDE_HONOR_AUTO_MODE=0 关掉本段对齐行为。
 if [[ "$TOOL_NAME" != "AskUserQuestion" ]] && [[ "${WECLAUDE_HONOR_AUTO_MODE:-1}" != "0" ]]; then
   case "$PERMISSION_MODE" in
-    auto|bypassPermissions|dontAsk)
-      emit "allow" "auto-mode passthrough ($PERMISSION_MODE)" ;;
+    bypassPermissions)
+      emit "allow" "bypass-mode passthrough" ;;
+    auto)
+      emit "ask" "auto-mode defer to Claude native auto-approve" ;;
   esac
 fi
 
