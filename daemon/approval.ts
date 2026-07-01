@@ -306,6 +306,11 @@ const buildAlreadyResolvedCard = (a: CardArgs): TemplateCard => {
 interface BatchMember {
   reqId: string;
   toolInput: unknown;
+  /** Original (unredacted) tool_input from the hook body. Kept alongside
+   *  `toolInput` (which may be the redacted display copy) so flushBeforeCard
+   *  can sig-match against the jsonl, where the model wrote the unredacted
+   *  form. Card rendering still uses `toolInput`. */
+  originalToolInput: unknown;
   toolInputStr: string;
   cwd: string;
   transcriptTail: string;
@@ -656,7 +661,7 @@ interface PlanHandleArgs {
   client: WSClient;
   body: ApproveReq;
   getMirrorTarget?: (sessionId: string) => string | undefined;
-  flushBeforeCard?: (sessionId: string) => Promise<void>;
+  flushBeforeCard?: (sessionId: string, expect?: { toolName: string; toolInput: unknown }) => Promise<void>;
 }
 
 const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flushBeforeCard }: PlanHandleArgs): Promise<ApproveResp> => {
@@ -685,7 +690,7 @@ const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flu
     const target = targetChatId(approver);
     // 发卡前先把 mirror 那条管道里同 turn 的"思考过程"text 推到 WeCom — 否则
     // hook 直发的卡片可能赛过 mirror 的 250ms/3s 防抖, 用户看到先卡片后解释。
-    try { await flushBeforeCard?.(body.session_id); } catch (e) {
+    try { await flushBeforeCard?.(body.session_id, { toolName: "ExitPlanMode", toolInput: body.tool_input }); } catch (e) {
       log.warn({ err: (e as Error).message }, "plan flushBeforeCard failed; sending card anyway");
     }
     try {
@@ -737,7 +742,7 @@ interface AskqHandleArgs {
   client: WSClient;
   body: ApproveReq;
   getMirrorTarget?: (sessionId: string) => string | undefined;
-  flushBeforeCard?: (sessionId: string) => Promise<void>;
+  flushBeforeCard?: (sessionId: string, expect?: { toolName: string; toolInput: unknown }) => Promise<void>;
 }
 
 type AskqAnswer =
@@ -799,7 +804,7 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
     try {
       // 发卡前先把同 turn 在 mirror 那条管道里 pending 的 assistant 文本推干净 —
       // hook 直发的卡片如果赛过 mirror 的防抖, 用户会先看到卡片再看到为什么。
-      try { await flushBeforeCard?.(body.session_id); } catch (e) {
+      try { await flushBeforeCard?.(body.session_id, { toolName: "AskUserQuestion", toolInput: body.tool_input }); } catch (e) {
         log.warn({ err: (e as Error).message }, "askq flushBeforeCard failed; sending card anyway");
       }
       // 先发 markdown 列出题目+ABCD 选项 (vote 卡不支持正文字段),
@@ -882,7 +887,7 @@ interface ApprovalDeps {
    *  for the per-attachment FIFO so `client.sendMessage(card)` can't overtake the
    *  "thinking" bubble. Mirror mode wires this through; headless mode leaves it
    *  undefined (no mirror pipe to drain). */
-  flushBeforeCard?: (sessionId: string) => Promise<void>;
+  flushBeforeCard?: (sessionId: string, expect?: { toolName: string; toolInput: unknown }) => Promise<void>;
 }
 
 const resolveApprover = (
@@ -927,7 +932,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
       // 卡片直发会赛过 mirror 那条管道里 pending 的 assistant 文本(防抖窗内),
       // 先 await 排干 — 不然用户先看到卡片再看到为什么。批量卡按 batch 第一位
       // 成员的 sessionId 走(同 sessionId 才会被合到一起, 任取一个都对)。
-      try { await flushBeforeCard?.(batch.sessionId); } catch (e) {
+      try { await flushBeforeCard?.(batch.sessionId, { toolName: batch.toolName, toolInput: batch.members[0]!.originalToolInput }); } catch (e) {
         log.warn({ batchId: batch.batchId, err: (e as Error).message }, "flushBatch flushBeforeCard failed; sending card anyway");
       }
       await client.sendMessage(targetChatId(batch.approver), {
@@ -1095,7 +1100,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
     // Batch coalesce: 同 session 同 tool 的并发请求合流为一张卡。窗口内首位
     // 创建 batch + 计时器, 后续到达者只追加成员, 不发卡。flush 时依据成员数
     // 选择普通 buildCard 或 buildBatchCard。0 = 关闭聚合, 立即 flush。
-    const member: BatchMember = { reqId, toolInput: display, toolInputStr, cwd, transcriptTail };
+    const member: BatchMember = { reqId, toolInput: display, originalToolInput: toolInput, toolInputStr, cwd, transcriptTail };
     const bk = batchKeyOf(sessionId, toolName);
     const existing = activeBatches.get(bk);
     if (existing && !existing.flushed) {

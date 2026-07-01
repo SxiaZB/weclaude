@@ -595,6 +595,20 @@ const tmuxRun = (args: string[]): Promise<{ ok: boolean; stdout: string; stderr:
 
 const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+// Stable JSON: sort object keys recursively. Used to fingerprint a tool_use's
+// `input` so the hook-side and the jsonl-side compute the same signature even
+// when the model emits keys in arbitrary order.
+const stableStringify = (v: unknown): string => {
+  if (v === null || v === undefined) return JSON.stringify(v);
+  if (typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
+  const obj = v as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
+};
+const toolUseSig = (name: string, input: unknown): string => `${name}|${stableStringify(input)}`;
+const RECENT_SIGS_MAX = 64;
+
 // macOS clipboard image inject. Claude Code's TUI handles Ctrl+V by reading the
 // system clipboard for image data and attaching it as an image content block in
 // the next user turn — no Read tool call, no permission prompt. To trigger that
@@ -967,8 +981,14 @@ export interface MirrorBridge {
    *  session and await the per-attachment FIFO so the card race never lets the
    *  vote/approval card overtake the "thinking" bubble. Resolves once all
    *  outbound mirror sends queued so far have hit WeCom. No-op when no
-   *  attachment exists for the session. */
-  flushBeforeCard: (sessionId: string) => Promise<void>;
+   *  attachment exists for the session. When `expect` is provided, polls
+   *  `tail.drain()` until the assistant message containing that tool_use is
+   *  observed in the jsonl (closes the race where Claude Code's flush trails
+   *  the hook fire by tens-to-hundreds of ms). */
+  flushBeforeCard: (
+    sessionId: string,
+    expect?: { toolName: string; toolInput: unknown },
+  ) => Promise<void>;
   /** Inject text into an attached mirror without an originating WeCom frame.
    *  Used by `weclaude init` to fire a demo prompt right after auto-spawn so
    *  the user sees the full PreToolUse → approval card → assistant mirror
@@ -1048,6 +1068,12 @@ interface AttachState {
    *  / STREAMING (a.liveStream is the source of truth in that phase).
    *  Set on dispatch when outboundDeferMs > 0; cleared on promote/exit. */
   outbound?: OutboundState;
+  /** Recent tool_use signatures observed via onItem — `${name}|${stableJSON(input)}`.
+   *  flushBeforeCard polls drain() until the to-be-approved tool's sig appears
+   *  here, closing the race where the hook fires before Claude Code has
+   *  finished flushing the assistant message (with its preceding text) to disk.
+   *  Bounded ring; insertion order via Map iteration. */
+  recentToolSigs: Map<string, number>;
 }
 
 // Mirror outbound state machine. See plan: defer stream open by N ms; flush
@@ -1430,6 +1456,21 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   };
 
   const onItem = (a: AttachState, item: RenderItem): void => {
+    // Record tool_use signatures unconditionally (before any state branching),
+    // so flushBeforeCard's poll-drain can detect that the to-be-approved tool
+    // is now persisted in the jsonl regardless of DEFERRED/STREAMING/IDLE.
+    if (item.kind === "tool_use") {
+      for (const c of item.calls) {
+        const sig = toolUseSig(c.name, c.input);
+        a.recentToolSigs.delete(sig); // re-insert at tail to keep recency order
+        a.recentToolSigs.set(sig, Date.now());
+        while (a.recentToolSigs.size > RECENT_SIGS_MAX) {
+          const oldest = a.recentToolSigs.keys().next().value;
+          if (oldest === undefined) break;
+          a.recentToolSigs.delete(oldest);
+        }
+      }
+    }
     if (a.outbound?.kind === "deferred") {
       handleDeferredItem(a, item);
       return;
@@ -1562,6 +1603,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       pendingCwd: carryPending,
       tail: { stop: () => undefined, drain: () => undefined }, // placeholder; replaced below
       standalonePending: Promise.resolve(),
+      recentToolSigs: new Map(),
     };
     a.tail = startMirrorTail({
       jsonlPath,
@@ -2065,12 +2107,32 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // 可能卡在三处 — DEFERRED 的 buf、standaloneBuf 的 3s 防抖、liveStream 的
     // 250ms flush。逐一强制 drain, 再 await standalonePending FIFO, 让发卡前 mirror
     // 已经把"为什么发这张卡"推完。
-    flushBeforeCard: async (sessionId) => {
+    flushBeforeCard: async (sessionId, expect) => {
       const a = bySessionId.get(sessionId);
       if (!a) return;
       // 1) fs.watch 通常即时, 但本调用是发卡前最后一道屏障 — 主动拽一次 tail,
       //    把刚落盘的 assistant 行(可能含 text + tool_use)立刻喂给 onItem。
-      try { a.tail.drain(); } catch (e) { log.warn({ sessionId, err: (e as Error).message }, "flushBeforeCard tail drain failed"); }
+      //    若 caller 给了 expect, 进一步轮询 drain 直到对应 tool_use 落盘 —
+      //    Claude Code 的 jsonl 写入相对 hook fire 有 tens-to-hundreds ms 的
+      //    异步抖动, 单次 drain 经常抓空, 最终用户先看到卡再看到为什么。
+      const expectSig = expect ? toolUseSig(expect.toolName, expect.toolInput) : "";
+      if (expectSig) {
+        const deadline = Date.now() + cfg.wrc.mirror.flushBeforeCardWaitMs;
+        let polls = 0;
+        while (Date.now() < deadline) {
+          try { a.tail.drain(); } catch (e) { log.warn({ sessionId, err: (e as Error).message }, "flushBeforeCard tail drain failed"); }
+          if (a.recentToolSigs.has(expectSig)) break;
+          polls++;
+          await sleepMs(50);
+        }
+        if (!a.recentToolSigs.has(expectSig)) {
+          log.warn({ sessionId, polls, toolName: expect?.toolName }, "flushBeforeCard wait timed out — sending card without sig confirm");
+        } else if (polls > 0) {
+          log.info({ sessionId, polls, toolName: expect?.toolName }, "flushBeforeCard waited for tool_use to materialize");
+        }
+      } else {
+        try { a.tail.drain(); } catch (e) { log.warn({ sessionId, err: (e as Error).message }, "flushBeforeCard tail drain failed"); }
+      }
       // 2) DEFERRED 状态如果还在 buffering(needsApproval 因任何原因没触发就走到这),
       //    这里手动提升 → 立刻把 buf 当 standalone 推出, 进入 AWAITING_APPR。
       if (a.outbound?.kind === "deferred" && a.outbound.buf.length > 0) {

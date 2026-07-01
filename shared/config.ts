@@ -69,6 +69,11 @@ const Mirror = z.object({
   //   • 窗口超时 → 正常开 stream, 重放 buffer。
   // 0 = 关闭, 退回到 dispatch 立即 ack "…" 的旧行为。
   outboundDeferMs: z.number().int().nonnegative().default(3000),
+  // 发卡前等待目标 tool_use 在 jsonl 落盘的最长 poll 时间 (ms)。Claude Code 的
+  // assistant 行写盘相对 PreToolUse hook fire 有 tens-to-hundreds ms 异步抖动,
+  // 没等到的话 drain 抓空, 卡先到、思考过程后到。轮询步进 50ms。0 = 关闭等待,
+  // 仅做一次同步 drain (旧行为)。
+  flushBeforeCardWaitMs: z.number().int().nonnegative().default(800),
 });
 
 const Wrc = z.object({

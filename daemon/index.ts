@@ -82,7 +82,8 @@ const main = async (): Promise<void> => {
   // Headless mode has no mirror pipe — leave undefined so approval skips the call.
   const flushBeforeCard =
     cfg.wrc.mode === "mirror"
-      ? (sid: string): Promise<void> => (bridge as MirrorBridge).flushBeforeCard(sid)
+      ? (sid: string, expect?: { toolName: string; toolInput: unknown }): Promise<void> =>
+          (bridge as MirrorBridge).flushBeforeCard(sid, expect)
       : undefined;
   const http = startHttp({ cfg, ws, log, sourcePath });
   http.register(
