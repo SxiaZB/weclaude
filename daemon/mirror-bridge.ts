@@ -152,6 +152,13 @@ interface ContentBlock {
 
 interface TranscriptLine {
   type?: string;
+  /** Present on `type:"system"` lines — e.g. "local_command" for slash-command
+   *  invocation records. */
+  subtype?: string;
+  /** Top-level content for `type:"system"` lines (distinct from message.content
+   *  used on user/assistant lines). Slash-command invocation lands here as
+   *  `<command-name>/foo</command-name>...`. */
+  content?: string;
   uuid?: string;
   message?: {
     role?: string;
@@ -452,6 +459,22 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
     return out;
   }
 
+  // Slash-command records for TUI-only commands land here as `type:"system"`,
+  // `subtype:"local_command"` — the invocation itself and, if present, a
+  // sibling `<local-command-stdout>` line carrying the rendered panel.
+  //   • /context (2.1.139+): dumps the full panel as ANSI-decorated text.
+  //   • /model on Claude Code 2.1.139 still lands under `type:"user"`, so this
+  //     branch is currently /context-focused; other future TUI-only commands
+  //     that follow the same shape will fall through the same anchoring.
+  if (line.type === "system" && line.subtype === "local_command" && typeof line.content === "string") {
+    const stdout = line.content.match(/<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/)?.[1] ?? "";
+    if (!stdout.trim()) return []; // pure invocation record or empty stdout
+    const cleaned = stripAnsi(stdout);
+    const anchored = anchorSkillOutput(cleaned);
+    if (!anchored) return [];
+    return [{ kind: "skill_output", body: `⚙️ ${anchored}` }];
+  }
+
   return [];
 };
 
@@ -671,6 +694,24 @@ const setMacClipboardImage = async (imgPath: string): Promise<{ ok: boolean; rea
 const capturePaneTail = async (target: string, rows = 12): Promise<string> => {
   const r = await tmuxRun(["capture-pane", "-t", target, "-p", "-S", `-${rows}`]);
   return r.ok ? r.stdout : "";
+};
+
+// Strip ANSI SGR + CSI + OSC sequences so a slash-command stdout is safely
+// embeddable in a WeCom bubble. We don't try to preserve color — text only.
+const stripAnsi = (s: string): string =>
+  s.replace(/\x1B\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1B\][^\x07]*\x07/g, "");
+
+// Trim slash-command stdout to the useful section. TUI panels prepend a run
+// of leading whitespace / bar-chart glyph rows before the human-readable
+// title; we anchor at the first title line and drop everything above. The
+// anchors here are the known /context titles — extend when new commands
+// route through this branch.
+const SKILL_ANCHORS = ["Context Usage"];
+const anchorSkillOutput = (raw: string): string => {
+  const lines = raw.split("\n");
+  const idx = lines.findIndex((l) => SKILL_ANCHORS.some((a) => l.includes(a)));
+  const sliced = idx >= 0 ? lines.slice(idx) : lines;
+  return sliced.join("\n").replace(/^\s+|\s+$/g, "");
 };
 
 // Two fingerprints, derived from different ends of `text`:
