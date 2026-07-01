@@ -124,6 +124,11 @@ interface TailDeps {
   toolResultMaxChars: number;
   toolUseInlineMaxChars: number;
   isOwnInject: (text: string) => boolean;
+  /** True when this assistant text was already pushed early from a pane capture
+   *  (pre-card preamble). CC flushes a tool-terminated turn to the jsonl only
+   *  after the tool resolves, so the tail re-emits text we already mirrored;
+   *  suppress that one echo. One-shot — a genuine later re-say still streams. */
+  isOwnAssistantSend?: (text: string) => boolean;
   onItem: (item: RenderItem) => void;
   /** Build a click-to-detail URL for a tool_use id; returns "" when disabled
    *  (cfg.daemon.detailLinksInMirror=false) so the tail can skip wrapping the
@@ -441,7 +446,7 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
       if (b?.type === "text" && typeof b.text === "string") {
         flushPending();
         const t = b.text.trim();
-        if (t) out.push({ kind: "text", body: t, final: isFinal });
+        if (t && !deps.isOwnAssistantSend?.(t)) out.push({ kind: "text", body: t, final: isFinal });
       } else if (b?.type === "tool_use" && deps.includeTools) {
         const name = b.name ?? "tool";
         const toolUseId = b.id ?? "";
@@ -712,6 +717,55 @@ const anchorSkillOutput = (raw: string): string => {
   const idx = lines.findIndex((l) => SKILL_ANCHORS.some((a) => l.includes(a)));
   const sliced = idx >= 0 ? lines.slice(idx) : lines;
   return sliced.join("\n").replace(/^\s+|\s+$/g, "");
+};
+
+// How far back to capture when recovering a pre-card preamble. Preambles before
+// AskUserQuestion/ExitPlanMode are short; 40 rows covers wrap + the pending
+// tool/picker below it without dragging in the previous turn.
+const PANE_PREAMBLE_ROWS = 40;
+const BULLET = "⏺"; // ⏺ — Claude Code's assistant/tool bullet
+// Indented lines that are tool-execution summaries, not prose wrap. Filtered out
+// when they sandwich between prose and the pending tool.
+const TOOL_SUMMARY_RE =
+  /^(⎿|… ?\+?\d|Ran |Read |Wrote |Edited |Listed |Searched |Found |Fetched |Called |Committed |Pushed |Pulled |Rebased |Staged |Updated )/u;
+// After `⏺ `: a tool call (`Bash(…`) or a collapsed summary → not prose.
+const isToolBullet = (afterBullet: string): boolean =>
+  /^[A-Za-z_][\w.-]*\(/u.test(afterBullet) || TOOL_SUMMARY_RE.test(afterBullet);
+
+// Pull the most recent assistant PROSE block out of a Claude Code TUI capture —
+// the "why" that precedes a pending approval tool. CC renders prose as
+// `⏺ <text>` + 2-space-indented wrapped lines; tool calls as `⏺ Name(…)` and
+// summaries as indented `Ran…/Read…/⎿…`. Walk up from the bottom past the
+// pending tool region to the last prose bullet, then collect its block.
+// Best-effort: returns "" when nothing confident is found (caller sends the
+// card alone — status-quo, no regression).
+const extractPaneAssistantTail = (pane: string): string => {
+  const lines = pane.replace(/[\s﻿]+$/u, "").split("\n");
+  let start = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const ln = lines[i]!;
+    if (/^❯\s+\S/u.test(ln)) return ""; // a user-message echo above → no preamble between it and here
+    // note: the empty input-box prompt (`❯ ` + NBSP, nothing after) is NOT a boundary — skip it
+    if (ln.startsWith(BULLET + " ")) {
+      if (!isToolBullet(ln.slice(2).trimStart())) { start = i; break; }
+      // tool bullet (the gating tool) — keep scanning up for the prose above it
+    }
+  }
+  if (start === -1) return "";
+  const out: string[] = [lines[start]!.slice(2).trimStart()];
+  for (let i = start + 1; i < lines.length; i++) {
+    const ln = lines[i]!;
+    if (ln.trim() === "") { out.push(""); continue; }
+    if (ln.startsWith(BULLET)) break;        // next block starts
+    if (!/^\s{2}\S/u.test(ln)) break;        // not a 2-space continuation
+    if (/[│┌┐└┘├┤┬┴┼◯○●☐☑▪▸▹]/u.test(ln)) break; // picker/table chrome
+    const body = ln.trimStart();
+    if (TOOL_SUMMARY_RE.test(body)) continue; // sandwiched tool summary
+    out.push(body);
+  }
+  while (out.length && out[out.length - 1] === "") out.pop();
+  const text = out.join("\n").trim();
+  return text.length >= 12 ? text : "";
 };
 
 // Two fingerprints, derived from different ends of `text`:
@@ -1173,6 +1227,39 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return false;
   };
 
+  // Assistant prose pushed EARLY from a pane capture (pre-card preamble). The
+  // same text lands in the jsonl later — CC flushes a tool-terminated turn only
+  // when the tool resolves, i.e. after the card is answered — so the tail would
+  // re-send it. Match normalized (ws-stripped) so a wrapped/dedented pane copy
+  // equals the clean jsonl text; boundary match covers a pane that only caught
+  // part of a long preamble. findAssistantSend peeks (dup-guard for the per-
+  // question flushBeforeCard re-calls); isOwnAssistantSend consumes one-shot.
+  const recentAssistantSends: Array<{ sig: string; ts: number }> = [];
+  const normAssistant = (s: string): string => s.replace(/\s+/gu, "");
+  const findAssistantSend = (text: string): number => {
+    const sig = normAssistant(text);
+    if (sig.length < 12) return -1;
+    const cutoff = Date.now() - INJECT_TTL_MS;
+    for (let i = recentAssistantSends.length - 1; i >= 0; i--) {
+      const e = recentAssistantSends[i]!;
+      if (e.ts < cutoff) continue;
+      if (sig === e.sig || sig.startsWith(e.sig) || e.sig.startsWith(sig) || sig.endsWith(e.sig) || e.sig.endsWith(sig)) return i;
+    }
+    return -1;
+  };
+  const rememberAssistantSend = (text: string): void => {
+    const sig = normAssistant(text);
+    if (sig.length < 12) return;
+    recentAssistantSends.push({ sig, ts: Date.now() });
+    if (recentAssistantSends.length > 32) recentAssistantSends.shift();
+  };
+  const isOwnAssistantSend = (text: string): boolean => {
+    const i = findAssistantSend(text);
+    if (i === -1) return false;
+    recentAssistantSends.splice(i, 1); // one-shot: a genuine later re-say still streams
+    return true;
+  };
+
   // ── Typewriter stream lifecycle ────────────────────────────────────
   // WeCom spec: server polls us for stream refreshes for up to 6 min from the
   // original inbound. SDK queues replyStream calls per req_id, sends serially
@@ -1292,6 +1379,27 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         }
       })
       .catch(() => undefined);
+  };
+
+  // Pre-card preamble recovery. Called right before an approval card when the
+  // gating tool_use is NOT yet in the jsonl (mirror mode: CC defers the whole
+  // tool-terminated turn's flush until the tool resolves — after the card is
+  // answered). The "why" text is therefore only in the live pane; capture it,
+  // push it ahead of the card, and remember it so the later jsonl-tailed copy
+  // is dropped as a dup. Enqueues on standalonePending, which flushBeforeCard
+  // awaits — so the card lands after. Fail-safe: any miss → just the card.
+  const sendPanePreamble = async (a: AttachState): Promise<void> => {
+    if (!cfg.wrc.mirror.panePreamble || !a.tmuxPane) return;
+    try {
+      const pane = await capturePaneTail(a.tmuxPane, PANE_PREAMBLE_ROWS);
+      const text = extractPaneAssistantTail(pane);
+      if (!text || findAssistantSend(text) !== -1) return; // nothing new / already queued
+      rememberAssistantSend(text);
+      sendStandalone(a, text);
+      log.info({ sessionId: a.sessionId, len: text.length }, "flushBeforeCard: pushed pane preamble before card");
+    } catch (e) {
+      log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "pane preamble capture failed");
+    }
   };
 
   // Debounce 聚合: 仅 standalone 路径用。窗口内 onItem 多次落入 → 合并成单条 markdown。
@@ -1655,6 +1763,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       toolResultMaxChars: cfg.wrc.mirror.toolResultMaxChars,
       toolUseInlineMaxChars: cfg.wrc.mirror.toolUseInlineMaxChars,
       isOwnInject,
+      isOwnAssistantSend,
       onItem: (item) => onItem(a, item),
       detailUrlFor,
       sessionId,
@@ -1880,6 +1989,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       toolResultMaxChars: cfg.wrc.mirror.toolResultMaxChars,
       toolUseInlineMaxChars: cfg.wrc.mirror.toolUseInlineMaxChars,
       isOwnInject,
+      isOwnAssistantSend,
       onItem: (item) => onItem(a, item),
       detailUrlFor,
       sessionId: newSessionId,
@@ -2173,6 +2283,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         }
       } else {
         try { a.tail.drain(); } catch (e) { log.warn({ sessionId, err: (e as Error).message }, "flushBeforeCard tail drain failed"); }
+      }
+      // 1.5) 门控 tool_use 始终没在 jsonl 落盘 → CC 把整条 tool-terminated turn 攒着
+      //     等工具 resolve 才 flush(而工具正卡在这张卡上), 前言此刻既不在 jsonl 也
+      //     不在 hook 的 transcript_tail 里, 只剩活着的 pane 有。抠出来先推, 稍后
+      //     jsonl 落盘 tail 出来的同一条由 isOwnAssistantSend 抑制。
+      const sigConfirmed = expectSig !== "" && a.recentToolSigs.has(expectSig);
+      if (expect && !sigConfirmed) {
+        await sendPanePreamble(a);
       }
       // 2) DEFERRED 状态如果还在 buffering(needsApproval 因任何原因没触发就走到这),
       //    这里手动提升 → 立刻把 buf 当 standalone 推出, 进入 AWAITING_APPR。
