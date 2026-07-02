@@ -82,6 +82,21 @@ interface ResolvedSession {
   jsonlPath: string;
 }
 
+// Newest-mtime *.jsonl in the encoded project dir for `cwd`. A `/clear` (or a
+// native `/new`) rotation always leaves a fresh jsonl here, so this is how the
+// mirror re-finds the live session after a rotation it didn't itself record —
+// used by resolveSession's auto-pick and by restoreFromStore's heal path.
+const latestJsonlForCwd = (cfg: Config, cwd: string): ResolvedSession | undefined => {
+  const projectDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(expandHome(cwd)));
+  if (!existsSync(projectDir)) return undefined;
+  const top = readdirSync(projectDir)
+    .filter((n) => n.endsWith(".jsonl"))
+    .map((n) => ({ name: n, mtime: statSync(join(projectDir, n)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime)[0];
+  if (!top) return undefined;
+  return { sessionId: top.name.replace(/\.jsonl$/, ""), jsonlPath: join(projectDir, top.name) };
+};
+
 const resolveSession = (cfg: Config, log: Logger): ResolvedSession | undefined => {
   const cwd = expandHome(cfg.wrc.cwd);
   const projectDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(cwd));
@@ -98,20 +113,12 @@ const resolveSession = (cfg: Config, log: Logger): ResolvedSession | undefined =
     }
     return { sessionId: pinned, jsonlPath: p };
   }
-  // auto-pick latest
-  const candidates = readdirSync(projectDir)
-    .filter((n) => n.endsWith(".jsonl"))
-    .map((n) => ({ name: n, mtime: statSync(join(projectDir, n)).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime);
-  if (candidates.length === 0) {
+  const top = latestJsonlForCwd(cfg, cwd);
+  if (!top) {
     log.error({ projectDir }, "mirror: no .jsonl in project dir");
     return undefined;
   }
-  const top = candidates[0]!;
-  return {
-    sessionId: top.name.replace(/\.jsonl$/, ""),
-    jsonlPath: join(projectDir, top.name),
-  };
+  return top;
 };
 
 // ── Tail logic ────────────────────────────────────────────────────────
@@ -1812,11 +1819,25 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const restoreFromStore = async (principal: string): Promise<AttachState | undefined> => {
     const rec = deps.store.get(principal);
     if (!rec) return undefined;
-    const jsonlAbs = expandHome(rec.jsonlPath);
+    let jsonlAbs = expandHome(rec.jsonlPath);
     if (!existsSync(jsonlAbs)) {
-      log.warn({ principal, jsonlPath: rec.jsonlPath }, "mirror restore: jsonl missing, dropping entry");
-      deps.store.drop(principal);
-      return undefined;
+      // Recorded session rotated out from under us — a `/clear` or native `/new`
+      // the daemon didn't record (e.g. it restarted while the /clear migration
+      // watcher was still open). The rotation left a newer jsonl in the same
+      // project dir; heal onto it instead of dropping the binding, else the
+      // chat silently loses all further responses. Fail-closed drop only when
+      // the project dir is truly empty.
+      const healed = latestJsonlForCwd(cfg, rec.cwd || cfg.wrc.cwd);
+      if (!healed) {
+        log.warn({ principal, jsonlPath: rec.jsonlPath }, "mirror restore: jsonl missing and no sibling, dropping entry");
+        deps.store.drop(principal);
+        return undefined;
+      }
+      log.warn({ principal, from: rec.sessionId, to: healed.sessionId }, "mirror restore: recorded jsonl gone, healed to latest in project dir");
+      rec.sessionId = healed.sessionId;
+      rec.jsonlPath = healed.jsonlPath;
+      jsonlAbs = healed.jsonlPath;
+      deps.store.set(principal, rec);
     }
     // Prefer the stored pane id and validate via display-message. Pane ids
     // (`%N`) are monotonic per tmux server lifetime, so they're stable across
