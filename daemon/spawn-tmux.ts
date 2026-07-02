@@ -205,10 +205,19 @@ export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, c
 
   // Reuse the shared session if alive; otherwise create it. Either way, end
   // up with a fresh window whose pane id we capture via `-P -F '#{pane_id}'`.
+  //
+  // Seed the new pane's environment (`-e`, tmux ≥3.0) BEFORE its shell sources
+  // rc: oh-my-zsh runs its update check while sourcing .zshrc and, when due,
+  // blocks on `[oh-my-zsh] Would you like to update? [Y/n]`. That prompt eats
+  // the `claude …` command line + the trailing Enter, so claude never launches
+  // and the injected message falls through to a bare shell (`command not
+  // found: hi`). These two legacy vars (still honored for back-compat) disable
+  // the prompt regardless of the user's zstyle config.
+  const paneEnv = ["-e", "DISABLE_AUTO_UPDATE=true", "-e", "DISABLE_UPDATE_PROMPT=true"];
   const has = await runTmux(["has-session", "-t", tmuxName]);
   const created = has.code === 0
-    ? await runTmux(["new-window", "-d", "-t", tmuxName, "-n", winName, "-c", cwd, "-P", "-F", "#{pane_id}"])
-    : await runTmux(["new-session", "-d", "-s", tmuxName, "-n", winName, "-c", cwd, "-P", "-F", "#{pane_id}"]);
+    ? await runTmux(["new-window", "-d", "-t", tmuxName, "-n", winName, "-c", cwd, ...paneEnv, "-P", "-F", "#{pane_id}"])
+    : await runTmux(["new-session", "-d", "-s", tmuxName, "-n", winName, "-c", cwd, ...paneEnv, "-P", "-F", "#{pane_id}"]);
   if (!created.ok) {
     const verb = has.code === 0 ? "new-window" : "new-session";
     return { ok: false, reason: `tmux ${verb} failed: ${created.stderr.trim() || created.code}` };
