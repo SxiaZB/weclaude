@@ -183,6 +183,35 @@ curl -sS -X POST http://127.0.0.1:17890/wedoc/invalidate -H 'content-type: appli
 
 ---
 
+## 事件订阅 / 定时广播
+
+一个轻量 pub/sub：任意群或单聊都能订阅一个 **topic**（自定义事件名），任何授权用户都能广播；daemon 内置分钟级调度器，每天定点自动推送。订阅关系与定时任务持久化到 `~/.weclaude/config.jsonc` 的 `topics` 段，`weclaude reload` 后自动恢复。
+
+**IM 命令**（在已授权的会话里说，中英文均可）：
+
+```
+订阅 sync-daily                       # 当前会话订阅 topic（群里说→群订阅，单聊里说→个人订阅）
+退订 sync-daily
+广播 sync-daily 内容：xxx              # 立即广播给所有订阅者
+每天 08:00 广播 sync-daily 内容：xxx   # 定时（也接受「每天8点」「每天8:30」「每日 08:00」）
+广播列表 / 订阅列表                    # 查看当前状态
+取消广播 sync-daily                    # 删掉该 topic 的所有定时
+```
+
+典型用法：在群 A 说 `订阅 sync-daily`，在群 B 说 `每天8点广播 sync-daily 内容：早会 10 分钟后开始`——第二天早 8 点群 A 自动收到。
+
+**外部触发**（CI / 监控 / 脚本）：
+
+```bash
+curl -sS -X POST http://127.0.0.1:17890/publish \
+  -H 'content-type: application/json' \
+  -d '{"topic":"ci-fail","markdown":"🔴 build #1234 failed on main"}'
+```
+
+调用方只关心事件名，运维通过 IM 命令改订阅者，代码零改动。
+
+---
+
 ## 消息是怎么同步的
 
 **审批流**（`headless` / `mirror` 都走这条）：

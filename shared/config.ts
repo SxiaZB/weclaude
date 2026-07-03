@@ -136,6 +136,22 @@ const Sync = z.object({
   targets: z.array(SyncTarget).default([]),
 });
 
+// 事件订阅 / 广播。subs 是 topic → 目标id数组 (`user:xxx` / `chat:xxx`),
+// 一个 topic 可以有多个订阅者; schedules 是「每天 HH:MM 触发某 topic」的定时任务。
+// 订阅关系与定时通过 IM 命令 (订阅 / 每天HH:MM广播 …) 增删,写回 config.jsonc。
+const Schedule = z.object({
+  topic: z.string(),
+  hour: z.number().int().min(0).max(23),
+  minute: z.number().int().min(0).max(59),
+  content: z.string(),
+  createdBy: z.string().default(""),
+  createdAt: z.number().default(0),
+});
+const Topics = z.object({
+  subs: z.record(z.string(), z.array(z.string())).default({}),
+  schedules: z.array(Schedule).default([]),
+});
+
 export const ConfigSchema = z.object({
   bot: Bot,
   defaultChat: z.string().default(""),
@@ -143,6 +159,7 @@ export const ConfigSchema = z.object({
   wrc: Wrc.default({}),
   approval: Approval.default({}),
   sync: Sync.default({ targets: [] }),
+  topics: Topics.default({ subs: {}, schedules: [] }),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;

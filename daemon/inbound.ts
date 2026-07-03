@@ -11,6 +11,22 @@ import { expandHome, sanitizeId } from "../shared/paths.js";
 import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim } from "./claim.js";
 import { getLastResponse } from "./last-response.js";
 import { scanClaudeSessions, type SessionInfo } from "./session-scan.js";
+import {
+  parseSubscribe,
+  parseUnsubscribe,
+  parseBroadcast,
+  parseDailySchedule,
+  parseCancelSchedule,
+  isListSchedules,
+  isListSubs,
+  subscribe,
+  unsubscribe,
+  addSchedule,
+  removeSchedulesByTopic,
+  publish,
+  renderSubs,
+  renderSchedules,
+} from "./topics.js";
 
 // Chat-binding key: stable id for "this conversation thread". Used as
 // session-map key, mirror target, defaultChat. NOT used for auth.
@@ -254,6 +270,70 @@ export const installInboundRouter = (
     return `✅ 新会话已建立 \`${r.sessionId}\``;
   };
 
+  // 事件订阅 / 广播命令。授权后调用,不再走 bridge dispatch。返回 true 表示已处理。
+  const topicLog = log.child({ mod: "topics" });
+  const handleTopicCommand = async (
+    frame: WsFrame<BaseMessage>,
+    msg: BaseMessage,
+    who: string,
+    text: string,
+  ): Promise<boolean> => {
+    const reply = async (t: string): Promise<void> => {
+      try { await client.replyStream(frame, msg.msgid, t, true); } catch { /* ignore */ }
+    };
+    const sub = parseSubscribe(text);
+    if (sub) {
+      const r = subscribe(cfg, sourcePath, sub.topic, who);
+      await reply(r.added
+        ? `✅ 已订阅 \`${sub.topic}\` (会话: \`${who}\`)`
+        : `ℹ️ 已在 \`${sub.topic}\` 订阅列表中`);
+      return true;
+    }
+    const unsub = parseUnsubscribe(text);
+    if (unsub) {
+      const r = unsubscribe(cfg, sourcePath, unsub.topic, who);
+      await reply(r.removed ? `✅ 已退订 \`${unsub.topic}\`` : `ℹ️ 未订阅 \`${unsub.topic}\``);
+      return true;
+    }
+    const daily = parseDailySchedule(text);
+    if (daily) {
+      addSchedule(cfg, sourcePath, {
+        topic: daily.topic,
+        hour: daily.hour,
+        minute: daily.minute,
+        content: daily.content,
+        createdBy: who,
+        createdAt: Date.now(),
+      });
+      const hh = String(daily.hour).padStart(2, "0");
+      const mm = String(daily.minute).padStart(2, "0");
+      const subCount = (cfg.topics.subs[daily.topic] ?? []).length;
+      await reply(`✅ 定时已添加: 每天 ${hh}:${mm} 广播 \`${daily.topic}\` (当前 ${subCount} 订阅者)`);
+      return true;
+    }
+    const bcast = parseBroadcast(text);
+    if (bcast) {
+      const r = await publish(client, cfg, topicLog, bcast.topic, bcast.content);
+      await reply(`📣 已广播到 \`${r.topic}\`: 送达 ${r.sent} / ${r.subs.length}${r.failed ? `,失败 ${r.failed}` : ""}`);
+      return true;
+    }
+    const cancel = parseCancelSchedule(text);
+    if (cancel) {
+      const n = removeSchedulesByTopic(cfg, sourcePath, cancel.topic);
+      await reply(n > 0 ? `✅ 已删除 \`${cancel.topic}\` 的 ${n} 条定时` : `ℹ️ \`${cancel.topic}\` 无定时任务`);
+      return true;
+    }
+    if (isListSubs(text)) {
+      await reply(renderSubs(cfg, who));
+      return true;
+    }
+    if (isListSchedules(text)) {
+      await reply(renderSchedules(cfg));
+      return true;
+    }
+    return false;
+  };
+
   // Common gating: claim bootstrap + allowFrom check. Returns true if the
   // caller should stop (claim consumed or message rejected).
   const gate = async (frame: WsFrame<BaseMessage>, msg: BaseMessage, text: string): Promise<{ stop: boolean; who: string }> => {
@@ -310,6 +390,11 @@ export const installInboundRouter = (
       try { await client.replyStream(frame, msg.msgid, reply, true); } catch { /* ignore */ }
       return { stop: true, who };
     }
+    // 事件订阅 / 广播 / 定时。授权后即可使用,任意 principal 可对本会话订阅/退订,
+    // 广播权限同 allowFrom(已过上面的 auth 门)。命令不进入 bridge dispatch,
+    // 用轻量 replyStream 回执。
+    const topicHandled = await handleTopicCommand(frame, msg, who, text);
+    if (topicHandled) return { stop: true, who };
     // Authorized `/stop` — Esc the live pane to interrupt whatever Claude is
     // currently doing. Mirror-mode only; bails cleanly when no attachment.
     if (isStopCommand(text)) {

@@ -22,6 +22,7 @@ import {
 import { makeWedocBridge } from "./wedoc.js";
 import { installResponseTracker } from "./last-response.js";
 import { scanClaudeSessions } from "./session-scan.js";
+import { startScheduler, publish as publishTopic } from "./topics.js";
 
 // pino's file transport is async; without flush, log.fatal before process.exit
 // vanishes. Mirror anything fatal to stderr too so launchd's stderr.log captures it.
@@ -93,6 +94,21 @@ const main = async (): Promise<void> => {
   http.register("POST /message", makeMessageHandler(ws.client, log.child({ mod: "outbound" })));
   http.register("POST /card", makeCardHandler(ws.client, log.child({ mod: "outbound" })));
   http.register("POST /ask", makeAskHandler(ws.client, log.child({ mod: "ask" })));
+  // 事件订阅广播: 外部脚本/CI 可 curl :17890/publish 触发一次广播,不用关心订阅者。
+  http.register("POST /publish", async (req, res) => {
+    const { readBody } = await import("./http.js");
+    const body = (await readBody(req)) as Partial<{ topic: string; markdown: string; text: string }>;
+    const topic = (body.topic ?? "").trim();
+    const content = body.markdown ?? body.text ?? "";
+    if (!topic || !content) { json(res, 400, { ok: false, error: "topic and markdown/text required" }); return; }
+    if (!ws.client.isConnected) { json(res, 503, { ok: false, error: "ws_disconnected" }); return; }
+    try {
+      const r = await publishTopic(ws.client, cfg, log.child({ mod: "topics" }), topic, content);
+      json(res, 200, { ok: true, ...r });
+    } catch (e) {
+      json(res, 502, { ok: false, error: (e as Error).message });
+    }
+  });
   http.register("POST /claim/start", makeClaimStartHandler({ log: log.child({ mod: "claim" }) }));
   http.register("GET /claim/status", makeClaimStatusHandler());
   http.register("POST /claim/reset", makeClaimResetHandler());
@@ -330,8 +346,12 @@ const main = async (): Promise<void> => {
     });
   }
 
+  // 事件订阅调度器 — 每 20s 检查 topics.schedules,匹配当前分钟即广播。
+  const scheduler = startScheduler({ client: ws.client, cfg, log: log.child({ mod: "topics" }) });
+
   const shutdown = async (signal: string): Promise<void> => {
     log.info({ signal }, "shutdown signal");
+    scheduler.stop();
     await Promise.allSettled([ws.shutdown(), http.close()]);
     process.exit(0);
   };
