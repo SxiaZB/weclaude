@@ -4,7 +4,9 @@
 set -uo pipefail
 
 DAEMON_URL="${WECLAUDE_DAEMON_URL:-http://127.0.0.1:17890/approve}"
-HOOK_TIMEOUT="${WECLAUDE_HOOK_TIMEOUT:-1810}"
+# 必须严格大于 daemon 的 approval.longPollSec (默认 43200) 且小于 hooks.json
+# 的 timeout, 否则卡在 WeCom 里挂 >30min 后 curl 先死, 用户的点击写进死 socket。
+HOOK_TIMEOUT="${WECLAUDE_HOOK_TIMEOUT:-43210}"
 STATE_DIR="${WECLAUDE_STATE_DIR:-$HOME/.weclaude/state}"
 # Fallback policy when the daemon is unreachable / replies garbage. ask|allow|deny.
 # Default keeps the safe behavior; set to `allow` in trusted local-only setups.

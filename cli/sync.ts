@@ -91,11 +91,13 @@ const ENV_KEYS = [
   "WECLAUDE_DAEMON_URL",
   "WECLAUDE_STATE_DIR",
   "WECLAUDE_HOOK_FALLBACK",
+  "WECLAUDE_HOOK_TIMEOUT",
 ];
 interface EnvVals {
   base: string;
   stateDir: string;
   hookFallback: "ask" | "allow" | "deny";
+  hookTimeoutSec: number;
 }
 const upsertEnv = (settings: Record<string, unknown>, v: EnvVals): string[] => {
   const env = ((settings.env as Record<string, unknown>) ??= {});
@@ -103,6 +105,8 @@ const upsertEnv = (settings: Record<string, unknown>, v: EnvVals): string[] => {
   env.WECLAUDE_DAEMON_URL = `${v.base}/approve`;
   env.WECLAUDE_STATE_DIR = expandHome(v.stateDir);
   env.WECLAUDE_HOOK_FALLBACK = v.hookFallback;
+  // curl --max-time: 严格大于 longPollSec, 否则长挂的卡在用户点击前就断线。
+  env.WECLAUDE_HOOK_TIMEOUT = String(v.hookTimeoutSec);
   return ENV_KEYS;
 };
 const stripEnv = (settings: Record<string, unknown>): void => {
@@ -152,6 +156,7 @@ const main = (): void => {
     base: `http://${cfg.daemon.host}:${cfg.daemon.port}`,
     stateDir: cfg.daemon.stateDir,
     hookFallback: cfg.approval.fallbackOnError,
+    hookTimeoutSec: cfg.approval.hookTimeoutSec,
   };
 
   const lock = readLock();
