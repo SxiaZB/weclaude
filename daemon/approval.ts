@@ -850,6 +850,16 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
   const reason = total === 1
     ? `User answered ${answers[0]} via WeCom`
     : `User answered ${total} questions via WeCom — ${answers.join("; ")}`;
+  // 答完最后一题后 model 进入不可见的长 thinking (隐藏式 thinking 不下发,
+  // WeCom 端全静默,极易被当成"卡住")。推一条回执确认答案已落地。失败不阻断。
+  try {
+    await client.sendMessage(target, {
+      msgtype: "markdown",
+      markdown: { content: total === 1 ? "✅ 已回传，Claude 处理中…" : `✅ ${total} 题已回传，Claude 处理中…` },
+    });
+  } catch (e) {
+    log.warn({ err: (e as Error).message }, "askq ack send failed");
+  }
   return { decision: "deny", reason };
 };
 
