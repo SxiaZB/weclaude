@@ -12,6 +12,7 @@
 - 📡 **MCP 主动推送** — Claude 通过 `wecom__send_markdown` / `wecom__send_card` / `wecom__ask_user` 主动汇报或问询。
 - 📄 **文档读写** — Claude 通过 `wecom_doc_list_tools` / `wecom_doc_call` 直接调企业微信智能机器人的 doc / smartsheet / smartpage MCP，新建在线文档、写 Markdown、读链接、操作智能表格——全程在内网，不需要 corp access_token。
 - 🗂 **多会话发现/切换** — Claude 通过 `list_claude_sessions` / `switch_claude_session` / `new_claude_session` 列出本机 tmux 内所有在跑的 Claude 会话（带摘要 + 稳定动物 emoji 标签）、把 IM 镜像切到其中任一个、或在指定路径新开一个会话。审批卡标题也带同一枚 emoji，多个会话兜底到同一 IM 时一眼区分。
+- 🔄 **重启即续** — 电脑重启 / tmux 全没了 / daemon 崩了都不掉档：IM ↔ 会话绑定持久化在 `~/.weclaude/mirror-attachments.json`，下一条 IM 消息自动 `claude --resume` 拉起新 tmux pane，历史完整继承；`tmux attach -t weclaude` 接管即可。
 
 ---
 
@@ -110,7 +111,7 @@ chmod +x ~/.weclaude/daemonctl.sh
 | **流式输出** | 转发 assistant 文本块 | 完整流式：打字机、tool_use、思考过程都看得到 |
 | **适合谁** | 简单单轮问答 / CI 类自动化 | 真·远程结对编程 |
 
-镜像模式下，IM 里发 `/new` 直接开新 tmux 窗口 + 新 Claude 会话；`/clear` 清当前上下文；带图消息自动注入剪贴板。所有 IM 聊天共享一个 tmux session（默认名 `weclaude`），每个聊天一个独立 window，重启 daemon、关 tmux 都能自愈。
+镜像模式下，IM 里发 `/new` 直接开新 tmux 窗口 + 新 Claude 会话；`/clear` 清当前上下文；带图消息自动注入剪贴板。所有 IM 聊天共享一个 tmux session（默认名 `weclaude`），每个聊天一个独立 window，**关 tmux / daemon 崩了 / 整机重启都能自愈**：IM↔会话绑定 write-through 落到 `~/.weclaude/mirror-attachments.json`，daemon 起来就 eager restore；重启后 pane 全死，下一条 IM 消息触发 `claude --resume <sid>` 拉起新 pane，`--resume` fork 出的新 jsonl 由 watcher 从 EOF 无缝接管（不会把整段历史再推一遍到 IM）。中途在别处 `/clear` 把 jsonl rotate 掉也不丢绑定，会自愈到同项目目录下最新的 jsonl。
 
 > 💡 **mirror 不要求你必须先在 CLI 里开 tmux**：在企业微信里直接发 `/new` 就能从零起一个新 tmux 窗口 + Claude 会话；甚至首次发任意消息都会自动 spawn + 绑定（首条消息既是绑定信号也是第一句 prompt）。回家打开终端 `tmux attach -t weclaude` 接管即可。
 
