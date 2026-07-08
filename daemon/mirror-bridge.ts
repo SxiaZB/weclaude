@@ -97,6 +97,26 @@ const latestJsonlForCwd = (cfg: Config, cwd: string): ResolvedSession | undefine
   return { sessionId: top.name.replace(/\.jsonl$/, ""), jsonlPath: join(projectDir, top.name) };
 };
 
+// Locate a transcript by sessionId across every sibling project dir under the
+// projects root. Claude Code's EnterWorktree/ExitWorktree relocate the SAME-sid
+// jsonl between <cwd> and <cwd>/.claude/worktrees/<name> — each cwd encodes to
+// its own project dir, so the path moves but the sid doesn't. It's a rename
+// (byte prefix preserved), so a tail can follow it with a continuous offset.
+// Newest-mtime wins if a stale sibling lingers.
+const findJsonlBySid = (projectsRoot: string, sid: string): string | undefined => {
+  const sidFile = `${sid}.jsonl`;
+  try {
+    return readdirSync(projectsRoot)
+      .flatMap((d) => {
+        const p = join(projectsRoot, d, sidFile);
+        try { return [{ p, m: statSync(p).mtimeMs }]; } catch { return []; }
+      })
+      .sort((a, b) => b.m - a.m)[0]?.p;
+  } catch {
+    return undefined;
+  }
+};
+
 const resolveSession = (cfg: Config, log: Logger): ResolvedSession | undefined => {
   const cwd = expandHome(cfg.wrc.cwd);
   const projectDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(cwd));
@@ -521,7 +541,35 @@ interface TailHandle {
 }
 
 export const startMirrorTail = (deps: TailDeps): TailHandle => {
-  const { jsonlPath, log } = deps;
+  const { log } = deps;
+
+  // A single logical tail follows ONE sessionId whose transcript file may move
+  // between sibling project dirs — Claude Code's EnterWorktree/ExitWorktree
+  // rename <sid>.jsonl into/out of <cwd>/.claude/worktrees/<name>, each cwd
+  // encoding to its own project dir. We keep a candidate path list (seeded with
+  // the attach-time path, grown lazily by sid on first miss) and ONE shared
+  // offset. Because the move is a rename (byte prefix preserved), the offset
+  // stays continuous across enter→work→exit: no re-dump, no missed lines, and
+  // switching back to the original path just resumes on the same offset.
+  const projectsRoot = dirname(dirname(deps.jsonlPath));
+  const candidates: string[] = [deps.jsonlPath];
+
+  // Newest-mtime candidate that currently exists (the move can briefly leave a
+  // stale sibling behind under copy-then-delete semantics; the destination wins).
+  const existing = (): string | undefined =>
+    candidates
+      .flatMap((p) => { try { return [{ p, m: statSync(p).mtimeMs }]; } catch { return []; } })
+      .sort((a, b) => b.m - a.m)[0]?.p;
+
+  // Live path: a known candidate if one exists; else the file relocated — find
+  // it by sid and cache so subsequent round-trips are a pure stat pick (no rescan).
+  const resolveLive = (): string | undefined => {
+    const known = existing();
+    if (known) return known;
+    const found = findJsonlBySid(projectsRoot, deps.sessionId);
+    if (found && !candidates.includes(found)) candidates.push(found);
+    return existing();
+  };
 
   // Start at EOF — don't re-emit history. File may not exist yet (auto-spawn
   // path: claude doesn't create the jsonl until it processes the first input);
@@ -530,12 +578,31 @@ export const startMirrorTail = (deps: TailDeps): TailHandle => {
   // already-written user line + any early assistant lines from offset 0).
   let offset = deps.startOffset !== undefined
     ? deps.startOffset
-    : existsSync(jsonlPath) ? statSync(jsonlPath).size : 0;
+    : (() => { const p = resolveLive(); return p ? statSync(p).size : 0; })();
   let buffer = "";
   let stopped = false;
 
+  // fs.watch binds one path; re-arm it on the live path whenever the file
+  // relocates. The 1s poll is the correctness floor either way.
+  let watcher: FSWatcher | undefined;
+  let watchedPath = "";
+  const armWatch = (path: string): void => {
+    if (path === watchedPath) return;
+    watcher?.close();
+    watchedPath = path;
+    try {
+      watcher = watch(path, { persistent: false }, () => drain());
+    } catch (e) {
+      watcher = undefined;
+      log.warn({ err: (e as Error).message }, "fs.watch failed; relying on poll");
+    }
+  };
+
   const drain = (): void => {
     if (stopped) return;
+    const jsonlPath = resolveLive();
+    if (!jsonlPath) return;
+    armWatch(jsonlPath);
     let size: number;
     try {
       size = statSync(jsonlPath).size;
@@ -568,17 +635,11 @@ export const startMirrorTail = (deps: TailDeps): TailHandle => {
     }
   };
 
-  // fs.watch fires on append on macOS/Linux. We also poll on a slow timer as
-  // belt-and-suspenders for editors/filesystems that drop events.
-  let watcher: FSWatcher | undefined;
-  try {
-    watcher = watch(jsonlPath, { persistent: false }, () => drain());
-  } catch (e) {
-    log.warn({ err: (e as Error).message }, "fs.watch failed; relying on poll");
-  }
+  const live0 = resolveLive();
+  if (live0) armWatch(live0);
   const poll = setInterval(drain, 1000);
 
-  log.info({ jsonlPath, startOffset: offset }, "mirror tail started");
+  log.info({ jsonlPath: deps.jsonlPath, startOffset: offset }, "mirror tail started");
 
   return {
     stop: () => {
@@ -1821,23 +1882,38 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (!rec) return undefined;
     let jsonlAbs = expandHome(rec.jsonlPath);
     if (!existsSync(jsonlAbs)) {
-      // Recorded session rotated out from under us — a `/clear` or native `/new`
-      // the daemon didn't record (e.g. it restarted while the /clear migration
-      // watcher was still open). The rotation left a newer jsonl in the same
-      // project dir; heal onto it instead of dropping the binding, else the
-      // chat silently loses all further responses. Fail-closed drop only when
-      // the project dir is truly empty.
-      const healed = latestJsonlForCwd(cfg, rec.cwd || cfg.wrc.cwd);
-      if (!healed) {
-        log.warn({ principal, jsonlPath: rec.jsonlPath }, "mirror restore: jsonl missing and no sibling, dropping entry");
-        deps.store.drop(principal);
-        return undefined;
+      // First: the SAME-sid transcript may have merely relocated to a sibling
+      // project dir (Claude Code EnterWorktree/ExitWorktree moved it while the
+      // daemon was down). Re-home onto it WITHOUT changing the sessionId — the
+      // tail then follows it natively. Must precede the latestJsonlForCwd heal,
+      // which would otherwise grab whatever session is newest in the original
+      // cwd's dir (usually a *different* chat) and cross-wire the mirror.
+      const projectsRoot = expandHome(cfg.wrc.mirror.projectsDir);
+      const relocated = findJsonlBySid(projectsRoot, rec.sessionId);
+      if (relocated) {
+        log.info({ principal, sessionId: rec.sessionId, from: rec.jsonlPath, to: relocated }, "mirror restore: sid relocated (worktree), re-homed");
+        rec.jsonlPath = relocated;
+        jsonlAbs = relocated;
+        deps.store.set(principal, rec);
+      } else {
+        // Recorded session rotated out from under us — a `/clear` or native `/new`
+        // the daemon didn't record (e.g. it restarted while the /clear migration
+        // watcher was still open). The rotation left a newer jsonl in the same
+        // project dir; heal onto it instead of dropping the binding, else the
+        // chat silently loses all further responses. Fail-closed drop only when
+        // the project dir is truly empty.
+        const healed = latestJsonlForCwd(cfg, rec.cwd || cfg.wrc.cwd);
+        if (!healed) {
+          log.warn({ principal, jsonlPath: rec.jsonlPath }, "mirror restore: jsonl missing and no sibling, dropping entry");
+          deps.store.drop(principal);
+          return undefined;
+        }
+        log.warn({ principal, from: rec.sessionId, to: healed.sessionId }, "mirror restore: recorded jsonl gone, healed to latest in project dir");
+        rec.sessionId = healed.sessionId;
+        rec.jsonlPath = healed.jsonlPath;
+        jsonlAbs = healed.jsonlPath;
+        deps.store.set(principal, rec);
       }
-      log.warn({ principal, from: rec.sessionId, to: healed.sessionId }, "mirror restore: recorded jsonl gone, healed to latest in project dir");
-      rec.sessionId = healed.sessionId;
-      rec.jsonlPath = healed.jsonlPath;
-      jsonlAbs = healed.jsonlPath;
-      deps.store.set(principal, rec);
     }
     // Prefer the stored pane id and validate via display-message. Pane ids
     // (`%N`) are monotonic per tmux server lifetime, so they're stable across
