@@ -117,6 +117,42 @@ const findJsonlBySid = (projectsRoot: string, sid: string): string | undefined =
   }
 };
 
+// True if `path` holds at least one real (non-meta, non-sidechain) user line —
+// i.e. it's a live session, not an empty just-touched jsonl. Bounded head read.
+const jsonlHasUserLine = (path: string): boolean => {
+  try {
+    const size = statSync(path).size;
+    const cap = Math.min(size, 256 * 1024);
+    const fd = openSync(path, "r");
+    const buf = Buffer.alloc(cap);
+    readSync(fd, buf, 0, cap, 0);
+    closeSync(fd);
+    for (const line of buf.toString("utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const j = JSON.parse(line) as TranscriptLine;
+        if (j.type === "user" && !j.isMeta && !j.isSidechain) return true;
+      } catch { /* partial line */ }
+    }
+  } catch { /* unreadable */ }
+  return false;
+};
+
+// Newest-mtime *.jsonl WITH user content in cwd's encoded project dir. The
+// content gate skips an empty just-touched file so we bind the real session.
+// Reliable for worktree dirs (one session lives there); restore + the drift
+// follower only consult it on cross-dir moves, where that assumption holds.
+const liveSessionForCwd = (projectsDir: string, cwd: string): ResolvedSession | undefined => {
+  const dir = join(projectsDir, encodeProjectDir(expandHome(cwd)));
+  let names: string[];
+  try { names = readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { return undefined; }
+  const ranked = names
+    .flatMap((n) => { const p = join(dir, n); try { return [{ p, sid: n.replace(/\.jsonl$/, ""), m: statSync(p).mtimeMs }]; } catch { return []; } })
+    .sort((a, b) => b.m - a.m);
+  for (const c of ranked) if (jsonlHasUserLine(c.p)) return { sessionId: c.sid, jsonlPath: c.p };
+  return undefined;
+};
+
 const resolveSession = (cfg: Config, log: Logger): ResolvedSession | undefined => {
   const cwd = expandHome(cfg.wrc.cwd);
   const projectDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(cwd));
@@ -1924,6 +1960,35 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // dispatch's respawn check reincarnate via `claude --resume <sid>`.
     const storedPane = (rec.tmuxPane ?? "").trim();
     const livePane = storedPane && (await tmuxPaneAlive(storedPane)) ? storedPane : "";
+
+    // Pane-cwd worktree re-home: the stored jsonl can EXIST yet be stale because
+    // the live pane entered/selected a git worktree, switching it to a DIFFERENT
+    // sessionId in a sibling project dir. Trust the pane's real cwd — if its
+    // project dir differs and holds a live session under another sid, bind that.
+    // Without this, two chats whose panes diverged into worktrees but still
+    // carry the old shared sid collide in bySessionId (attach → replace) and one
+    // is silently detached; that detached chat then never mirrors again. Runs at
+    // boot; the 3s drift follower maintains it thereafter.
+    if (livePane) {
+      const cwdRes = await tmuxRun(["display-message", "-p", "-t", livePane, "#{pane_current_path}"]);
+      const paneCwd = cwdRes.stdout.trim();
+      if (paneCwd) {
+        const projectsRoot = expandHome(cfg.wrc.mirror.projectsDir);
+        const paneDir = join(projectsRoot, encodeProjectDir(expandHome(paneCwd)));
+        if (paneDir !== dirname(jsonlAbs)) {
+          const live = liveSessionForCwd(projectsRoot, paneCwd);
+          if (live && live.sessionId !== rec.sessionId) {
+            log.info({ principal, from: rec.sessionId, to: live.sessionId, paneCwd }, "mirror restore: pane in worktree, re-homed to live session");
+            rec.sessionId = live.sessionId;
+            rec.jsonlPath = live.jsonlPath;
+            jsonlAbs = live.jsonlPath;
+            rec.cwd = expandHome(paneCwd);
+            deps.store.set(principal, rec);
+          }
+        }
+      }
+    }
+
     const r = attach({
       sessionId: rec.sessionId,
       jsonlPath: jsonlAbs,
@@ -2160,6 +2225,54 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     log.info({ target: a.target, sessionId: a.sessionId, projectDir, baselineCount: baseline.size }, "mirror migration: watcher armed");
     timer = setTimeout(tick, POLL_MS);
   };
+
+  // ── Worktree / session drift follow ─────────────────────────────────
+  // An inject isn't the only way the live session under a pane changes:
+  // entering OR selecting a git worktree makes Claude Code switch the pane to a
+  // DIFFERENT sessionId in a sibling project dir (the worktree cwd encodes to
+  // its own dir). That's neither a same-sid rename (findJsonlBySid follows those
+  // with a continuous offset) nor an inject-triggered rotation (startMigration-
+  // Watcher catches those) — the old jsonl just goes quiet and the mirror tails
+  // a dead file. Poll each attached pane's real cwd; when it points at a
+  // different project dir whose live session has a different sid, migrate onto
+  // it. Tail from EOF (undefined startOffset): the worktree session already
+  // carries full history we don't want to re-dump to WeCom.
+  const projectsRootDir = expandHome(cfg.wrc.mirror.projectsDir);
+
+  let paneDriftTicking = false;
+  const followPaneDrift = async (): Promise<void> => {
+    if (paneDriftTicking) return; // skip overlapping ticks (tmux call is async)
+    paneDriftTicking = true;
+    try {
+      const attachments = Array.from(byTarget.values()).filter((a) => a.tmuxPane);
+      if (attachments.length === 0) return;
+      const r = await tmuxRun(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_current_path}"]);
+      if (r.code !== 0) return;
+      const paneCwd = new Map<string, string>();
+      for (const line of r.stdout.split("\n")) {
+        const tab = line.indexOf("\t");
+        if (tab !== -1) paneCwd.set(line.slice(0, tab).trim(), line.slice(tab + 1).trim());
+      }
+      for (const a of attachments) {
+        if (a.migrationWatcher) continue;                    // inject-driven migration in flight
+        if (a.liveStream && !a.liveStream.closed) continue;  // mid typewriter — don't yank the tail
+        const cwd = paneCwd.get(a.tmuxPane);
+        if (!cwd) continue;                                   // pane gone
+        const paneDir = join(projectsRootDir, encodeProjectDir(expandHome(cwd)));
+        if (paneDir === dirname(a.jsonlPath)) continue;       // same project dir — no drift
+        const live = liveSessionForCwd(projectsRootDir, cwd);
+        if (!live || live.sessionId === a.sessionId) continue; // empty dir, or same-sid rename (tail follows it)
+        a.runningCwd = expandHome(cwd);                        // migrateAttachment persists this to store
+        log.info({ target: a.target, pane: a.tmuxPane, fromDir: dirname(a.jsonlPath), toDir: paneDir, oldSid: a.sessionId, newSid: live.sessionId }, "mirror: pane drifted (worktree), following live session");
+        migrateAttachment(a, live.sessionId, live.jsonlPath);
+      }
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "pane-drift follow tick failed");
+    } finally {
+      paneDriftTicking = false;
+    }
+  };
+  const paneDriftTimer = setInterval(() => void followPaneDrift(), 3000);
 
   // ── Cwd lifecycle ───────────────────────────────────────────────────
   // Per-chat project path. Stored on the attachment (live) and persisted to
@@ -2462,6 +2575,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     setPendingCwd,
     newSession,
     shutdown: () => {
+      clearInterval(paneDriftTimer);
       for (const a of bySessionId.values()) {
         if (a.outbound?.kind === "deferred") clearTimeout(a.outbound.timer);
         a.outbound = undefined;
