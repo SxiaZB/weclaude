@@ -250,46 +250,13 @@ export const computeUsage = (): UsageReport => {
   return { now, todayStart, today, weekStart, week, active };
 };
 
-export const fmtTokens = (n: number): string => {
+const fmtTokens = (n: number): string => {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
 };
 
-export const fmtCost = (usd: number): string => (usd >= 0.005 ? `$${usd.toFixed(2)}` : "—");
-
-export interface SessionCost {
-  sessionId: string;
-  totalTokens: number;
-  totalCost: number;
-  byModel: Array<{ model: string; tokens: number; cost: number }>;
-}
-
-// Cost/token rollup for a SINGLE session's jsonl (whole history, no time gate).
-// Dedup within the file the same way computeUsage does (message.id|requestId),
-// so `--resume`-copied parent turns aren't double-counted. Same pricing as the
-// block/day readout — this is the "Session · Total cost" the /usage TUI shows,
-// computed locally from real token counts.
-export const computeSessionCost = (jsonlPath: string): SessionCost => {
-  const seen = new Set<string>();
-  const acc = new Map<string, ModelTotals>();
-  for (const e of readUsageEntries(jsonlPath, 0)) {
-    if (seen.has(e.dedupKey)) continue;
-    seen.add(e.dedupKey);
-    const t = acc.get(e.model) ?? emptyTotals();
-    addInto(t, e.tokens);
-    acc.set(e.model, t);
-  }
-  const byModel = Array.from(acc.entries())
-    .map(([model, t]) => ({ model, tokens: sumTotal(t), cost: costOf(model, t) }))
-    .sort((a, b) => b.tokens - a.tokens);
-  return {
-    sessionId: jsonlPath.replace(/^.*\//, "").replace(/\.jsonl$/, ""),
-    totalTokens: byModel.reduce((s, m) => s + m.tokens, 0),
-    totalCost: byModel.reduce((s, m) => s + m.cost, 0),
-    byModel,
-  };
-};
+const fmtCost = (usd: number): string => (usd >= 0.005 ? `$${usd.toFixed(2)}` : "—");
 
 const fmtDuration = (ms: number): string => {
   if (ms <= 0) return "0m";

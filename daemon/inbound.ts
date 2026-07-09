@@ -11,7 +11,7 @@ import { expandHome, sanitizeId } from "../shared/paths.js";
 import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim } from "./claim.js";
 import { getLastResponse } from "./last-response.js";
 import { scanClaudeSessions, type SessionInfo } from "./session-scan.js";
-import { computeUsage, renderUsageReport, computeSessionCost } from "./usage.js";
+import { computeUsage, renderUsageReport } from "./usage.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
 import {
   parseSubscribe,
@@ -72,15 +72,6 @@ const isPwdCommand = (text: string): boolean => text.trim() === "/pwd";
 const isCcusageCommand = (text: string): boolean => text.trim() === "/ccusage";
 const isNewCommand = (text: string): boolean => text.trim() === "/new";
 const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
-
-// The jsonl of the Claude session currently mirrored to `who` (undefined in
-// headless mode or when the chat has no attachment) — lets /usage report the
-// caller's real session cost.
-const callerJsonl = (bridge: Bridge | MirrorBridge, who: string): string | undefined => {
-  try {
-    return (bridge as MirrorBridge).status?.().mirrors?.find((m) => m.target === who)?.jsonlPath;
-  } catch { return undefined; }
-};
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 
 // /session(s) [arg] — list live Claude sessions, or switch the mirror to one.
@@ -426,21 +417,16 @@ export const installInboundRouter = (
       } catch { /* ignore */ }
       return { stop: true, who };
     }
-    // Authorized `/usage` — real subscription rate-limit % + session cost,
-    // scraped from Claude Code's own `/usage` TUI (/ccusage can only estimate
-    // cost/tokens; the true limit % is server-side). Drives a throwaway isolated
-    // pane (~10s) → interim ack, then replace with the result. Session cost is
-    // computed locally from THIS chat's mirrored session jsonl (real tokens).
+    // Authorized `/usage` — real subscription rate-limit %, scraped from Claude
+    // Code's own `/usage` TUI (/ccusage can only estimate cost/tokens; the true
+    // limit % is server-side). Drives a throwaway isolated pane (~10s) → interim
+    // ack, then replace with the result.
     if (isUsageCommand(text)) {
       log.info({ who }, "/usage panel: start");
       try { await client.replyStream(frame, msg.msgid, "⏳ 正在拉起 /usage 面板查询真实额度…", false); } catch (e) { log.warn({ err: (e as Error).message }, "/usage: interim ack failed"); }
       let body: string;
       try {
         const report = await captureQuota(cfg, log);
-        const jsonlPath = callerJsonl(bridge, who);
-        if (jsonlPath) {
-          try { report.sessionCost = computeSessionCost(jsonlPath); } catch { /* best-effort */ }
-        }
         body = renderQuotaReport(report);
         log.info({ who, limits: report.limits.length }, "/usage panel: done");
       } catch (e) {

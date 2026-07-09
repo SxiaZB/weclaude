@@ -13,7 +13,6 @@ import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import { expandHome } from "../shared/paths.js";
 import { runTmux, trustWorkspace } from "./spawn-tmux.js";
-import { fmtTokens, fmtCost, type SessionCost } from "./usage.js";
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -29,7 +28,6 @@ export interface LimitRow {
 export interface QuotaReport {
   limits: LimitRow[];
   factors: string[]; // "What's contributing to your limits usage" headlines
-  sessionCost?: SessionCost; // filled by the caller from its own session jsonl
   raw?: string; // cleaned panel text, kept for the failure path
 }
 
@@ -165,8 +163,6 @@ const headingFor = (label: string): string => {
   return `📊 ${label}`;
 };
 
-const shortModel = (m: string): string => m.replace(/^claude-/, "");
-
 export const renderQuotaReport = (r: QuotaReport): string => {
   const out: string[] = ["[weclaude] 📊 真实额度 · Claude Code /usage"];
 
@@ -177,15 +173,6 @@ export const renderQuotaReport = (r: QuotaReport): string => {
   if (r.limits.length === 0) {
     out.push("", "⚠️ 未能从 /usage 面板读到额度数字");
     if (r.raw) out.push("```", r.raw.split("\n").filter((l) => l.trim()).slice(0, 12).join("\n"), "```");
-  }
-
-  const sc = r.sessionCost;
-  if (sc && sc.totalTokens > 0) {
-    out.push("", `💰 本会话成本 \`${sc.sessionId.slice(0, 8)}\``);
-    for (const m of sc.byModel.slice(0, 4)) {
-      out.push(`  \`${shortModel(m.model)}\` ${fmtTokens(m.tokens)} tok · ${fmtCost(m.cost)}`);
-    }
-    out.push(`  合计: **${fmtTokens(sc.totalTokens)}** tok · ${fmtCost(sc.totalCost)}`);
   }
 
   if (r.factors.length) {
