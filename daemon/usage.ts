@@ -1,0 +1,315 @@
+// Read Claude Code transcripts (~/.claude(-internal)?/projects/**/*.jsonl) and
+// aggregate token usage into (a) today's totals and (b) the currently-active
+// 5-hour billing block. Matches ccusage's algorithm without pulling ccusage's
+// heavy dep graph or paying npx's 28s cold start.
+//
+// Block model: Anthropic's rate-limit windows are 5h. First assistant message
+// anchors block startTs to floor-of-hour; block ends 5h later. A gap of >5h
+// since last activity starts a new block on the next message.
+import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
+interface ModelTotals {
+  input: number;
+  output: number;
+  cacheCreate: number;
+  cacheRead: number;
+}
+
+const emptyTotals = (): ModelTotals => ({ input: 0, output: 0, cacheCreate: 0, cacheRead: 0 });
+
+const addInto = (a: ModelTotals, b: ModelTotals): void => {
+  a.input += b.input;
+  a.output += b.output;
+  a.cacheCreate += b.cacheCreate;
+  a.cacheRead += b.cacheRead;
+};
+
+const sumTotal = (t: ModelTotals): number => t.input + t.output + t.cacheCreate + t.cacheRead;
+
+interface UsageEntry {
+  ts: number;
+  model: string;
+  tokens: ModelTotals;
+  dedupKey: string;
+}
+
+export interface BlockUsage {
+  startTs: number;
+  endTs: number;
+  lastTs: number;
+  isActive: boolean;
+  byModel: Map<string, ModelTotals>;
+}
+
+const PROJECT_ROOTS = [
+  join(homedir(), ".claude-internal", "projects"),
+  join(homedir(), ".claude", "projects"),
+];
+
+const HOUR_MS = 60 * 60 * 1000;
+const BLOCK_MS = 5 * HOUR_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+// Rough per-model pricing (USD per 1M tokens). Kept intentionally small — only
+// covers the models likely to show up on weclaude users' machines. Unknown
+// models fall back to 0 (token counts still shown, just no cost line).
+// Prices derived from ccusage's LiteLLM pricing at time of writing (Opus 4.7,
+// Sonnet 4.6, Haiku 4.5). Drift over time is expected — accuracy here matters
+// less than order-of-magnitude for the burn-rate readout.
+interface Price { in: number; out: number; cacheWrite: number; cacheRead: number; }
+const PRICES: Array<{ match: RegExp; price: Price }> = [
+  { match: /opus/i, price: { in: 5, out: 25, cacheWrite: 6.25, cacheRead: 0.5 } },
+  { match: /sonnet/i, price: { in: 3, out: 15, cacheWrite: 3.75, cacheRead: 0.3 } },
+  { match: /haiku/i, price: { in: 1, out: 5, cacheWrite: 1.25, cacheRead: 0.1 } },
+];
+
+const priceFor = (model: string): Price | undefined =>
+  PRICES.find((p) => p.match.test(model))?.price;
+
+const costOf = (model: string, t: ModelTotals): number => {
+  const p = priceFor(model);
+  if (!p) return 0;
+  return (
+    (t.input * p.in + t.output * p.out + t.cacheCreate * p.cacheWrite + t.cacheRead * p.cacheRead) /
+    1_000_000
+  );
+};
+
+const walkJsonl = (root: string, sinceMs: number, out: string[]): void => {
+  let subs: import("node:fs").Dirent[];
+  try {
+    subs = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const d of subs) {
+    if (!d.isDirectory()) continue;
+    const dir = join(root, d.name);
+    let files: string[];
+    try {
+      files = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!f.endsWith(".jsonl")) continue;
+      const p = join(dir, f);
+      try {
+        const st = statSync(p);
+        if (st.mtimeMs < sinceMs) continue;
+        out.push(p);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+};
+
+// Parse a jsonl file and yield assistant usage entries with ts >= sinceMs.
+// Skips synthetic error messages (model=<synthetic>) and rows without usage.
+const readUsageEntries = (path: string, sinceMs: number): UsageEntry[] => {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return [];
+  }
+  const out: UsageEntry[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    // Fast reject: rows without usage never match.
+    if (line.indexOf("\"usage\"") < 0) continue;
+    let row: Record<string, unknown>;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (row.type !== "assistant") continue;
+    const ts = Date.parse(String(row.timestamp ?? ""));
+    if (!Number.isFinite(ts) || ts < sinceMs) continue;
+    const msg = (row.message ?? {}) as Record<string, unknown>;
+    const model = String(msg.model ?? "");
+    if (!model || model === "<synthetic>") continue;
+    const u = (msg.usage ?? {}) as Record<string, unknown>;
+    const input = Number(u.input_tokens ?? 0);
+    const output = Number(u.output_tokens ?? 0);
+    const cacheCreate = Number(u.cache_creation_input_tokens ?? 0);
+    const cacheRead = Number(u.cache_read_input_tokens ?? 0);
+    if (input + output + cacheCreate + cacheRead === 0) continue;
+    // Dedup: `--resume` copies the parent transcript into the new session's
+    // jsonl, so every historical message would otherwise count many times.
+    // ccusage keys on `message.id + requestId`; we do the same. Fall back to
+    // `uuid` for older rows that lack message.id.
+    const msgId = String(msg.id ?? "");
+    const reqId = String(row.requestId ?? "");
+    const dedupKey = msgId ? `${msgId}|${reqId}` : String(row.uuid ?? "");
+    if (!dedupKey) continue;
+    out.push({ ts, model, tokens: { input, output, cacheCreate, cacheRead }, dedupKey });
+  }
+  return out;
+};
+
+// Group sorted entries into 5h billing blocks (matches ccusage semantics):
+// startTs = floor-of-hour of first entry; endTs = startTs + 5h; a >5h idle gap
+// since lastTs forces a new block.
+const groupBlocks = (entries: UsageEntry[]): BlockUsage[] => {
+  const blocks: BlockUsage[] = [];
+  const now = Date.now();
+  for (const e of entries) {
+    const cur = blocks[blocks.length - 1];
+    const shouldStart =
+      !cur || e.ts >= cur.endTs || e.ts - cur.lastTs >= BLOCK_MS;
+    if (shouldStart) {
+      const startTs = Math.floor(e.ts / HOUR_MS) * HOUR_MS;
+      blocks.push({
+        startTs,
+        endTs: startTs + BLOCK_MS,
+        lastTs: e.ts,
+        isActive: false,
+        byModel: new Map(),
+      });
+    }
+    const b = blocks[blocks.length - 1]!;
+    b.lastTs = e.ts;
+    const bucket = b.byModel.get(e.model) ?? emptyTotals();
+    addInto(bucket, e.tokens);
+    b.byModel.set(e.model, bucket);
+  }
+  for (const b of blocks) {
+    b.isActive = now < b.endTs && now - b.lastTs < BLOCK_MS;
+  }
+  return blocks;
+};
+
+const startOfLocalDay = (ts: number): number => {
+  const d = new Date(ts);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+};
+
+export interface UsageReport {
+  now: number;
+  todayStart: number;
+  today: Map<string, ModelTotals>;
+  active?: BlockUsage;
+}
+
+// Public entry point. Scans jsonl mtime'd within the last ~30h (covers today +
+// any in-flight 5h block that started late yesterday), parses usage rows, and
+// returns (a) today's aggregates and (b) the active block if any.
+export const computeUsage = (): UsageReport => {
+  const now = Date.now();
+  const todayStart = startOfLocalDay(now);
+  const scanSince = todayStart - DAY_MS; // one full day back covers active block
+  const files: string[] = [];
+  for (const root of PROJECT_ROOTS) {
+    if (existsSync(root)) walkJsonl(root, scanSince, files);
+  }
+  const entries: UsageEntry[] = [];
+  for (const f of files) entries.push(...readUsageEntries(f, scanSince));
+  entries.sort((a, b) => a.ts - b.ts);
+  // Dedup after sort so we keep the earliest occurrence (matches ccusage — the
+  // first jsonl that carried a message is where the actual work happened).
+  const seen = new Set<string>();
+  const dedup: UsageEntry[] = [];
+  for (const e of entries) {
+    if (seen.has(e.dedupKey)) continue;
+    seen.add(e.dedupKey);
+    dedup.push(e);
+  }
+  const blocks = groupBlocks(dedup);
+  const active = blocks.find((b) => b.isActive);
+  const today = new Map<string, ModelTotals>();
+  for (const e of dedup) {
+    if (e.ts < todayStart) continue;
+    const t = today.get(e.model) ?? emptyTotals();
+    addInto(t, e.tokens);
+    today.set(e.model, t);
+  }
+  return { now, todayStart, today, active };
+};
+
+const fmtTokens = (n: number): string => {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+};
+
+const fmtCost = (usd: number): string => (usd >= 0.005 ? `$${usd.toFixed(2)}` : "—");
+
+const fmtDuration = (ms: number): string => {
+  if (ms <= 0) return "0m";
+  const h = Math.floor(ms / HOUR_MS);
+  const m = Math.floor((ms % HOUR_MS) / (60 * 1000));
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+};
+
+const pad2 = (n: number): string => String(n).padStart(2, "0");
+const fmtHHMM = (ts: number): string => {
+  const d = new Date(ts);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+};
+
+const renderModelLines = (byModel: Map<string, ModelTotals>): { lines: string[]; totalTokens: number; totalCost: number } => {
+  let totalTokens = 0;
+  let totalCost = 0;
+  const lines: string[] = [];
+  const sorted = Array.from(byModel.entries()).sort(
+    (a, b) => sumTotal(b[1]) - sumTotal(a[1]),
+  );
+  for (const [model, t] of sorted) {
+    const sum = sumTotal(t);
+    const cost = costOf(model, t);
+    totalTokens += sum;
+    totalCost += cost;
+    const short = model.replace(/^claude-/, "");
+    lines.push(
+      `  \`${short}\` in ${fmtTokens(t.input)} / out ${fmtTokens(t.output)} / cache ${fmtTokens(t.cacheRead + t.cacheCreate)}`,
+    );
+  }
+  return { lines, totalTokens, totalCost };
+};
+
+const fmtLocalDate = (ts: number): string => {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+};
+
+export const renderUsageReport = (r: UsageReport): string => {
+  const out: string[] = ["[weclaude] 📊 Usage 概览"];
+
+  if (r.active) {
+    const b = r.active;
+    const remaining = Math.max(0, b.endTs - r.now);
+    const elapsed = Math.max(0, r.now - b.startTs);
+    const { lines, totalTokens, totalCost } = renderModelLines(b.byModel);
+    out.push(
+      "",
+      `⏰ 当前 5h 计费块 (${fmtHHMM(b.startTs)} → ${fmtHHMM(b.endTs)}, 剩余 ${fmtDuration(remaining)})`,
+    );
+    out.push(...lines);
+    out.push(`  合计: **${fmtTokens(totalTokens)}** tokens · ${fmtCost(totalCost)}`);
+    if (elapsed > 60_000 && totalCost > 0) {
+      const perHour = (totalCost / elapsed) * HOUR_MS;
+      const projected = perHour * (BLOCK_MS / HOUR_MS);
+      out.push(`  燃烧速率: ${fmtCost(perHour)}/h · 预计块末 ${fmtCost(projected)}`);
+    }
+  } else {
+    out.push("", "⏰ 当前无活跃 5h 计费块");
+  }
+
+  const dayLabel = fmtLocalDate(r.todayStart);
+  if (r.today.size > 0) {
+    const { lines, totalTokens, totalCost } = renderModelLines(r.today);
+    out.push("", `📅 今日累计 (${dayLabel})`);
+    out.push(...lines);
+    out.push(`  合计: **${fmtTokens(totalTokens)}** tokens · ${fmtCost(totalCost)}`);
+  } else {
+    out.push("", `📅 今日累计 (${dayLabel}): 无`);
+  }
+
+  return out.join("\n");
+};

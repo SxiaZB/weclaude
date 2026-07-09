@@ -11,6 +11,7 @@ import { expandHome, sanitizeId } from "../shared/paths.js";
 import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim } from "./claim.js";
 import { getLastResponse } from "./last-response.js";
 import { scanClaudeSessions, type SessionInfo } from "./session-scan.js";
+import { computeUsage, renderUsageReport } from "./usage.js";
 import {
   parseSubscribe,
   parseUnsubscribe,
@@ -67,6 +68,7 @@ const renderIds = (msg: BaseMessage, cfg: Config): string => {
 
 const isIdCommand = (text: string): boolean => text.trim() === "/id";
 const isPwdCommand = (text: string): boolean => text.trim() === "/pwd";
+const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
 const isNewCommand = (text: string): boolean => text.trim() === "/new";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 
@@ -347,6 +349,19 @@ export const installInboundRouter = (
     // /pwd — bypass allowFrom too. Read-only project-path lookup.
     if (isPwdCommand(text)) {
       try { await client.replyStream(frame, msg.msgid, renderPwd(who), true); } catch { /* ignore */ }
+      return { stop: true, who };
+    }
+    // /usage — token / cost snapshot pulled from ~/.claude(-internal)?/projects
+    // jsonl transcripts. Read-only, no session state, so it bypasses allowFrom
+    // like /id and /pwd.
+    if (isUsageCommand(text)) {
+      let body: string;
+      try {
+        body = renderUsageReport(computeUsage());
+      } catch (e) {
+        body = `[weclaude] /usage failed: ${(e as Error).message}`;
+      }
+      try { await client.replyStream(frame, msg.msgid, body, true); } catch { /* ignore */ }
       return { stop: true, who };
     }
     if (tryConsumeClaim(text, who)) {
