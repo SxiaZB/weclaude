@@ -743,6 +743,9 @@ interface AskqHandleArgs {
   body: ApproveReq;
   getMirrorTarget?: (sessionId: string) => string | undefined;
   flushBeforeCard?: (sessionId: string, expect?: { toolName: string; toolInput: unknown }) => Promise<void>;
+  /** Resolves when the hook's HTTP connection dies before we respond
+   *  (CC 按 timeout 杀 hook / curl --max-time / CC 重启) — 发卡循环的中止信号。 */
+  clientGone?: Promise<"client_gone">;
 }
 
 type AskqAnswer =
@@ -768,7 +771,7 @@ const interpretAskqRaw = (raw: string, q: AskqQuestion): AskqAnswer => {
 
 // 多问题: 逐题顺序发卡 → 收答 → 下一题。任一题选「CLI」整体转 CLI,选「聊聊」
 // 整体转讨论; 全部答完合并成单个 deny+reason 注入。卡不会一次性轰炸 N 张。
-const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, flushBeforeCard }: AskqHandleArgs): Promise<ApproveResp> => {
+const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, flushBeforeCard, clientGone }: AskqHandleArgs): Promise<ApproveResp> => {
   const questions = parseAskqInput(body.tool_input);
   if (!questions || questions.length === 0) return { decision: "ask", reason: "askq_unparsable" };
   if (questions.some((q) => q.options.length === 0)) return { decision: "ask", reason: "askq_no_options" };
@@ -781,9 +784,19 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
   const longPollMs = cfg.approval.longPollSec * 1000;
   const total = questions.length;
   const answers: string[] = [];
+  const flowStart = Date.now();
+  // hook 客户端断开后整个流程只是往死管道灌数据 — 记标志, 循环内 race、
+  // 循环后回执都以它止血。正常完成时 clientGone 永不 resolve, 无副作用。
+  let gone = false;
+  void clientGone?.then(() => { gone = true; });
 
   for (let i = 0; i < total; i++) {
     const q = questions[i]!;
+    // 剩余预算: N 题共享一份 longPollSec。若每题都给整份, 多题总时长上限是
+    // N×longPollSec, 必然越过 hook curl 的 --max-time (longPollSec+10s),
+    // 之后的答案全部写进死 socket。预算耗尽 → ask, CC 弹本地 picker 兜底。
+    const remainMs = longPollMs - (Date.now() - flowStart);
+    if (remainMs < 10_000) return { decision: "ask", reason: "askq_timeout" };
     // 每题独立 pending: meta.toolInput 只塞本题(包成单题 wrapper),click 事件
     // listener 里的 parseAskqInput(meta.toolInput)?.[0] 渲染的就是当前题 — 监听
     // 侧零改动。transcriptTail 一并存进 meta, resolved 卡复用同一份 source。
@@ -797,7 +810,7 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
         sessionId: body.session_id,
         transcriptTail: body.transcript_tail ?? "",
       },
-      timeoutMs: longPollMs,
+      timeoutMs: remainMs,
     });
 
     const prefix = total > 1 ? `(${i + 1}/${total}) ` : "";
@@ -830,9 +843,22 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
 
     let raw: string;
     try {
-      raw = (await promise) as unknown as string;
+      const racers: Promise<string>[] = [promise as unknown as Promise<string>];
+      if (clientGone) racers.push(clientGone);
+      raw = await Promise.race(racers);
     } catch {
       return { decision: "ask", reason: "askq_timeout" };
+    }
+    if (raw === "client_gone") {
+      resolvePending(reqId, "deny"); // 释放 pending 槽, 这张卡的后续点击变 no-op
+      log.warn({ reqId, idx: i, total }, "askq client gone — flow aborted");
+      try {
+        await client.sendMessage(target, {
+          msgtype: "markdown",
+          markdown: { content: "⚠️ CLI 侧连接已断开，本轮问题卡已失效，请回到 CLI 处理。" },
+        });
+      } catch { /* best-effort */ }
+      return { decision: "ask", reason: "askq_client_gone" };
     }
 
     const ans = interpretAskqRaw(raw, q);
@@ -852,13 +878,16 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
     : `User answered ${total} questions via WeCom — ${answers.join("; ")}`;
   // 答完最后一题后 model 进入不可见的长 thinking (隐藏式 thinking 不下发,
   // WeCom 端全静默,极易被当成"卡住")。推一条回执确认答案已落地。失败不阻断。
-  try {
-    await client.sendMessage(target, {
-      msgtype: "markdown",
-      markdown: { content: total === 1 ? "✅ 已回传，Claude 处理中…" : `✅ ${total} 题已回传，Claude 处理中…` },
-    });
-  } catch (e) {
-    log.warn({ err: (e as Error).message }, "askq ack send failed");
+  // 客户端已断开时回执是谎言 (答案送不回去了), 跳过。
+  if (!gone) {
+    try {
+      await client.sendMessage(target, {
+        msgtype: "markdown",
+        markdown: { content: total === 1 ? "✅ 已回传，Claude 处理中…" : `✅ ${total} 题已回传，Claude 处理中…` },
+      });
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "askq ack send failed");
+    }
   }
   return { decision: "deny", reason };
 };
@@ -1001,12 +1030,20 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
 
     // AskUserQuestion 走单独的投票卡分支(deny+reason 注入答案 / ask 转 CLI)。
     if (toolName === "AskUserQuestion") {
+      // writableEnded 为 false 时的 close = 响应还没写就断线 = hook 客户端先死。
+      // 正常完成时 json() 先置 writableEnded, close 到来后 resolve 不再发生。
+      const clientGone = new Promise<"client_gone">((resolve) => {
+        res.on("close", () => {
+          if (!res.writableEnded) resolve("client_gone");
+        });
+      });
       const resp = await handleAskUserQuestion({
         cfg,
         log,
         client,
         getMirrorTarget,
         flushBeforeCard,
+        clientGone,
         body: {
           session_id: sessionId,
           tool_name: toolName,
