@@ -190,12 +190,33 @@ const startOfLocalDay = (ts: number): number => {
   return d.getTime();
 };
 
+// Monday 00:00 local as week anchor (Chinese convention: week starts Monday).
+const startOfLocalWeek = (ts: number): number => {
+  const d = new Date(startOfLocalDay(ts));
+  const back = (d.getDay() + 6) % 7; // days since Monday (getDay: 0=Sun)
+  d.setDate(d.getDate() - back);
+  return d.getTime();
+};
+
 export interface UsageReport {
   now: number;
   todayStart: number;
   today: Map<string, ModelTotals>;
+  weekStart: number;
+  week: Map<string, ModelTotals>;
   active?: BlockUsage;
 }
+
+const aggregateSince = (entries: UsageEntry[], sinceMs: number): Map<string, ModelTotals> => {
+  const acc = new Map<string, ModelTotals>();
+  for (const e of entries) {
+    if (e.ts < sinceMs) continue;
+    const t = acc.get(e.model) ?? emptyTotals();
+    addInto(t, e.tokens);
+    acc.set(e.model, t);
+  }
+  return acc;
+};
 
 // Public entry point. Scans jsonl mtime'd within the last ~30h (covers today +
 // any in-flight 5h block that started late yesterday), parses usage rows, and
@@ -203,7 +224,9 @@ export interface UsageReport {
 export const computeUsage = (): UsageReport => {
   const now = Date.now();
   const todayStart = startOfLocalDay(now);
-  const scanSince = todayStart - DAY_MS; // one full day back covers active block
+  const weekStart = startOfLocalWeek(now);
+  // Scan back to whichever is earlier: week start, or one day (covers active block).
+  const scanSince = Math.min(weekStart, todayStart - DAY_MS);
   const files: string[] = [];
   for (const root of PROJECT_ROOTS) {
     if (existsSync(root)) walkJsonl(root, scanSince, files);
@@ -222,23 +245,51 @@ export const computeUsage = (): UsageReport => {
   }
   const blocks = groupBlocks(dedup);
   const active = blocks.find((b) => b.isActive);
-  const today = new Map<string, ModelTotals>();
-  for (const e of dedup) {
-    if (e.ts < todayStart) continue;
-    const t = today.get(e.model) ?? emptyTotals();
-    addInto(t, e.tokens);
-    today.set(e.model, t);
-  }
-  return { now, todayStart, today, active };
+  const today = aggregateSince(dedup, todayStart);
+  const week = aggregateSince(dedup, weekStart);
+  return { now, todayStart, today, weekStart, week, active };
 };
 
-const fmtTokens = (n: number): string => {
+export const fmtTokens = (n: number): string => {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
 };
 
-const fmtCost = (usd: number): string => (usd >= 0.005 ? `$${usd.toFixed(2)}` : "—");
+export const fmtCost = (usd: number): string => (usd >= 0.005 ? `$${usd.toFixed(2)}` : "—");
+
+export interface SessionCost {
+  sessionId: string;
+  totalTokens: number;
+  totalCost: number;
+  byModel: Array<{ model: string; tokens: number; cost: number }>;
+}
+
+// Cost/token rollup for a SINGLE session's jsonl (whole history, no time gate).
+// Dedup within the file the same way computeUsage does (message.id|requestId),
+// so `--resume`-copied parent turns aren't double-counted. Same pricing as the
+// block/day readout — this is the "Session · Total cost" the /usage TUI shows,
+// computed locally from real token counts.
+export const computeSessionCost = (jsonlPath: string): SessionCost => {
+  const seen = new Set<string>();
+  const acc = new Map<string, ModelTotals>();
+  for (const e of readUsageEntries(jsonlPath, 0)) {
+    if (seen.has(e.dedupKey)) continue;
+    seen.add(e.dedupKey);
+    const t = acc.get(e.model) ?? emptyTotals();
+    addInto(t, e.tokens);
+    acc.set(e.model, t);
+  }
+  const byModel = Array.from(acc.entries())
+    .map(([model, t]) => ({ model, tokens: sumTotal(t), cost: costOf(model, t) }))
+    .sort((a, b) => b.tokens - a.tokens);
+  return {
+    sessionId: jsonlPath.replace(/^.*\//, "").replace(/\.jsonl$/, ""),
+    totalTokens: byModel.reduce((s, m) => s + m.tokens, 0),
+    totalCost: byModel.reduce((s, m) => s + m.cost, 0),
+    byModel,
+  };
+};
 
 const fmtDuration = (ms: number): string => {
   if (ms <= 0) return "0m";
@@ -309,6 +360,16 @@ export const renderUsageReport = (r: UsageReport): string => {
     out.push(`  合计: **${fmtTokens(totalTokens)}** tokens · ${fmtCost(totalCost)}`);
   } else {
     out.push("", `📅 今日累计 (${dayLabel}): 无`);
+  }
+
+  const weekLabel = `${fmtLocalDate(r.weekStart)} → ${fmtLocalDate(r.now)}`;
+  if (r.week.size > 0) {
+    const { lines, totalTokens, totalCost } = renderModelLines(r.week);
+    out.push("", `🗓️ 本周累计 (${weekLabel})`);
+    out.push(...lines);
+    out.push(`  合计: **${fmtTokens(totalTokens)}** tokens · ${fmtCost(totalCost)}`);
+  } else {
+    out.push("", `🗓️ 本周累计 (${weekLabel}): 无`);
   }
 
   return out.join("\n");

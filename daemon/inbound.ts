@@ -11,7 +11,8 @@ import { expandHome, sanitizeId } from "../shared/paths.js";
 import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim } from "./claim.js";
 import { getLastResponse } from "./last-response.js";
 import { scanClaudeSessions, type SessionInfo } from "./session-scan.js";
-import { computeUsage, renderUsageReport } from "./usage.js";
+import { computeUsage, renderUsageReport, computeSessionCost } from "./usage.js";
+import { captureQuota, renderQuotaReport } from "./quota.js";
 import {
   parseSubscribe,
   parseUnsubscribe,
@@ -68,8 +69,18 @@ const renderIds = (msg: BaseMessage, cfg: Config): string => {
 
 const isIdCommand = (text: string): boolean => text.trim() === "/id";
 const isPwdCommand = (text: string): boolean => text.trim() === "/pwd";
-const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
+const isCcusageCommand = (text: string): boolean => text.trim() === "/ccusage";
 const isNewCommand = (text: string): boolean => text.trim() === "/new";
+const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
+
+// The jsonl of the Claude session currently mirrored to `who` (undefined in
+// headless mode or when the chat has no attachment) — lets /usage report the
+// caller's real session cost.
+const callerJsonl = (bridge: Bridge | MirrorBridge, who: string): string | undefined => {
+  try {
+    return (bridge as MirrorBridge).status?.().mirrors?.find((m) => m.target === who)?.jsonlPath;
+  } catch { return undefined; }
+};
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 
 // /session(s) [arg] — list live Claude sessions, or switch the mirror to one.
@@ -180,6 +191,24 @@ const withQuote = (msg: BaseMessage, text: string): string => {
   if (isLastResponseQuote(chatPrincipal(msg), quoted)) return text;
   const prefix = renderQuotePrefix(msg.quote);
   return prefix ? `${prefix}${text}` : text;
+};
+
+// Effective body for a text message.
+// - Normal: strip the bot @mention, attach any quote as a markdown context prefix.
+// - Pure-quote re-trigger: when the user adds NO new text and just quotes a
+//   message, promote the quoted message to the body (strip its @mention so
+//   "@weclaude /usage" → "/usage" hits the command path). WeCom silently dedups
+//   identical text sends, so re-quoting the same command is the only way to
+//   re-fire it — this makes that work. Self-quotes of weclaude's own last reply
+//   are excluded (would echo weclaude's text back as a command).
+const resolveTextBody = (msg: TextMessage): { text: string; promoted: boolean } => {
+  const body = maybeStripMentions(msg, msg.text?.content ?? "");
+  if (body.trim()) return { text: withQuote(msg, body), promoted: false };
+  const quoted = msg.quote ? quoteToText(msg.quote).trim() : "";
+  if (quoted && !isLastResponseQuote(chatPrincipal(msg), quoted)) {
+    return { text: maybeStripMentions(msg, quoted).trim(), promoted: true };
+  }
+  return { text: withQuote(msg, body), promoted: false };
 };
 
 const isAllowed = (cfg: Config, principals: string[]): boolean => {
@@ -351,15 +380,15 @@ export const installInboundRouter = (
       try { await client.replyStream(frame, msg.msgid, renderPwd(who), true); } catch { /* ignore */ }
       return { stop: true, who };
     }
-    // /usage — token / cost snapshot pulled from ~/.claude(-internal)?/projects
-    // jsonl transcripts. Read-only, no session state, so it bypasses allowFrom
-    // like /id and /pwd.
-    if (isUsageCommand(text)) {
+    // /ccusage — token / cost ESTIMATE pulled from ~/.claude(-internal)?/projects
+    // jsonl transcripts (ccusage-style). Read-only, no session state, so it
+    // bypasses allowFrom like /id and /pwd. Real subscription %: use /usage.
+    if (isCcusageCommand(text)) {
       let body: string;
       try {
         body = renderUsageReport(computeUsage());
       } catch (e) {
-        body = `[weclaude] /usage failed: ${(e as Error).message}`;
+        body = `[weclaude] /ccusage failed: ${(e as Error).message}`;
       }
       try { await client.replyStream(frame, msg.msgid, body, true); } catch { /* ignore */ }
       return { stop: true, who };
@@ -395,6 +424,30 @@ export const installInboundRouter = (
           true,
         );
       } catch { /* ignore */ }
+      return { stop: true, who };
+    }
+    // Authorized `/usage` — real subscription rate-limit % + session cost,
+    // scraped from Claude Code's own `/usage` TUI (/ccusage can only estimate
+    // cost/tokens; the true limit % is server-side). Drives a throwaway isolated
+    // pane (~10s) → interim ack, then replace with the result. Session cost is
+    // computed locally from THIS chat's mirrored session jsonl (real tokens).
+    if (isUsageCommand(text)) {
+      log.info({ who }, "/usage panel: start");
+      try { await client.replyStream(frame, msg.msgid, "⏳ 正在拉起 /usage 面板查询真实额度…", false); } catch (e) { log.warn({ err: (e as Error).message }, "/usage: interim ack failed"); }
+      let body: string;
+      try {
+        const report = await captureQuota(cfg, log);
+        const jsonlPath = callerJsonl(bridge, who);
+        if (jsonlPath) {
+          try { report.sessionCost = computeSessionCost(jsonlPath); } catch { /* best-effort */ }
+        }
+        body = renderQuotaReport(report);
+        log.info({ who, limits: report.limits.length }, "/usage panel: done");
+      } catch (e) {
+        body = `[weclaude] /usage failed: ${(e as Error).message}`;
+        log.error({ who, err: (e as Error).message }, "/usage panel: failed");
+      }
+      try { await client.replyStream(frame, msg.msgid, body, true); } catch (e) { log.warn({ err: (e as Error).message }, "/usage: final reply failed"); }
       return { stop: true, who };
     }
     // Authorized `/new` — spawn a tmux+claude pair and attach it to this chat.
@@ -488,9 +541,8 @@ export const installInboundRouter = (
   client.on("message.text", async (frame: WsFrame<TextMessage>) => {
     const msg = frame.body;
     if (!msg) return;
-    const raw = msg.text?.content ?? "";
-    const text = withQuote(msg, maybeStripMentions(msg, raw));
-    log.info({ msgid: msg.msgid, len: text.length, hasQuote: !!msg.quote }, "rx text");
+    const { text, promoted } = resolveTextBody(msg);
+    log.info({ msgid: msg.msgid, len: text.length, hasQuote: !!msg.quote, promoted }, "rx text");
     const { stop, who } = await gate(frame, msg, text);
     if (stop) return;
     await send(frame, msg, who, text);

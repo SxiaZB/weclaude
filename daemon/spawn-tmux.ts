@@ -51,7 +51,7 @@ interface ExecResult {
   code: number | null;
 }
 
-const runTmux = (args: string[]): Promise<ExecResult> =>
+export const runTmux = (args: string[]): Promise<ExecResult> =>
   new Promise((resolve) => {
     const proc = spawn("tmux", args, {
       env: { ...process.env, PATH: augmentedPath(process.env.PATH) },
@@ -143,7 +143,7 @@ const claudeConfigCandidates = (claudeBin: string): string[] => {
   if (name === "claude") return [join(home, ".claude.json")];
   return [join(home, `.${name}`, ".claude.json"), join(home, `.${name}.json`)];
 };
-const trustWorkspace = (claudeBin: string, cwd: string, log: Logger): void => {
+export const trustWorkspace = (claudeBin: string, cwd: string, log: Logger): void => {
   const candidates = claudeConfigCandidates(claudeBin);
   const target: string = candidates.find(existsSync) ?? candidates[0]!;
   let cfg: { projects?: Record<string, ClaudeProjectMeta>; [k: string]: unknown } = {};
