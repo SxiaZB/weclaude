@@ -216,7 +216,10 @@ export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, c
   const paneEnv = ["-e", "DISABLE_AUTO_UPDATE=true", "-e", "DISABLE_UPDATE_PROMPT=true"];
   const has = await runTmux(["has-session", "-t", tmuxName]);
   const created = has.code === 0
-    ? await runTmux(["new-window", "-d", "-t", tmuxName, "-n", winName, "-c", cwd, ...paneEnv, "-P", "-F", "#{pane_id}"])
+    // `${tmuxName}:` (trailing colon) forces session-only resolution → next free
+    // window index. Bare `-t weclaude` is ambiguous: if a *window* is also named
+    // `weclaude`, tmux matches it and tries to reuse its index → "index N in use".
+    ? await runTmux(["new-window", "-d", "-t", `${tmuxName}:`, "-n", winName, "-c", cwd, ...paneEnv, "-P", "-F", "#{pane_id}"])
     : await runTmux(["new-session", "-d", "-s", tmuxName, "-n", winName, "-c", cwd, ...paneEnv, "-P", "-F", "#{pane_id}"]);
   if (!created.ok) {
     const verb = has.code === 0 ? "new-window" : "new-session";
