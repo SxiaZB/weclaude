@@ -11,6 +11,10 @@ export interface PendingMeta {
   toolInput?: unknown;
   cwd?: string;
   sessionId?: string;
+  /** WeCom principal ("user:xxx" / "chat:xxx") this pending's card was sent to.
+   *  Used by resolvePendingsByChat sweep so allow_window opens across all
+   *  sessions bound to the same chat, not just the clicked one. */
+  chatKey?: string;
   transcriptTail?: string;
 }
 
@@ -108,12 +112,14 @@ export const getResolvedSnapshot = (
   return { meta: e.meta, decision: e.decision };
 };
 
-// 批量 resolve 同 session 下仍在长轮询的 approval 请求。
-// 用途: 用户点 allow_window 时，Claude 同 turn 并发触发的其它 pending 卡
-// 不应再要求逐个点击 — 直接按 decision 放行。返回被放行的 (reqId, meta) 列表，
-// 供调用方做提示展示 (resolve 后 store 里就拿不到 meta 了)。
-export const resolvePendingsBySession = (
-  sessionId: string,
+// 批量 resolve 同 chat 下仍在长轮询的 approval 请求。
+// 用途: 用户点 allow_window 时，同一个 WeCom 聊天里其它 pending 卡 (可能来自
+// 别的 session) 都应一并放行 — 窗口按 chat 维度生效, 别的 session 反正也会
+// 在下次请求时被 isAutoWindowActive 短路, 提前扫掉纯粹是省用户手指。返回被
+// 放行的 (reqId, meta) 列表, 供调用方做提示展示 (resolve 后 store 里就拿不
+// 到 meta 了)。
+export const resolvePendingsByChat = (
+  chatKey: string,
   decision: Decision,
   excludeReqId?: string,
 ): Array<{ reqId: string; meta: PendingMeta }> => {
@@ -121,7 +127,7 @@ export const resolvePendingsBySession = (
   for (const [reqId, p] of store.entries()) {
     if (reqId === excludeReqId) continue;
     if (p.meta.kind !== "approval") continue;
-    if (p.meta.sessionId !== sessionId) continue;
+    if (p.meta.chatKey !== chatKey) continue;
     hits.push({ reqId, meta: p.meta });
   }
   hits.forEach(({ reqId, meta }) => {

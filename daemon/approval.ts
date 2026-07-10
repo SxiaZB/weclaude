@@ -9,7 +9,7 @@ import type {
 } from "@wecom/aibot-node-sdk";
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
-import { createPending, getPending, getResolvedSnapshot, resolvePending, resolvePendingsBySession, failPending, type Decision } from "./pending.js";
+import { createPending, getPending, getResolvedSnapshot, resolvePending, resolvePendingsByChat, failPending, type Decision } from "./pending.js";
 import {
   cacheGet,
   cachePut,
@@ -51,6 +51,10 @@ interface CardArgs {
   sessionShort: string;
   /** Full sessionId — used for the stable animal-emoji tag (matches /sessions list). */
   sessionId?: string;
+  /** WeCom principal for this card; used to encode the "点击取消" cancel key
+   *  on allow_window resolved cards. Auto-window is chat-scoped so the cancel
+   *  key must carry chatKey, not sessionId. */
+  chatKey?: string;
   transcriptTail: string;
   windowMinutes: number;
   detailUrl?: string;  // 空则不渲染 jump_list
@@ -230,13 +234,13 @@ const resolvedButton = (
   d: Decision,
   windowMinutes: number,
   reqId: string,
-  sessionId: string,
+  chatKey: string,
 ): { text: string; style: number; key: string } => {
   if (d === "allow_window") {
     return {
       text: `${verbOf(d, windowMinutes)} · 点击取消`,
       style: 4,
-      key: encodeCancelKey(sessionId),
+      key: encodeCancelKey(chatKey),
     };
   }
   return {
@@ -247,7 +251,7 @@ const resolvedButton = (
 };
 
 const buildResolvedCard = (
-  a: CardArgs & { decision: Decision; by: string; sessionId: string },
+  a: CardArgs & { decision: Decision; by: string },
 ): TemplateCard => {
   const r = renderInput(a.toolName, a.toolInput, a.toolInputStr, a.cwd);
   const dir = dirName(a.cwd);
@@ -260,7 +264,7 @@ const buildResolvedCard = (
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
-    button_list: [resolvedButton(a.decision, a.windowMinutes, a.reqId, a.sessionId)],
+    button_list: [resolvedButton(a.decision, a.windowMinutes, a.reqId, a.chatKey ?? "")],
   };
 };
 
@@ -385,7 +389,7 @@ const buildBatchResolvedCard = (
     ? {
         text: `${verbOf(decision, batch.windowMinutes)} · 点击取消`,
         style: 4,
-        key: encodeCancelKey(batch.sessionId),
+        key: encodeCancelKey(batch.approver),
       }
     : {
         text: `${emojiOf(decision)} ${verbOf(decision, batch.windowMinutes)} ×${batch.members.length}`,
@@ -420,7 +424,7 @@ const NOOP_PREFIX = "noop:";
 const CANCEL_PREFIX = "cancel_window:";
 const BATCH_PREFIX = "B|";
 const BATCH_NOOP_PREFIX = "B-noop:";
-const encodeCancelKey = (sessionId: string): string => `${CANCEL_PREFIX}${sessionId}`;
+const encodeCancelKey = (chatKey: string): string => `${CANCEL_PREFIX}${chatKey}`;
 const encodeBatchKey = (batchId: string, decision: Decision): string =>
   `${BATCH_PREFIX}${batchId}|${decision}`;
 const encodeBatchNoopKey = (batchId: string): string => `${BATCH_NOOP_PREFIX}${batchId}`;
@@ -435,13 +439,13 @@ const decodeBatchNoopKey = (key: string): string | undefined =>
   key.startsWith(BATCH_NOOP_PREFIX) ? key.slice(BATCH_NOOP_PREFIX.length) : undefined;
 const decodeKey = (
   key: string,
-): { reqId?: string; decision?: Decision; cancelSessionId?: string; noopReqId?: string } => {
+): { reqId?: string; decision?: Decision; cancelChatKey?: string; noopReqId?: string } => {
   if (key.startsWith(NOOP_PREFIX)) {
     // noop:cancelled:<id> 也走这里，noopReqId 取剩余部分作为 task_id 兜底。
     return { noopReqId: key.slice(NOOP_PREFIX.length) };
   }
   if (key.startsWith(CANCEL_PREFIX)) {
-    return { cancelSessionId: key.slice(CANCEL_PREFIX.length) };
+    return { cancelChatKey: key.slice(CANCEL_PREFIX.length) };
   }
   const [reqId, d] = key.split("|");
   if (!reqId || !d) return {};
@@ -1076,10 +1080,15 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
       return;
     }
 
-    // Auto-approve window: while active for THIS session, requests short-circuit to allow.
-    if (isAutoWindowActive(sessionId)) {
-      const remainSec = Math.ceil(autoWindowRemainingMs(sessionId) / 1000);
-      log.info({ toolName, sessionId, remainSec }, "auto-window allow");
+    // Approver 提前解析: auto-window 现在按 chat 维度生效, isAutoWindowActive
+    // 检查要拿到 chatKey (= approver principal) 才能查。approver 缺失时 window
+    // 检查跳过 (window 需要一个 chat 才存在), 走后面的 no_approver fallback。
+    const approver = resolveApprover(cfg, sessionId, getMirrorTarget);
+
+    // Auto-approve window: while active for THIS chat, requests short-circuit to allow.
+    if (approver && isAutoWindowActive(approver)) {
+      const remainSec = Math.ceil(autoWindowRemainingMs(approver) / 1000);
+      log.info({ toolName, sessionId, chatKey: approver, remainSec }, "auto-window allow");
       json(res, 200, {
         decision: "allow",
         reason: `auto_window:${remainSec}s`,
@@ -1099,7 +1108,6 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
       return;
     }
 
-    const approver = resolveApprover(cfg, sessionId, getMirrorTarget);
     if (!approver) {
       log.warn("no approver configured");
       json(res, 200, fallback(cfg, "no_approver") satisfies ApproveResp);
@@ -1130,6 +1138,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
         toolInput: display,
         cwd,
         sessionId,
+        chatKey: approver,
         transcriptTail,
       },
       timeoutMs: longPollMs,
@@ -1187,17 +1196,18 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
       cachePut(ck, decision, cfg.approval.sessionCacheMinutes * 60_000);
     }
     if (decision === "allow_window" && cfg.approval.windowMinutes > 0) {
-      setAutoWindow(sessionId, cfg.approval.windowMinutes * 60_000, {
+      setAutoWindow(approver, cfg.approval.windowMinutes * 60_000, {
         toolName,
         toolInput: display,
         cwd,
         transcriptTail,
       });
-      // 同 turn 并发触发的其它 pending 卡 — 一并放行，免得用户逐个点。
+      // 同一个 chat 里其它 pending 卡 (可能来自并发同 turn, 也可能来自绑到
+      // 同一个 chat 的别的 session) — 一并放行，免得用户逐个点。
       // 我们没有那些卡的事件 frame, 不能 updateTemplateCard 改文案；
       // 改用一条 markdown 消息回执让用户知道发生了什么。
-      const swept = resolvePendingsBySession(sessionId, "allow_window", reqId);
-      log.info({ sessionId, minutes: cfg.approval.windowMinutes, swept: swept.length }, "auto-window opened");
+      const swept = resolvePendingsByChat(approver, "allow_window", reqId);
+      log.info({ sessionId, chatKey: approver, minutes: cfg.approval.windowMinutes, swept: swept.length }, "auto-window opened");
       if (swept.length > 0) {
         try {
           const tools = swept
@@ -1396,11 +1406,11 @@ export const installApprovalEventListener = (
       }
 
       // Cancel branch: resolved allow_window card was clicked again to cancel
-      // the auto-approve window for that session. No pending to resolve.
-      if (decoded.cancelSessionId) {
-        const wmeta = getWindowMeta(decoded.cancelSessionId);
-        clearAutoWindow(decoded.cancelSessionId);
-        log.info({ sessionId: decoded.cancelSessionId }, "auto-window cancelled by click");
+      // the auto-approve window for that chat. No pending to resolve.
+      if (decoded.cancelChatKey) {
+        const wmeta = getWindowMeta(decoded.cancelChatKey);
+        clearAutoWindow(decoded.cancelChatKey);
+        log.info({ chatKey: decoded.cancelChatKey }, "auto-window cancelled by click");
         try {
           await client.updateTemplateCard(
             frame,
@@ -1410,14 +1420,14 @@ export const installApprovalEventListener = (
               toolInput: wmeta?.toolInput ?? {},
               toolInputStr: "",
               cwd: wmeta?.cwd ?? "",
-              sessionShort: decoded.cancelSessionId.slice(-8),
-              sessionId: decoded.cancelSessionId,
+              sessionShort: "?",
+              chatKey: decoded.cancelChatKey,
               transcriptTail: wmeta?.transcriptTail ?? "",
               windowMinutes: cfg.approval.windowMinutes,
               detailUrl: cbTaskId ? detailUrlFor(cbTaskId) : undefined,
             }),
           );
-          log.info({ sessionId: decoded.cancelSessionId, cbTaskId }, "cancel card updated in place");
+          log.info({ chatKey: decoded.cancelChatKey, cbTaskId }, "cancel card updated in place");
         } catch (e) {
           log.warn({ err: (e as Error).message }, "updateTemplateCard (cancel) failed");
         }
@@ -1500,6 +1510,7 @@ export const installApprovalEventListener = (
               decision: effectiveDecision,
               by,
               sessionId: meta?.sessionId ?? "",
+              chatKey: meta?.chatKey ?? "",
               detailUrl: detailUrlFor(reqId),
             });
         await client.updateTemplateCard(frame, card);

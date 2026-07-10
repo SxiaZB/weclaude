@@ -52,11 +52,15 @@ export const cachePut = (key: string, decision: Decision, ttlMs: number): void =
 
 export const cacheClear = (): void => cache.clear();
 
-// ── Per-session auto-approve window ────────────────────────────────────
-// Set by `allow_window` clicks; while active, approval requests within the
-// SAME sessionId bypass the card flow and return allow immediately.
-// Persisted to disk so daemon restart doesn't drop the user's "10min" choice.
-const autoApproveUntilBySession = new Map<string, number>();
+// ── Per-chat auto-approve window ───────────────────────────────────────
+// Set by `allow_window` clicks; while active, approval requests routed to
+// the SAME chat (WeCom principal like "user:abc" / "chat:wc...") bypass the
+// card flow and return allow immediately. Chat-scoped instead of session-scoped
+// so that multiple concurrent sessions bound to the same WeCom chat share the
+// user's "放行 N 分钟" choice — a new session started under the same chat
+// inherits the window until it expires.
+// Persisted to disk so daemon restart doesn't drop the user's choice.
+const autoApproveUntilByChat = new Map<string, number>();
 
 // 保存最近一次窗口卡片的元信息，用于"取消"时重建卡片不丢上下文。
 export interface WindowMeta {
@@ -65,7 +69,7 @@ export interface WindowMeta {
   cwd: string;
   transcriptTail: string;
 }
-const windowMetaBySession = new Map<string, WindowMeta>();
+const windowMetaByChat = new Map<string, WindowMeta>();
 
 // ── Persistence ─────────────────────────────────────────────────────────
 let persistPath: string | undefined;
@@ -83,8 +87,8 @@ const writeAtomic = (path: string, text: string): void => {
 const persist = (): void => {
   if (!persistPath) return;
   const windows: PersistShape["windows"] = {};
-  for (const [sid, until] of autoApproveUntilBySession.entries()) {
-    windows[sid] = { until, meta: windowMetaBySession.get(sid) };
+  for (const [chatKey, until] of autoApproveUntilByChat.entries()) {
+    windows[chatKey] = { until, meta: windowMetaByChat.get(chatKey) };
   }
   try {
     writeAtomic(persistPath, JSON.stringify({ windows } satisfies PersistShape));
@@ -96,7 +100,9 @@ const persist = (): void => {
 /** Call once at daemon startup. Loads any unexpired windows from disk. */
 export const initAutoWindowPersistence = (stateDir: string): void => {
   const dir = expandHome(stateDir);
-  persistPath = join(dir, "auto-windows.json");
+  // 文件名改成 -by-chat 版本; 旧的 auto-windows.json (sessionId 键) 直接搁置,
+  // 不迁移 — 那些键在新语义下永远不会匹配, 靠自然 TTL 淘汰即可。
+  persistPath = join(dir, "auto-windows-by-chat.json");
   try {
     mkdirSync(dirname(persistPath), { recursive: true });
   } catch {
@@ -106,11 +112,11 @@ export const initAutoWindowPersistence = (stateDir: string): void => {
   try {
     const data = JSON.parse(readFileSync(persistPath, "utf8")) as Partial<PersistShape>;
     const now = Date.now();
-    for (const [sid, entry] of Object.entries(data.windows ?? {})) {
+    for (const [chatKey, entry] of Object.entries(data.windows ?? {})) {
       if (!entry || typeof entry.until !== "number") continue;
       if (entry.until <= now) continue;
-      autoApproveUntilBySession.set(sid, entry.until);
-      if (entry.meta) windowMetaBySession.set(sid, entry.meta);
+      autoApproveUntilByChat.set(chatKey, entry.until);
+      if (entry.meta) windowMetaByChat.set(chatKey, entry.meta);
     }
     // 清掉过期项后落盘一次。
     persist();
@@ -119,39 +125,39 @@ export const initAutoWindowPersistence = (stateDir: string): void => {
   }
 };
 
-export const setAutoWindow = (sessionId: string, ttlMs: number, meta?: WindowMeta): number => {
+export const setAutoWindow = (chatKey: string, ttlMs: number, meta?: WindowMeta): number => {
   const until = Date.now() + ttlMs;
-  autoApproveUntilBySession.set(sessionId, until);
-  if (meta) windowMetaBySession.set(sessionId, meta);
+  autoApproveUntilByChat.set(chatKey, until);
+  if (meta) windowMetaByChat.set(chatKey, meta);
   persist();
   return until;
 };
 
-export const getWindowMeta = (sessionId: string): WindowMeta | undefined =>
-  windowMetaBySession.get(sessionId);
+export const getWindowMeta = (chatKey: string): WindowMeta | undefined =>
+  windowMetaByChat.get(chatKey);
 
-export const autoWindowRemainingMs = (sessionId: string): number =>
-  Math.max(0, (autoApproveUntilBySession.get(sessionId) ?? 0) - Date.now());
+export const autoWindowRemainingMs = (chatKey: string): number =>
+  Math.max(0, (autoApproveUntilByChat.get(chatKey) ?? 0) - Date.now());
 
-export const isAutoWindowActive = (sessionId: string): boolean => {
-  const until = autoApproveUntilBySession.get(sessionId);
+export const isAutoWindowActive = (chatKey: string): boolean => {
+  const until = autoApproveUntilByChat.get(chatKey);
   if (until === undefined) return false;
   if (Date.now() >= until) {
-    autoApproveUntilBySession.delete(sessionId);
-    windowMetaBySession.delete(sessionId);
+    autoApproveUntilByChat.delete(chatKey);
+    windowMetaByChat.delete(chatKey);
     persist();
     return false;
   }
   return true;
 };
 
-export const clearAutoWindow = (sessionId?: string): void => {
-  if (sessionId === undefined) {
-    autoApproveUntilBySession.clear();
-    windowMetaBySession.clear();
+export const clearAutoWindow = (chatKey?: string): void => {
+  if (chatKey === undefined) {
+    autoApproveUntilByChat.clear();
+    windowMetaByChat.clear();
   } else {
-    autoApproveUntilBySession.delete(sessionId);
-    windowMetaBySession.delete(sessionId);
+    autoApproveUntilByChat.delete(chatKey);
+    windowMetaByChat.delete(chatKey);
   }
   persist();
 };
