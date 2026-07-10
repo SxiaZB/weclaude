@@ -82,20 +82,21 @@ export const SHARED_CSS = `
   section>h2{margin:0;padding:6px 12px;font-size:11px;font-weight:600;
     color:#656d76;text-transform:uppercase;letter-spacing:.5px;
     background:#f1f3f6;border-bottom:1px solid #d0d7de}
-  pre{margin:0;padding:12px;overflow:auto;font-size:12.5px;line-height:1.5;
-    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}
+  pre{margin:0;padding:12px;font-size:12.5px;line-height:1.5;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
   .jk{color:#953800}.js{color:#0a3069}.jb{color:#9a6700}.jn{color:#8250df}
   .hc{color:#6e7781;font-style:italic}.hs{color:#0a3069}.hk{color:#cf222e}
   .hl{color:#8250df}.hn{color:#0550ae}.hv{color:#953800}
   .codeview{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-    font-size:12.5px;line-height:1.5;overflow:auto;padding:8px 0}
-  .codeview .row{display:grid;grid-template-columns:56px 1fr}
+    font-size:12.5px;line-height:1.5;padding:8px 0}
+  .codeview .row{display:grid;grid-template-columns:56px 1fr;min-width:0}
   .codeview .ln{color:#8c959f;text-align:right;padding:0 8px;
     user-select:none;font-variant-numeric:tabular-nums}
-  .codeview .txt{padding:0 8px;white-space:pre}
+  .codeview .txt{padding:0 8px;white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}
   .diff{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-    font-size:12.5px;line-height:1.5;overflow:auto}
-  .diff .row{display:grid;grid-template-columns:44px 44px 14px 1fr}
+    font-size:12.5px;line-height:1.5}
+  .diff .row{display:grid;grid-template-columns:44px 44px 14px 1fr;min-width:0}
   .diff .row.add{background:#dafbe1}
   .diff .row.del{background:#ffebe9}
   .diff .row.hunk{background:#ddf4ff;color:#0969da;
@@ -105,7 +106,7 @@ export const SHARED_CSS = `
   .diff .sign{text-align:center;color:#656d76;user-select:none}
   .diff .row.add .sign{color:#1a7f37}
   .diff .row.del .sign{color:#cf222e}
-  .diff .txt{padding:0 8px;white-space:pre;min-width:0}
+  .diff .txt{padding:0 8px;white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}
   .diff-meta{padding:4px 12px;font-size:12px;color:#656d76;
     background:#f1f3f6;border-bottom:1px solid #d0d7de;
     font-family:ui-monospace,monospace}
@@ -324,8 +325,9 @@ const TURN_CSS = `
   .md-body code{background:#f6f8fa;border-radius:4px;padding:1px 5px;font-size:.9em;
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
   .md-body pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;
-    margin:.7em 0;padding:12px;overflow:auto}
+    margin:.7em 0;padding:12px;white-space:pre-wrap;overflow-wrap:anywhere}
   .md-body pre code{background:transparent;padding:0;font-size:12.5px;line-height:1.5}
+  .md-body pre code.hljs{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
   .md-body blockquote{margin:.6em 0;padding:.2em 1em;border-left:3px solid #d0d7de;color:#656d76}
   .md-body table{border-collapse:collapse;margin:.7em 0}
   .md-body th,.md-body td{border:1px solid #d0d7de;padding:6px 10px}
