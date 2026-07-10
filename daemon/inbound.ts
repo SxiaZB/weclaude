@@ -75,6 +75,7 @@ const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 const isEnterCommand = (text: string): boolean => text.trim() === "/n";
 const isHelpCommand = (text: string): boolean => /^\/(?:help|\?|h)$/i.test(text.trim());
+const isSkillBCommand = (text: string): boolean => text.trim() === "/skill-b";
 
 // Static command reference. Grouped: session control, usage/info, topic
 // broadcast (natural-language, zh+en). Anything not matching a command is a
@@ -95,6 +96,7 @@ const renderHelp = (): string =>
     "`/usage` 真实订阅额度 %",
     "`/cost` token/成本估算",
     "`/help` 本帮助",
+    "`/skill-b` 广播接口用法 (贴给 Claude)",
     "",
     "▎广播订阅",
     "`订阅 <topic>` · `退订 <topic>`",
@@ -110,6 +112,28 @@ const renderHelp = (): string =>
     "",
     "其余文本直接转发给已绑定的 Claude 会话。",
   ].join("\n");
+
+// /skill-b — 回执一段 prompt,告诉 Claude 如何调用本 daemon 的 /publish 广播接口。
+// 用围栏代码块包裹便于用户在 WeCom 长按 copy 后贴给上游 Claude。
+const renderSkillBroadcast = (): string => [
+  "把下面这段贴给 Claude,它就知道怎么广播:",
+  "```",
+  "本机 daemon 在 127.0.0.1:17890 暴露 POST /publish,用来向已订阅某 topic 的会话广播消息。",
+  "",
+  "调用示例:",
+  "curl -sS -X POST http://127.0.0.1:17890/publish \\",
+  "  -H 'Content-Type: application/json' \\",
+  "  -d '{\"topic\":\"daily-report\",\"markdown\":\"# 标题\\n正文...\"}'",
+  "",
+  "请求体:",
+  "- topic (必填):订阅表里的 key",
+  "- markdown 或 text (二选一):消息内容,markdown 语法",
+  "",
+  "返回: { ok, topic, sent, failed, subs }。ws_disconnected=true 表示 daemon 与 WeCom WS 断开。",
+  "",
+  "长消息用 --data-binary @file.json,避免 shell 转义踩坑。",
+  "```",
+].join("\n");
 
 // /session(s) [arg] — list live Claude sessions, or switch the mirror to one.
 // Bare "/sessions" (or "/session") lists; an arg (animal emoji, sessionId, or
@@ -412,6 +436,11 @@ export const installInboundRouter = (
     // /pwd — bypass allowFrom too. Read-only project-path lookup.
     if (isPwdCommand(text)) {
       try { await client.replyStream(frame, msg.msgid, renderPwd(who), true); } catch { /* ignore */ }
+      return { stop: true, who };
+    }
+    // /skill-b — 静态 prompt 回执,教 Claude 调用 /publish 广播接口。纯文本,bypass allowFrom。
+    if (isSkillBCommand(text)) {
+      try { await client.replyStream(frame, msg.msgid, renderSkillBroadcast(), true); } catch { /* ignore */ }
       return { stop: true, who };
     }
     // /cost — token / cost ESTIMATE pulled from ~/.claude(-internal)?/projects
