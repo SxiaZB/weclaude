@@ -73,6 +73,7 @@ const isCcusageCommand = (text: string): boolean => text.trim() === "/ccusage";
 const isNewCommand = (text: string): boolean => text.trim() === "/new";
 const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
+const isEnterCommand = (text: string): boolean => text.trim() === "/n";
 
 // /session(s) [arg] — list live Claude sessions, or switch the mirror to one.
 // Bare "/sessions" (or "/session") lists; an arg (animal emoji, sessionId, or
@@ -457,6 +458,19 @@ export const installInboundRouter = (
       } else {
         const r = await bridge.interruptPane(who);
         const reply = r.ok ? "✅ Esc sent" : `[weclaude] /stop failed: ${r.reason ?? "unknown"}`;
+        try { await client.replyStream(frame, msg.msgid, reply, true); } catch { /* ignore */ }
+      }
+      return { stop: true, who };
+    }
+    // Authorized `/n` — send a bare Enter to the live pane. Confirms a prompt /
+    // dismisses a "press enter to continue", or submits whatever's already in
+    // the input box. Mirror-mode only; bails cleanly when no attachment.
+    if (isEnterCommand(text)) {
+      if (!("submitPane" in bridge)) {
+        try { await client.replyStream(frame, msg.msgid, "[weclaude] /n only available in mirror mode", true); } catch { /* ignore */ }
+      } else {
+        const r = await bridge.submitPane(who);
+        const reply = r.ok ? "✅ Enter sent" : `[weclaude] /n failed: ${r.reason ?? "unknown"}`;
         try { await client.replyStream(frame, msg.msgid, reply, true); } catch { /* ignore */ }
       }
       return { stop: true, who };
