@@ -3,6 +3,7 @@
 // 让两端保持同款外观。
 import { structuredPatch, parsePatch, type StructuredPatchHunk } from "diff";
 import { highlightCode, langFromPath } from "./highlight.js";
+import { ansiToHtml } from "./ansi.js";
 import type {
   ApprovalDecision,
   ApprovalDetailRecord,
@@ -237,12 +238,12 @@ const renderToolPage = (r: ToolDetailRecord): string => {
     : "";
   const readResultHtml = isRead && hasResult ? renderReadContent(r.toolResult!, filePath) : "";
   const resultBlock = readResultHtml
-    ? `${readResultHtml}<section><details><summary>result (raw)</summary><pre><code>${escHtml(r.toolResult!)}</code></pre></details></section>`
+    ? `${readResultHtml}<section><details><summary>result (raw)</summary><pre><code>${ansiToHtml(r.toolResult!)}</code></pre></details></section>`
     : hasResult
       ? (diffResultHtml
-        ? `${diffResultHtml}<section><details><summary>result (raw)</summary><pre><code>${escHtml(r.toolResult!)}</code></pre></details></section>`
-        : `<section><h2>result</h2><pre><code>${escHtml(r.toolResult!)}</code></pre></section>`)
-      : `<section><h2>result</h2><pre style="color:#656d76;font-style:italic"><code>(尚未捕获)</code></pre></section>`;
+        ? `${diffResultHtml}<section><details><summary>result (raw)</summary><pre><code>${ansiToHtml(r.toolResult!)}</code></pre></details></section>`
+        : `<section><h2>result</h2><pre><code>${ansiToHtml(r.toolResult!)}</code></pre></section>`)
+    : `<section><h2>result</h2><pre style="color:#656d76;font-style:italic"><code>(尚未捕获)</code></pre></section>`;
   const status = hasResult
     ? `<span class="badge allow">完成${r.resultAt ? ` · ${fmtDuration(r.resultAt - r.createdAt)}` : ""}</span>`
     : `<span class="badge pending">运行中</span>`;
@@ -291,7 +292,7 @@ const renderApprovalPage = (r: ApprovalDetailRecord): string => {
 <div class="meta">${metaParts.map(escHtml).join('<span class="sep">·</span>')}</div>
 <section><h2>input</h2><pre><code>${inputJson}</code></pre></section>
 ${transcript
-    ? `<section><details><summary>transcript (${transcript.split("\n").length} 行)</summary><pre><code>${escHtml(transcript)}</code></pre></details></section>`
+    ? `<section><details><summary>transcript (${transcript.split("\n").length} 行)</summary><pre><code>${ansiToHtml(transcript)}</code></pre></details></section>`
     : ""}
 </div></body></html>`;
 };
@@ -364,7 +365,7 @@ const renderToolBubble = (
     ? renderJsonSection(use.toolInput)
     : `<details open><summary>input</summary><pre><code>${highlightJson(toJson(use.toolInput))}</code></pre></details>`;
   const resultRaw = rawResult
-    ? `<details><summary>result (raw)</summary><pre><code>${escHtml(rawResult)}</code></pre></details>`
+    ? `<details><summary>result (raw)</summary><pre><code>${ansiToHtml(rawResult)}</code></pre></details>`
     : `<details><summary>result</summary><pre style="color:#656d76;font-style:italic;margin:0;padding:12px"><code>(尚未捕获)</code></pre></details>`;
   return `<section class="bubble tool">
     <div class="bubble-head">🔧 <span class="role">${escHtml(use.toolName)}</span>
