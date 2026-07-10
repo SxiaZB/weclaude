@@ -86,6 +86,12 @@ const Mirror = z.object({
   // 到 jsonl —— 而工具正卡在这张授权卡上, 于是前言在发卡时点既不在 jsonl 也不在
   // hook 的 transcript_tail 里, 唯一存在处是 pane。抠不到时静默退回「只发卡」(无回归)。
   panePreamble: z.boolean().default(true),
+  // Brief 模式: 只对 mirror 模式生效。一个 turn 里群里只发两条 —
+  //   1. turn 起始时:「🧵 [本轮详情](url)」链接 (指向聚合详情页,含所有 tool 输入/输出+中间文本+折叠展示)
+  //   2. turn 结束时: Claude 的 finish text (最终 assistant 回复)
+  // 中间 tool_use / tool_result / thinking / 非 final text 全部只写进详情页,不发气泡。
+  // 授权卡照常发群 (交互无法替代)。false = 现状 (逐条气泡)。
+  brief: z.boolean().default(false),
 });
 
 const Wrc = z.object({

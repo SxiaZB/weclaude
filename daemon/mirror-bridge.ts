@@ -21,7 +21,7 @@ import type { Config } from "../shared/config.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
 import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
-import { recordTool, recordToolResult, buildDetailUrl } from "./detail.js";
+import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnClose, buildDetailUrl } from "./detail.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -1282,6 +1282,10 @@ interface AttachState {
    *  finished flushing the assistant message (with its preceding text) to disk.
    *  Bounded ring; insertion order via Map iteration. */
   recentToolSigs: Map<string, number>;
+  /** Brief 模式当前 turn 的 id (由 newTurnId 生成)。空 = 没有活跃 turn。
+   *  brief 模式下所有 tool_use / tool_result / 中间 text 只写入 detail store,
+   *  不发气泡; final text / turn_end 触发关闭 + finish 消息。 */
+  briefTurnId?: string;
 }
 
 // Mirror outbound state machine. See plan: defer stream open by N ms; flush
@@ -1717,6 +1721,85 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
   };
 
+  // ── Brief mode ────────────────────────────────────────────────────────
+  // 每个 turn 只发两条:
+  //   • 起始时 "🧵 [本轮详情](url)" —— 用 replyStream finish=true 关掉 WeCom loading 气泡
+  //   • 结束时 finish text (Claude 最终文本) —— standalone
+  // 其它所有 item 只写入 turn detail store。
+  const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string): Promise<void> => {
+    if (a.briefTurnId) closeBriefTurn(a); // 上一 turn 未收尾, 强制关掉再开新的
+    const turnId = newTurnId();
+    a.briefTurnId = turnId;
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId });
+    const url = buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId);
+    const body = `🧵 [本轮详情](${url})`;
+    try {
+      await client.replyStream(frame, streamId, body, true);
+    } catch (e) {
+      log.warn({ sessionId: a.sessionId, turnId, err: (e as Error).message }, "brief: turn URL reply failed");
+    }
+    log.info({ sessionId: a.sessionId, turnId, url }, "brief: turn started");
+  };
+
+  const closeBriefTurn = (a: AttachState): void => {
+    if (!a.briefTurnId) return;
+    recordTurnClose(a.briefTurnId);
+    log.info({ sessionId: a.sessionId, turnId: a.briefTurnId }, "brief: turn closed");
+    a.briefTurnId = undefined;
+  };
+
+  // Route one RenderItem into the turn store. final text 会额外作为 standalone 发群。
+  const handleBriefItem = (a: AttachState, item: RenderItem): void => {
+    const turnId = a.briefTurnId;
+    if (!turnId) return;
+    const now = Date.now();
+    if (item.kind === "tool_use") {
+      for (const c of item.calls) {
+        // 也走单卡 detail record — turn 页里 tool_use 段可点开链到独立详情 (以后有需要时)。
+        if (c.toolUseId) {
+          recordTool({
+            id: c.toolUseId,
+            toolName: c.name,
+            toolInput: c.input,
+            sessionId: a.sessionId,
+            target: a.target,
+          });
+        }
+        recordTurnItem(turnId, {
+          t: "tool_use",
+          toolUseId: c.toolUseId,
+          toolName: c.name,
+          toolInput: c.input,
+          ts: now,
+        });
+      }
+      return;
+    }
+    if (item.kind === "tool_result") {
+      recordTurnItem(turnId, { t: "tool_result", toolUseId: item.toolUseId, body: item.full, ts: now });
+      return;
+    }
+    if (item.kind === "text") {
+      recordTurnItem(turnId, { t: "text", body: item.body, ts: now, final: item.final === true });
+      if (item.final === true) {
+        // finish text: 发一条 standalone 到群。closeBriefTurn 由 turn_end 触发。
+        sendStandalone(a, item.body);
+      }
+      return;
+    }
+    if (item.kind === "turn_end") {
+      closeBriefTurn(a);
+      return;
+    }
+    if (item.kind === "skill_output") {
+      // /model 等 skill 输出照旧发群 (用户主动触发, 需要立刻看到反馈)。
+      recordTurnItem(turnId, { t: "text", body: item.body, ts: now });
+      sendStandalone(a, item.body);
+      return;
+    }
+    // user_text (CLI 侧输入) 在 brief 下丢弃 — turn 视角不需要展示。
+  };
+
   const onItem = (a: AttachState, item: RenderItem): void => {
     // Record tool_use signatures unconditionally (before any state branching),
     // so flushBeforeCard's poll-drain can detect that the to-be-approved tool
@@ -1732,6 +1815,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           a.recentToolSigs.delete(oldest);
         }
       }
+    }
+    // Brief mode 短路: 所有正常流/deferral/awaiting 全跳过, 只写入 turn store,
+    // 唯一发到群里的是 turn 结束时的 finish text (下文 handleBriefItem 处理)。
+    if (cfg.wrc.mirror.brief && a.briefTurnId) {
+      handleBriefItem(a, item);
+      return;
     }
     if (a.outbound?.kind === "deferred") {
       handleDeferredItem(a, item);
@@ -1817,6 +1906,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (a.migrationWatcher) { a.migrationWatcher.cancel(); a.migrationWatcher = undefined; }
     if (a.outbound?.kind === "deferred") clearTimeout(a.outbound.timer);
     a.outbound = undefined;
+    if (a.briefTurnId) closeBriefTurn(a);
     if (a.liveStream && !a.liveStream.closed) void finalizeStream(a, a.liveStream);
     if (a.standaloneBuf) { clearTimeout(a.standaloneBuf.timer); flushStandalone(a); }
     a.tail.stop();
@@ -2675,7 +2765,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       //  • armMigration → s undefined, no defer (existing /clear behavior)
       //  • outboundDeferMs > 0 → DEFERRED slot; stream opens later via promote
       //  • outboundDeferMs === 0 → eager openStream + "…" ack (legacy behavior)
-      const eagerOpen = !armMigration && cfg.wrc.mirror.outboundDeferMs <= 0;
+      const brief = cfg.wrc.mirror.brief && !armMigration;
+      const eagerOpen = !armMigration && !brief && cfg.wrc.mirror.outboundDeferMs <= 0;
       const s = eagerOpen ? openStream(a, frame, streamId) : undefined;
       if (s) {
         a.liveStream = s;
@@ -2685,7 +2776,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "stream initial ack failed");
         }
       }
-      if (!armMigration && !eagerOpen) {
+      if (brief) {
+        // 关闭上一 turn (若存在), 起新 turn: 立刻推详情 URL 覆盖 loading 气泡。
+        // 后续 onItem 走 handleBriefItem, 不再走 stream / defer 路径。
+        await startBriefTurn(a, frame, streamId);
+      } else if (!armMigration && !eagerOpen) {
         enterDeferred(a, frame, streamId);
       }
       const sid = a.sessionId;

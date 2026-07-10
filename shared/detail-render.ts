@@ -8,6 +8,8 @@ import type {
   ApprovalDetailRecord,
   DetailRecord,
   ToolDetailRecord,
+  TurnDetailRecord,
+  TurnItem,
 } from "./detail-store.js";
 
 const escHtml = (s: string): string =>
@@ -293,8 +295,215 @@ ${transcript
 </div></body></html>`;
 };
 
-export const renderDetailPage = (r: DetailRecord): string =>
-  r.kind === "tool" ? renderToolPage(r) : renderApprovalPage(r);
+// ── Turn (brief-mode) 聚合页 ────────────────────────────────────────────
+// 一个 turn 内的所有 item 按 ts 序渲染成 claude.ai 风格气泡时间线。
+// tool_use 与其配对的 tool_result 合并为一个可折叠 section (按 toolUseId 匹配)。
+// assistant text 用客户端 markdown-it + highlight.js 富文本渲染 —— 服务端只输出
+// 转义后的原文放到 data-md, 页尾脚本一次性 render 到 .md-body。未 closed 时页面
+// 每 2s meta-refresh, closed 后移除 refresh + 状态徽章切「已完成 · 用时Xs」。
+const TURN_CSS = `
+  .bubbles{display:flex;flex-direction:column;gap:14px;margin-top:8px}
+  .bubble{background:#fff;border:1px solid #d0d7de;border-radius:12px;overflow:hidden}
+  .bubble.assistant{background:#fff}
+  .bubble.final{border-color:#1a7f3766;box-shadow:0 0 0 2px #1a7f3714}
+  .bubble.tool{background:#fafbfc}
+  .bubble.approval{background:#fbfaff}
+  .bubble-head{display:flex;align-items:center;gap:8px;padding:10px 14px;
+    font-size:13px;color:#1f2328;flex-wrap:wrap}
+  .bubble-head .role{font-weight:600}
+  .bubble-head .ts{margin-left:auto;color:#8c959f;font-size:11px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .bubble-head .compact{color:#656d76;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:12.5px;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+  .md-body{padding:2px 16px 14px;color:#1f2328;line-height:1.65;font-size:14px}
+  .md-body p{margin:.6em 0}
+  .md-body h1,.md-body h2,.md-body h3{margin:1em 0 .4em;font-weight:600}
+  .md-body h1{font-size:1.4em}.md-body h2{font-size:1.2em}.md-body h3{font-size:1.05em}
+  .md-body ul,.md-body ol{margin:.6em 0;padding-left:1.6em}
+  .md-body li{margin:.2em 0}
+  .md-body code{background:#f6f8fa;border-radius:4px;padding:1px 5px;font-size:.9em;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .md-body pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;
+    margin:.7em 0;padding:12px;overflow:auto}
+  .md-body pre code{background:transparent;padding:0;font-size:12.5px;line-height:1.5}
+  .md-body blockquote{margin:.6em 0;padding:.2em 1em;border-left:3px solid #d0d7de;color:#656d76}
+  .md-body table{border-collapse:collapse;margin:.7em 0}
+  .md-body th,.md-body td{border:1px solid #d0d7de;padding:6px 10px}
+  .md-body a{color:#0969da;text-decoration:none}
+  .md-body a:hover{text-decoration:underline}
+  .bubble details{border-top:1px solid #eaeef2}
+  .bubble details summary{background:#f6f8fa;border-bottom:0}
+  .typing{color:#8c959f;font-style:italic;padding:10px 14px;
+    background:#fff;border:1px dashed #d0d7de;border-radius:12px}
+  .typing::after{content:"";display:inline-block;width:6px;height:6px;
+    background:#8c959f;border-radius:50%;margin-left:6px;
+    animation:blink 1.2s infinite}
+  @keyframes blink{0%,60%,100%{opacity:.2}30%{opacity:1}}
+`;
+
+const renderJsonSection = (input: unknown): string =>
+  `<details><summary>input</summary><pre><code>${highlightJson(toJson(input))}</code></pre></details>`;
+
+const renderToolBubble = (
+  use: Extract<TurnItem, { t: "tool_use" }>,
+  result: Extract<TurnItem, { t: "tool_result" }> | undefined,
+): string => {
+  const compact = escHtml(oneLineCompact(use.toolInput));
+  const isBash = use.toolName === "Bash";
+  const isRead = use.toolName === "Read";
+  const bashHtml = isBash ? renderBashCommand(use.toolInput) : "";
+  const diffBlocks = extractDiffBlocks(use.toolName, use.toolInput);
+  const diffHtml = diffBlocks.map(renderDiffBlock).join("");
+  const rawResult = result?.body ?? "";
+  const readResultHtml = isRead && rawResult ? renderReadContent(rawResult, extractFilePath(use.toolInput)) : "";
+  const diffResultHtml = rawResult && !isRead ? tryRenderUnifiedDiff(rawResult) : "";
+  const primary = [bashHtml, diffHtml, readResultHtml, diffResultHtml].filter(Boolean).join("");
+  const inputSection = primary
+    ? renderJsonSection(use.toolInput)
+    : `<details open><summary>input</summary><pre><code>${highlightJson(toJson(use.toolInput))}</code></pre></details>`;
+  const resultRaw = rawResult
+    ? `<details><summary>result (raw)</summary><pre><code>${escHtml(rawResult)}</code></pre></details>`
+    : `<details><summary>result</summary><pre style="color:#656d76;font-style:italic;margin:0;padding:12px"><code>(尚未捕获)</code></pre></details>`;
+  return `<section class="bubble tool">
+    <div class="bubble-head">🔧 <span class="role">${escHtml(use.toolName)}</span>
+      <span class="compact">${compact}</span>
+      <span class="ts">${fmtTs(use.ts)}</span></div>
+    ${primary}
+    ${inputSection}
+    ${resultRaw}
+  </section>`;
+};
+
+const oneLineCompact = (input: unknown, max = 100): string => {
+  if (input && typeof input === "object") {
+    const o = input as Record<string, unknown>;
+    const pick = o.command ?? o.file_path ?? o.path ?? o.pattern ?? o.url ?? o.query ?? o.prompt;
+    if (typeof pick === "string") return truncate(pick.replace(/\s+/g, " ").trim(), max);
+  }
+  try { return truncate(JSON.stringify(input) ?? "", max); } catch { return ""; }
+};
+
+const truncate = (s: string, max: number): string =>
+  s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+
+const extractFilePath = (input: unknown): string => {
+  if (!input || typeof input !== "object") return "";
+  const v = (input as Record<string, unknown>).file_path;
+  return typeof v === "string" ? v : "";
+};
+
+const renderTextBubble = (item: Extract<TurnItem, { t: "text" }>): string => {
+  const role = item.final ? "assistant · final" : "assistant";
+  const cls = item.final ? "bubble final" : "bubble assistant";
+  // 原文用 <script type="text/plain"> 承载 —— 免转义歧义, JS 端 textContent 读回原样。
+  return `<section class="${cls}">
+    <div class="bubble-head"><span class="role">${escHtml(role)}</span>
+      <span class="ts">${fmtTs(item.ts)}</span></div>
+    <div class="md-body"></div>
+    <script type="text/plain" class="md-src">${escHtml(item.body)}</script>
+  </section>`;
+};
+
+const renderApprovalItem = (item: Extract<TurnItem, { t: "approval" }>): string => {
+  const b = decisionBadge(item.decision);
+  return `<section class="bubble approval">
+    <div class="bubble-head">🔐 <span class="role">${escHtml(item.toolName)}</span>
+      <span class="badge ${b.cls}">${b.label}</span>
+      <span class="ts">${fmtTs(item.ts)}</span></div>
+  </section>`;
+};
+
+const pairItems = (items: readonly TurnItem[]): Array<{ kind: "solo"; item: TurnItem } | { kind: "pair"; use: Extract<TurnItem, { t: "tool_use" }>; result?: Extract<TurnItem, { t: "tool_result" }> }> => {
+  const results = new Map<string, Extract<TurnItem, { t: "tool_result" }>>();
+  for (const it of items) if (it.t === "tool_result") results.set(it.toolUseId, it);
+  const paired: ReturnType<typeof pairItems> = [];
+  const consumed = new Set<string>();
+  for (const it of items) {
+    if (it.t === "tool_use") {
+      const r = results.get(it.toolUseId);
+      if (r) consumed.add(it.toolUseId);
+      paired.push({ kind: "pair", use: it, result: r });
+    } else if (it.t === "tool_result") {
+      if (consumed.has(it.toolUseId)) continue; // 已附在 tool_use bubble 里
+      paired.push({ kind: "solo", item: it });
+    } else {
+      paired.push({ kind: "solo", item: it });
+    }
+  }
+  return paired;
+};
+
+const renderTurnPage = (r: TurnDetailRecord): string => {
+  const items = [...r.items].sort((a, b) => a.ts - b.ts);
+  const paired = pairItems(items);
+  const bodies = paired.map((p) => {
+    if (p.kind === "pair") return renderToolBubble(p.use, p.result);
+    const it = p.item;
+    if (it.t === "text") return renderTextBubble(it);
+    if (it.t === "approval") return renderApprovalItem(it);
+    if (it.t === "tool_result") {
+      return `<section class="bubble tool">
+        <div class="bubble-head">↩ <span class="role">tool_result</span>
+          <span class="compact">${escHtml(it.toolUseId)}</span>
+          <span class="ts">${fmtTs(it.ts)}</span></div>
+        <details open><summary>result</summary><pre><code>${escHtml(it.body)}</code></pre></details>
+      </section>`;
+    }
+    return "";
+  }).join("");
+  const ageMs = (r.closed ? r.updatedAt : Date.now()) - r.createdAt;
+  const statusBadge = r.closed
+    ? `<span class="badge allow">已完成 · ${fmtDuration(ageMs)}</span>`
+    : `<span class="badge pending">进行中</span>`;
+  const metaParts = [
+    fmtTs(r.createdAt),
+    r.sessionId ? r.sessionId.slice(0, 8) : null,
+    r.target || null,
+    `${items.length} 项`,
+  ].filter(Boolean) as string[];
+  const refresh = r.closed ? "" : `<meta http-equiv="refresh" content="2">`;
+  const typing = r.closed ? "" : `<div class="typing">Claude 正在思考</div>`;
+  // markdown-it + highlight.js from unpkg CDN. html:false 防注入; linkify + breaks 更贴聊天。
+  const script = `
+(function(){
+  if(!window.markdownit) return;
+  var hl = function(str,lang){
+    if(lang && window.hljs){
+      try{return window.hljs.highlight(str,{language:lang,ignoreIllegals:true}).value}catch(e){}
+    }
+    if(window.hljs){try{return window.hljs.highlightAuto(str).value}catch(e){}}
+    return '';
+  };
+  var md = window.markdownit({html:false, linkify:true, breaks:true, highlight:hl});
+  document.querySelectorAll('.bubble').forEach(function(b){
+    var src = b.querySelector('script.md-src');
+    var body = b.querySelector('.md-body');
+    if(src && body){ body.innerHTML = md.render(src.textContent||''); }
+  });
+})();
+`;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${refresh}
+<title>本轮工具调用</title>
+<link rel="stylesheet" href="https://unpkg.com/highlight.js@11/styles/github.min.css">
+<style>${SHARED_CSS}${TURN_CSS}</style>
+<script src="https://unpkg.com/markdown-it@14/dist/markdown-it.min.js"></script>
+<script src="https://unpkg.com/@highlightjs/cdn-assets@11/highlight.min.js"></script>
+</head><body><div class="wrap">
+<header><h1><span class="accent">本轮工具调用</span></h1>${statusBadge}</header>
+<div class="meta">${metaParts.map(escHtml).join('<span class="sep">·</span>')}</div>
+<div class="bubbles">${bodies}${typing}</div>
+</div>
+<script>${script}</script>
+</body></html>`;
+};
+
+export const renderDetailPage = (r: DetailRecord): string => {
+  if (r.kind === "tool") return renderToolPage(r);
+  if (r.kind === "turn") return renderTurnPage(r);
+  return renderApprovalPage(r);
+};
 
 export const renderNotFound = (id: string): string =>
   `<!doctype html><meta charset="utf-8"><body style="font:14px -apple-system,sans-serif;background:#f6f8fa;color:#1f2328;padding:60px 20px;text-align:center"><p style="color:#656d76">未找到 <code style="background:#fff;border:1px solid #d0d7de;border-radius:4px;padding:2px 6px;font-family:ui-monospace,monospace">${escHtml(id)}</code></p></body>`;

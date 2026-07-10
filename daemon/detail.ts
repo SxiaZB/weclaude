@@ -14,10 +14,12 @@ import {
   type DetailRecord,
   type DetailStore,
   type ToolDetailRecord,
+  type TurnDetailRecord,
+  type TurnItem,
 } from "../shared/detail-store.js";
 import { renderDetailPage, renderNotFound } from "../shared/detail-render.js";
 
-export type { ToolDetailRecord, ApprovalDetailRecord } from "../shared/detail-store.js";
+export type { ToolDetailRecord, ApprovalDetailRecord, TurnDetailRecord, TurnItem } from "../shared/detail-store.js";
 
 let store: DetailStore | null = null;
 let remoteBase = "";
@@ -77,6 +79,31 @@ export const recordApprovalDecision = (
   store.recordApprovalDecision(reqId, toApprovalDecision(decision), decidedBy);
   const rec = store.get(reqId);
   if (rec) forwardToRemote(rec);
+};
+
+// Brief 模式聚合详情: 一个 turn 的时间线。startTurn 建空壳,item 增量 append,close 收尾。
+// 每次变更都完整重推整条 record 给 remote svr — svr 侧存的是 last-write-wins 快照。
+export const recordTurnStart = (
+  rec: Omit<TurnDetailRecord, "kind" | "createdAt" | "updatedAt" | "closed" | "items"> & { createdAt?: number },
+): void => {
+  if (!store) return;
+  store.startTurn(rec);
+  const full = store.get(rec.id);
+  if (full) forwardToRemote(full);
+};
+
+export const recordTurnItem = (id: string, item: TurnItem): void => {
+  if (!store) return;
+  store.appendTurnItem(id, item);
+  const full = store.get(id);
+  if (full) forwardToRemote(full);
+};
+
+export const recordTurnClose = (id: string): void => {
+  if (!store) return;
+  store.closeTurn(id);
+  const full = store.get(id);
+  if (full) forwardToRemote(full);
 };
 
 export const getDetail = (id: string): DetailRecord | undefined => store?.get(id);

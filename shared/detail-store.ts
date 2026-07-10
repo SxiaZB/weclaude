@@ -43,7 +43,26 @@ export interface ApprovalDetailRecord {
   decidedAt?: number;
 }
 
-export type DetailRecord = ToolDetailRecord | ApprovalDetailRecord;
+// Brief 模式聚合: 一个 turn 内所有中间事件的时间线快照。turnId = mirror-bridge
+// 侧生成的 turnId (t<base36-time><rand6>);同一 turn 多次 append 覆盖前值 (put 语义)。
+export type TurnItem =
+  | { t: "text"; body: string; ts: number; final?: boolean }
+  | { t: "tool_use"; toolUseId: string; toolName: string; toolInput: unknown; ts: number }
+  | { t: "tool_result"; toolUseId: string; body: string; ts: number }
+  | { t: "approval"; approvalId: string; toolName: string; decision?: ApprovalDecision; ts: number };
+
+export interface TurnDetailRecord {
+  kind: "turn";
+  id: string;
+  createdAt: number;
+  updatedAt: number;
+  closed: boolean;
+  target?: string;
+  sessionId?: string;
+  items: TurnItem[];
+}
+
+export type DetailRecord = ToolDetailRecord | ApprovalDetailRecord | TurnDetailRecord;
 
 export interface DetailStore {
   recordTool(rec: Omit<ToolDetailRecord, "kind" | "createdAt"> & { createdAt?: number }): void;
@@ -52,6 +71,11 @@ export interface DetailStore {
     rec: Omit<ApprovalDetailRecord, "kind" | "createdAt" | "decision" | "decidedAt" | "decidedBy"> & { createdAt?: number },
   ): void;
   recordApprovalDecision(reqId: string, decision: ApprovalDecision, decidedBy?: string): void;
+  startTurn(
+    rec: Omit<TurnDetailRecord, "kind" | "createdAt" | "updatedAt" | "closed" | "items"> & { createdAt?: number },
+  ): void;
+  appendTurnItem(id: string, item: TurnItem): void;
+  closeTurn(id: string): void;
   put(rec: DetailRecord): void;
   get(id: string): DetailRecord | undefined;
 }
@@ -97,7 +121,7 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
         if (!line) continue;
         try {
           const r = JSON.parse(line) as DetailRecord;
-          if (!r?.id || (r.kind !== "tool" && r.kind !== "approval")) continue;
+          if (!r?.id || (r.kind !== "tool" && r.kind !== "approval" && r.kind !== "turn")) continue;
           if (typeof r.createdAt !== "number" || r.createdAt < cutoff) { dropped++; continue; }
           store.set(r.id, r);
           replayed++;
@@ -138,6 +162,27 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
       const r = store.get(reqId);
       if (!r || r.kind !== "approval") return;
       put({ ...r, decision, decidedBy, decidedAt: Date.now() });
+    },
+    startTurn: (rec) => {
+      const now = Date.now();
+      put({
+        kind: "turn",
+        ...rec,
+        createdAt: rec.createdAt ?? now,
+        updatedAt: now,
+        closed: false,
+        items: [],
+      });
+    },
+    appendTurnItem: (id, item) => {
+      const r = store.get(id);
+      if (!r || r.kind !== "turn") return;
+      put({ ...r, items: [...r.items, item], updatedAt: Date.now() });
+    },
+    closeTurn: (id) => {
+      const r = store.get(id);
+      if (!r || r.kind !== "turn" || r.closed) return;
+      put({ ...r, closed: true, updatedAt: Date.now() });
     },
   };
 };
