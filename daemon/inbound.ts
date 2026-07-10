@@ -69,7 +69,7 @@ const renderIds = (msg: BaseMessage, cfg: Config): string => {
 
 const isIdCommand = (text: string): boolean => text.trim() === "/id";
 const isPwdCommand = (text: string): boolean => text.trim() === "/pwd";
-const isCcusageCommand = (text: string): boolean => text.trim() === "/ccusage";
+const isCostCommand = (text: string): boolean => text.trim() === "/cost";
 const isNewCommand = (text: string): boolean => text.trim() === "/new";
 const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
@@ -93,7 +93,7 @@ const renderHelp = (): string =>
     "`/id` 查看会话/权限 id",
     "`/pwd` 当前项目路径",
     "`/usage` 真实订阅额度 %",
-    "`/ccusage` token/成本估算",
+    "`/cost` token/成本估算",
     "`/help` 本帮助",
     "",
     "▎广播订阅",
@@ -414,15 +414,15 @@ export const installInboundRouter = (
       try { await client.replyStream(frame, msg.msgid, renderPwd(who), true); } catch { /* ignore */ }
       return { stop: true, who };
     }
-    // /ccusage — token / cost ESTIMATE pulled from ~/.claude(-internal)?/projects
+    // /cost — token / cost ESTIMATE pulled from ~/.claude(-internal)?/projects
     // jsonl transcripts (ccusage-style). Read-only, no session state, so it
     // bypasses allowFrom like /id and /pwd. Real subscription %: use /usage.
-    if (isCcusageCommand(text)) {
+    if (isCostCommand(text)) {
       let body: string;
       try {
         body = renderUsageReport(computeUsage());
       } catch (e) {
-        body = `[weclaude] /ccusage failed: ${(e as Error).message}`;
+        body = `[weclaude] /cost failed: ${(e as Error).message}`;
       }
       try { await client.replyStream(frame, msg.msgid, body, true); } catch { /* ignore */ }
       return { stop: true, who };
@@ -461,7 +461,7 @@ export const installInboundRouter = (
       return { stop: true, who };
     }
     // Authorized `/usage` — real subscription rate-limit %, scraped from Claude
-    // Code's own `/usage` TUI (/ccusage can only estimate cost/tokens; the true
+    // Code's own `/usage` TUI (/cost can only estimate cost/tokens; the true
     // limit % is server-side). Drives a throwaway isolated pane (~10s) → interim
     // ack, then replace with the result.
     if (isUsageCommand(text)) {
@@ -470,7 +470,9 @@ export const installInboundRouter = (
       let body: string;
       try {
         const report = await captureQuota(cfg, log);
-        body = renderQuotaReport(report);
+        // Wrap in a fenced code block so WeCom renders the aligned panel in a
+        // monospace bubble (columns stay lined up).
+        body = "```\n" + renderQuotaReport(report) + "\n```";
         log.info({ who, limits: report.limits.length }, "/usage panel: done");
       } catch (e) {
         body = `[weclaude] /usage failed: ${(e as Error).message}`;

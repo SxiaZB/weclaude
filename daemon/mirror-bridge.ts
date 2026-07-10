@@ -421,9 +421,10 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
   if (line.type === "user") {
     const c = line.message?.content;
     if (typeof c === "string") {
-      if (!deps.includeUser) return [];
-
-      // Mirror skill outputs like "/model" from <local-command-stdout>
+      // Skill/system feedback (e.g. `/model`'s "Set model to …", background
+      // task completions) is emitted REGARDLESS of includeUser — it's system
+      // output, not the user's own chatter, so the includeUser=false default
+      // (which suppresses echoing user lines) must not swallow it.
       // Match against raw content BEFORE cleanUserText strips the tag.
       const stdoutMatch = c.match(/<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/);
       if (stdoutMatch && stdoutMatch[1]) {
@@ -441,6 +442,8 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
         out.push({ kind: "skill_output", body: renderTaskNotification(taskMatch[1]) });
         return out;
       }
+
+      if (!deps.includeUser) return [];
 
       const text = cleanUserText(c);
       if (!text) return []; // pure slash-command meta / stdout — drop
@@ -540,7 +543,9 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
     const cleaned = stripAnsi(stdout);
     const anchored = anchorSkillOutput(cleaned);
     if (!anchored) return [];
-    return [{ kind: "skill_output", body: `⚙️ ${anchored}` }];
+    // Fenced code block so WeCom renders the aligned /context panel monospaced
+    // (the bar-chart columns only line up in a fixed-width bubble).
+    return [{ kind: "skill_output", body: "⚙️\n```\n" + anchored + "\n```" }];
   }
 
   return [];
@@ -2625,6 +2630,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // own message bubble. Then open a fresh stream tied to the new frame and
       // ack immediately so WeCom doesn't time out while inject queues.
       const armMigration = isClearCommand(text);
+      // `/model <arg>` opens the TUI picker preselected on the match — the
+      // switch only lands after a confirm Enter. Bare `/model` is excluded:
+      // auto-confirming it would just re-pick the current model.
+      const isModelSwitch = /^\/model\s+\S/.test(text.trim());
       // Auto-upgrade /clear → /new when the user has queued a project switch:
       // a plain /clear would only rotate sessionId in the same pane, which sits
       // in the OLD cwd. Killing+respawning is the only way to honor the switch.
@@ -2774,6 +2783,16 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // WECLAUDE_WARN_UNCERTAIN_INJECT=1 if you want the (noisy) heads-up.
         if (r.uncertain && !armMigration && process.env.WECLAUDE_WARN_UNCERTAIN_INJECT === "1") {
           sendStandalone(a, `[mirror] ⚠️ 消息已发送,但目标会话似乎正忙或未响应(输入框未清空),可能未被处理。可稍后重试,或用 \`/sessions\` 切到其它会话。`);
+        }
+        // Confirm the /model picker. Early Enter (before the picker renders)
+        // would leave it unconfirmed, so settle first; a late Enter is a
+        // harmless no-op in the empty input box. On confirm, claude writes
+        // "Set model to …" as <local-command-stdout> — the tail mirrors that
+        // back to the chat as a ⚙️ bubble, which IS the readback.
+        if (isModelSwitch && a.tmuxPane) {
+          await sleepMs(1000);
+          const e = await tmuxRun(["send-keys", "-t", a.tmuxPane, "Enter"]);
+          if (e.code !== 0) log.warn({ pane: a.tmuxPane, reason: e.stdout.slice(-200) || e.code }, "/model confirm Enter failed — user can send /n manually");
         }
         // /clear was just injected — claude rotates sessionId on the next user
         // input. Arm a watcher to migrate the attachment onto the new jsonl,
