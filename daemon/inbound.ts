@@ -74,6 +74,42 @@ const isNewCommand = (text: string): boolean => text.trim() === "/new";
 const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 const isEnterCommand = (text: string): boolean => text.trim() === "/n";
+const isHelpCommand = (text: string): boolean => /^\/(?:help|\?|h)$/i.test(text.trim());
+
+// Static command reference. Grouped: session control, usage/info, topic
+// broadcast (natural-language, zh+en). Anything not matching a command is a
+// prompt forwarded to the bound Claude session.
+const renderHelp = (): string =>
+  [
+    "*weclaude 命令*",
+    "",
+    "▎会话",
+    "`/new` 新开 claude 会话并绑定本聊天",
+    "`/sessions` 列出 live 会话 · `/sessions <emoji|id>` 切换",
+    "`/stop` 打断当前生成 (Esc)",
+    "`/n` 向 CLI 输入回车 (Enter)",
+    "",
+    "▎信息 (免授权)",
+    "`/id` 查看会话/权限 id",
+    "`/pwd` 当前项目路径",
+    "`/usage` 真实订阅额度 %",
+    "`/ccusage` token/成本估算",
+    "`/help` 本帮助",
+    "",
+    "▎广播订阅",
+    "`订阅 <topic>` · `退订 <topic>`",
+    "`广播 <topic> <内容>`",
+    "`每天 08:30 广播 <topic> <内容>`",
+    "`取消广播 <topic>`",
+    "`订阅列表` · `广播列表`",
+    "",
+    "▎引用 (quote)",
+    "引用消息 + 新文字：被引用内容作为上下文前缀附在你的话前。",
+    "纯引用不加字：把被引用内容当正文重发 —— 微信会去重相同文本，",
+    "这是重新触发同一条命令 (如 `/usage`) 的唯一方式。",
+    "",
+    "其余文本直接转发给已绑定的 Claude 会话。",
+  ].join("\n");
 
 // /session(s) [arg] — list live Claude sessions, or switch the mirror to one.
 // Bare "/sessions" (or "/session") lists; an arg (animal emoji, sessionId, or
@@ -365,6 +401,12 @@ export const installInboundRouter = (
     // /id — bypass allowFrom so users can discover their ids before configuring.
     if (isIdCommand(text)) {
       try { await client.replyStream(frame, msg.msgid, renderIds(msg, cfg), true); } catch { /* ignore */ }
+      return { stop: true, who };
+    }
+    // /help — static command reference. Bypasses allowFrom like /id so a new
+    // user can discover the command surface before being authorized.
+    if (isHelpCommand(text)) {
+      try { await client.replyStream(frame, msg.msgid, renderHelp(), true); } catch { /* ignore */ }
       return { stop: true, who };
     }
     // /pwd — bypass allowFrom too. Read-only project-path lookup.
