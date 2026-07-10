@@ -10,7 +10,7 @@ import { makeBridge } from "./cc-bridge.js";
 import { startMirror, installMirrorEventListener, type MirrorBridge } from "./mirror-bridge.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { installApprovalEventListener, makeApproveHandler } from "./approval.js";
-import { initDetailPersistence, makeDetailHandler } from "./detail.js";
+import { initDetailPersistence, makeDetailHandler, configureRemoteForward } from "./detail.js";
 import { initAutoWindowPersistence } from "./session-cache.js";
 import { makeMessageHandler } from "./outbound.js";
 import { makeCardHandler, makeAskHandler, installAskEventListener } from "./ask.js";
@@ -47,6 +47,7 @@ const main = async (): Promise<void> => {
   // Replay tool/approval detail records so reload doesn't lose click-to-detail
   // links from messages already on the user's WeCom timeline.
   initDetailPersistence(cfg.daemon.stateDir, log.child({ mod: "detail" }));
+  configureRemoteForward(cfg.daemon.detailRemoteBase, cfg.daemon.detailRemoteToken);
 
   const ws = startWs(cfg, log);
   // Wrap replyStream / replyStreamWithCard before any module sends —

@@ -35,6 +35,7 @@ weclaude <subcommand>
   mirror-status        show current mirror attachment
   send <chat> <text>   proactive markdown message
   pending              list outstanding approval req_ids
+  svr [args...]        run standalone detail relay (deploy on a host chat + cli both reach)
   logs [-f]            tail daemon log
   config-path            show resolved config path
   sync                   write hooks/MCP/env into sync.targets settings.json
@@ -108,6 +109,12 @@ case "$cmd" in
     http_post /message "$body"
     ;;
   pending) http_get /pending | jq . 2>/dev/null || http_get /pending ;;
+  svr)
+    NODE_BIN="$(command -v node)"
+    SCRIPT="$REPO_ROOT/dist/svr/index.js"
+    [[ -f "$SCRIPT" ]] || { echo "build first: npm run build"; exit 1; }
+    exec "$NODE_BIN" "$SCRIPT" "$@"
+    ;;
   logs)
     log_path=$(http_get /status 2>/dev/null | jq -r '.logFile // empty' 2>/dev/null || true)
     log_path="${log_path:-$HOME_DIR/.weclaude/daemon.log}"

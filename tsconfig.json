@@ -16,6 +16,6 @@
     "forceConsistentCasingInFileNames": true,
     "allowImportingTsExtensions": false
   },
-  "include": ["daemon/**/*", "cli/**/*.ts", "mcp/**/*", "shared/**/*"],
+  "include": ["daemon/**/*", "cli/**/*.ts", "mcp/**/*", "shared/**/*", "svr/**/*"],
   "exclude": ["node_modules", "dist"]
 }

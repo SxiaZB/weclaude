@@ -25,7 +25,8 @@
     "weclaude": "./cli/weclaude.sh",
     "weclaude-daemon": "./dist/daemon/index.js",
     "weclaude-mcp": "./dist/mcp/server.js",
-    "weclaude-init": "./dist/cli/init.js"
+    "weclaude-init": "./dist/cli/init.js",
+    "weclaude-svr": "./dist/svr/index.js"
   },
   "files": [
     ".claude-plugin/marketplace.json",
@@ -41,6 +42,8 @@
     "dist/mcp/**/*.js.map",
     "dist/shared/**/*.js",
     "dist/shared/**/*.js.map",
+    "dist/svr/**/*.js",
+    "dist/svr/**/*.js.map",
     "hooks/pre-tool-use.sh",
     "hooks/hooks.json",
     "scripts/install.sh",
@@ -55,7 +58,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && chmod +x dist/cli/init.js dist/daemon/index.js dist/mcp/server.js",
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli/init.js dist/daemon/index.js dist/mcp/server.js dist/svr/index.js",
     "dev:daemon": "tsx daemon/index.ts",
     "dev:cli": "tsx cli/weclaude.ts",
     "typecheck": "tsc --noEmit",

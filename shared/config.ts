@@ -20,6 +20,13 @@ const Daemon = z.object({
   // 工具调用 / 授权详情页 URL。空则用 http://<host>:<port> (回环)。
   // 想让手机 WeCom 也能点开, 需要在反向代理后填外网地址。桌面端用回环即可。
   detailPublicBase: z.string().default(""),
+  // 远端 detail svr (weclaude svr 起的独立服务, chat + cli 共同可达的网络里)。
+  // 空则不转发, 详情走本机 :port/detail。非空时:
+  //   • 每次 record*() 后 fire-and-forget POST 到 <base>/d, 存到远端 store。
+  //   • buildDetailUrl 用 <base> 作为链接根 (chat 端浏览器打开 <base>/detail?id=...)。
+  // 用这条路径解决 daemon (公司内网) 和 chat 用户 (移动网络) 不同网段的场景。
+  detailRemoteBase: z.string().default(""),
+  detailRemoteToken: z.string().default(""),
   // 镜像消息里给每个 tool_use 行包成 markdown 链接, 点开本地 HTML 详情页。
   detailLinksInMirror: z.boolean().default(true),
 });
