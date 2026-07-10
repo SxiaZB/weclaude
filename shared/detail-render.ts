@@ -464,36 +464,59 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
     r.target || null,
     `${items.length} 项`,
   ].filter(Boolean) as string[];
-  const refresh = r.closed ? "" : `<meta http-equiv="refresh" content="2">`;
   const typing = r.closed ? "" : `<div class="typing">Claude 正在思考</div>`;
   // markdown-it + highlight.js from unpkg CDN. html:false 防注入; linkify + breaks 更贴聊天。
+  // 未 closed 时客户端 2s 轮询同一 URL — DOMParser 抽 .bubbles 换 innerHTML, 不做整页刷新,
+  // 保留滚动位置 + CDN 缓存。closed 时 body[data-closed=1], 轮询自终止。
   const script = `
 (function(){
-  if(!window.markdownit) return;
-  var hl = function(str,lang){
-    if(lang && window.hljs){
-      try{return window.hljs.highlight(str,{language:lang,ignoreIllegals:true}).value}catch(e){}
-    }
-    if(window.hljs){try{return window.hljs.highlightAuto(str).value}catch(e){}}
-    return '';
+  var render = function(scope){
+    if(!window.markdownit) return;
+    var hl = function(str,lang){
+      if(lang && window.hljs){
+        try{return window.hljs.highlight(str,{language:lang,ignoreIllegals:true}).value}catch(e){}
+      }
+      if(window.hljs){try{return window.hljs.highlightAuto(str).value}catch(e){}}
+      return '';
+    };
+    var md = window.markdownit({html:false, linkify:true, breaks:true, highlight:hl});
+    scope.querySelectorAll('.bubble').forEach(function(b){
+      var src = b.querySelector('script.md-src');
+      var body = b.querySelector('.md-body');
+      if(src && body){ body.innerHTML = md.render(src.textContent||''); }
+    });
   };
-  var md = window.markdownit({html:false, linkify:true, breaks:true, highlight:hl});
-  document.querySelectorAll('.bubble').forEach(function(b){
-    var src = b.querySelector('script.md-src');
-    var body = b.querySelector('.md-body');
-    if(src && body){ body.innerHTML = md.render(src.textContent||''); }
-  });
+  render(document);
+  if(document.body.dataset.closed === '1') return;
+  var url = location.href;
+  var tick = function(){
+    fetch(url, {cache:'no-store'}).then(function(r){return r.text()}).then(function(html){
+      var doc = new DOMParser().parseFromString(html, 'text/html');
+      var newBubbles = doc.querySelector('.bubbles');
+      var curBubbles = document.querySelector('.bubbles');
+      if(newBubbles && curBubbles){
+        curBubbles.innerHTML = newBubbles.innerHTML;
+        render(curBubbles);
+      }
+      var newBadge = doc.querySelector('header .badge');
+      var curBadge = document.querySelector('header .badge');
+      if(newBadge && curBadge){ curBadge.outerHTML = newBadge.outerHTML; }
+      var nowClosed = doc.body.dataset.closed === '1';
+      if(nowClosed){ document.body.dataset.closed = '1'; return; }
+      setTimeout(tick, 2000);
+    }).catch(function(){ setTimeout(tick, 2000); });
+  };
+  setTimeout(tick, 2000);
 })();
 `;
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-${refresh}
 <title>本轮工具调用</title>
 <link rel="stylesheet" href="https://unpkg.com/highlight.js@11/styles/github.min.css">
 <style>${SHARED_CSS}${TURN_CSS}</style>
 <script src="https://unpkg.com/markdown-it@14/dist/markdown-it.min.js"></script>
 <script src="https://unpkg.com/@highlightjs/cdn-assets@11/highlight.min.js"></script>
-</head><body><div class="wrap">
+</head><body data-closed="${r.closed ? "1" : "0"}"><div class="wrap">
 <header><h1><span class="accent">本轮工具调用</span></h1>${statusBadge}</header>
 <div class="meta">${metaParts.map(escHtml).join('<span class="sep">·</span>')}</div>
 <div class="bubbles">${bodies}${typing}</div>
