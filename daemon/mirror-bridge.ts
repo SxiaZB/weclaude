@@ -139,6 +139,27 @@ const jsonlHasUserLine = (path: string): boolean => {
   return false;
 };
 
+// Search a jsonl's tail for a just-injected message fingerprint; return the
+// byte offset of the START of the line containing it, or undefined. Used to
+// rebind onto a same-dir fork that swallowed our inject (see armSilentForkRebind)
+// — matching the exact text is what makes cross-session rebind safe when many
+// sessions share one project dir. Bounded tail read (the inject is near EOF).
+const findInjectOffset = (path: string, fp: string): number | undefined => {
+  try {
+    const size = statSync(path).size;
+    const readLen = Math.min(size, 256 * 1024);
+    const start = size - readLen;
+    const fd = openSync(path, "r");
+    const buf = Buffer.alloc(readLen);
+    try { readSync(fd, buf, 0, readLen, start); } finally { closeSync(fd); }
+    const chunk = buf.toString("utf8");
+    const idx = chunk.lastIndexOf(fp);
+    if (idx === -1) return undefined;
+    const lineStart = chunk.lastIndexOf("\n", idx) + 1; // -1 → 0 (chunk head)
+    return start + Buffer.byteLength(chunk.slice(0, lineStart), "utf8");
+  } catch { return undefined; }
+};
+
 // Newest-mtime *.jsonl WITH user content in cwd's encoded project dir. The
 // content gate skips an empty just-touched file so we bind the real session.
 // Reliable for worktree dirs (one session lives there); restore + the drift
@@ -1809,6 +1830,16 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     log.info({ sessionId: a.sessionId, turnId, isSlash }, "brief: turn started");
   };
 
+  // 本轮一旦出现工具调用 / tool_result / 非 final 文本, 就说明这不是"一句话答完"的
+  // 简单 turn —— 立刻把 loading 气泡收成详情链接, 用户马上能点进去看实时刷新的时间线,
+  // 不必等 turn 收口 (旧逻辑 URL 只在 closeBriefTurn 才写, 刷新太慢)。收链接即视作
+  // briefHadTool, 最终结论照常另发 standalone; closeBriefTurn 见气泡已 done 会跳过。
+  const earlyLinkBubble = (a: AttachState): void => {
+    if (!a.briefTurnId || !a.briefBubble || a.briefBubble.done) return;
+    a.briefHadTool = true;
+    void finishBriefBubble(a, briefDetailLink(a.briefTurnId));
+  };
+
   const closeBriefTurn = (a: AttachState): void => {
     if (!a.briefTurnId) return;
     // 气泡还开着 (有工具的 turn: final text 只发了 standalone, 气泡留到这里收链接;
@@ -1830,6 +1861,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const now = Date.now();
     if (item.kind === "tool_use") {
       a.briefHadTool = true; // 有工具 → 气泡收口写详情链接, 结论另发 standalone
+      earlyLinkBubble(a);    // 立刻推详情链接, 不等 turn 收口
       for (const c of item.calls) {
         // 也走单卡 detail record — turn 页里 tool_use 段可点开链到独立详情 (以后有需要时)。
         if (c.toolUseId) {
@@ -1852,11 +1884,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       return;
     }
     if (item.kind === "tool_result") {
+      earlyLinkBubble(a);
       recordTurnItem(turnId, { t: "tool_result", toolUseId: item.toolUseId, body: item.full, ts: now });
       return;
     }
     if (item.kind === "text") {
       recordTurnItem(turnId, { t: "text", body: item.body, ts: now, final: item.final === true });
+      if (item.final !== true) earlyLinkBubble(a); // 非 final 中间输出 → 立刻推链接
       if (item.final === true) {
         // 收口结论: 无工具 → 直接写进 loading 气泡 (一条消息搞定); 有工具 → 气泡留给
         // closeBriefTurn 收详情链接, 结论另发 standalone。本轮 closeBriefTurn 仍由
@@ -2430,6 +2464,58 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     timer = setTimeout(tick, POLL_MS);
   };
 
+  // A user who runs /clear (or restarts claude) directly in the live TUI forks
+  // the pane onto a NEW sid in the SAME project dir — invisible to both watchers
+  // above (startMigrationWatcher wants a daemon-injected new file; followPaneDrift
+  // wants a cross-dir move). The tail then sits on the dead old jsonl and the "…"
+  // bubble never updates. After every inject, if the bound jsonl stays silent
+  // while a same-dir sibling swallowed our exact injected text, rebind onto it —
+  // replaying from our message so the response is mirrored. Fingerprint match on
+  // the injected text is what keeps this from mis-migrating across the many
+  // sessions that legitimately share one project dir.
+  const armSilentForkRebind = (a: AttachState, text: string): void => {
+    if (a.migrationWatcher) return;                 // don't race an in-flight watcher
+    const stripped = text.replace(/\s+/gu, "");
+    if (stripped.length < 8) return;                // too short to fingerprint safely
+    const fp = stripped.slice(0, 40);
+    const dir = dirname(a.jsonlPath);
+    const boundPath = a.jsonlPath;
+    let baseSize = 0; try { baseSize = statSync(boundPath).size; } catch { /* fresh */ }
+    const POLL_MS = 700;
+    const TIMEOUT_MS = 25_000;
+    const t0 = Date.now();
+    let stopped = false;
+    let timer: NodeJS.Timeout | undefined;
+    const tick = (): void => {
+      if (stopped) return;
+      if (Date.now() - t0 > TIMEOUT_MS) { a.migrationWatcher = undefined; return; }
+      // Bound jsonl grew → our message landed in the right session; nothing to do.
+      try { if (statSync(boundPath).size > baseSize) { a.migrationWatcher = undefined; return; } } catch { /* */ }
+      let names: string[] = [];
+      try { names = readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { /* */ }
+      const boundName = boundPath.slice(dir.length + 1);
+      const ranked = names
+        .filter((n) => n !== boundName)
+        .map((n) => ({ n, m: (() => { try { return statSync(join(dir, n)).mtimeMs; } catch { return 0; } })() }))
+        .sort((x, y) => y.m - x.m);
+      for (const c of ranked) {
+        const off = findInjectOffset(join(dir, c.n), fp);
+        if (off === undefined) continue;
+        stopped = true;
+        a.migrationWatcher = undefined;
+        const newSid = c.n.replace(/\.jsonl$/, "");
+        if (newSid !== a.sessionId) {
+          log.info({ target: a.target, oldSid: a.sessionId, newSid, off }, "mirror: silent same-dir fork, rebinding onto forked session");
+          migrateAttachment(a, newSid, join(dir, c.n), off);
+        }
+        return;
+      }
+      timer = setTimeout(tick, POLL_MS);
+    };
+    a.migrationWatcher = { cancel: () => { stopped = true; if (timer) clearTimeout(timer); } };
+    timer = setTimeout(tick, POLL_MS);
+  };
+
   // ── Worktree / session drift follow ─────────────────────────────────
   // An inject isn't the only way the live session under a pane changes:
   // entering OR selecting a git worktree makes Claude Code switch the pane to a
@@ -2987,6 +3073,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         if (r.uncertain && !armMigration && process.env.WECLAUDE_WARN_UNCERTAIN_INJECT === "1") {
           sendStandalone(a, `[mirror] ⚠️ 消息已发送,但目标会话似乎正忙或未响应(输入框未清空),可能未被处理。可稍后重试,或用 \`/sessions\` 切到其它会话。`);
         }
+        // Follow a user-initiated same-dir fork (/clear or manual restart in the
+        // live TUI) that would otherwise leave the tail — and the "…" bubble —
+        // stuck on the dead old jsonl. /clear via WeCom (armMigration) has its
+        // own watcher; skip spawn-mode (no shared pane to fork under us).
+        if (!armMigration && a.tmuxPane) armSilentForkRebind(a, text);
         // Confirm the /model picker. Early Enter (before the picker renders)
         // would leave it unconfirmed, so settle first; a late Enter is a
         // harmless no-op in the empty input box. On confirm, claude writes
