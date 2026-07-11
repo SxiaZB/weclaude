@@ -43,6 +43,16 @@ const fmtTok = (n: number): string => {
   return (n / 1e6).toFixed(2).replace(/\.?0+$/, "") + "M";
 };
 
+// 上下文窗口大小 —— [1m] / 1m 后缀标记 1M 窗口 (Claude Code 长上下文变体), 否则按 200k。
+const ctxWindow = (model?: string): number =>
+  model && /\[?1m\]?/i.test(model) ? 1_000_000 : 200_000;
+
+// 窗口占用压力配色: <60% 绿, <85% 黄, 否则红。
+const ctxPressure = (pct: number): { fill: string; text: string } =>
+  pct < 60 ? { fill: "#1a7f37", text: "#1a7f37" }
+  : pct < 85 ? { fill: "#9a6700", text: "#9a6700" }
+  : { fill: "#cf222e", text: "#cf222e" };
+
 const decisionBadge = (d?: ApprovalDecision): { label: string; cls: string } => {
   if (!d) return { label: "待审批", cls: "pending" };
   if (d === "deny") return { label: "拒绝", cls: "deny" };
@@ -360,7 +370,12 @@ const TURN_CSS = `
     font-variant-numeric:tabular-nums}
   .chip.model{color:#0969da;background:#0969da10;border-color:#0969da33;
     font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif}
-  .chip.ctx{color:#0969da;background:#0969da10;border-color:#0969da33;font-weight:600}
+  .chip.ctx{position:relative;font-weight:600;border-color:currentColor;
+    background:linear-gradient(to right,
+      color-mix(in srgb,var(--fc) 16%,transparent) var(--fill),
+      #f6f8fa var(--fill));overflow:hidden}
+  .chip.ctx::after{content:"";position:absolute;left:0;bottom:0;height:2px;
+    width:var(--fill);background:var(--fc)}
   .chip.ctx b{font-weight:700}
   .chip.mini{font-size:10.5px;opacity:.72;padding:2px 6px}
   .chip.mini.cache{color:#8250df;opacity:.85}
@@ -494,9 +509,12 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
   // 占用 (例: 43 次调用累计 2.6M, 窗口其实只有 ~82k)。所以主指标用峰值, 不用求和。
   // Σ 前缀的 chip 是累计计费口径, 与上下文峰值语义分开。
   const ctxPeak = u ? (u.ctxPeak ?? (u.input + u.cacheRead + u.cacheWrite)) : 0;
+  const win = ctxWindow(r.model);
+  const pct = Math.min(100, Math.round((ctxPeak / win) * 100));
+  const pres = ctxPressure(pct);
   const usageChips = u
     ? [
-        `<span class="chip ctx" title="单次调用送入模型的上下文峰值 = 窗口占用高水位。${u.calls} 次调用各自重读缓存前缀, 故下方 Σ 累计值远大于此。">上下文 <b>${fmtTok(ctxPeak)}</b></span>`,
+        `<span class="chip ctx" style="--fill:${pct}%;--fc:${pres.fill};color:${pres.text}" title="单次调用送入模型的上下文峰值 = 窗口占用高水位, 占 ${fmtTok(win)} 窗口的 ${pct}%。${u.calls} 次调用各自重读缓存前缀, 故下方 Σ 累计值远大于此。">上下文 <b>${fmtTok(ctxPeak)}</b> / ${fmtTok(win)} · ${pct}%</span>`,
         `<span class="chip mini" title="累计: 未命中缓存的新鲜输入">Σin ${fmtTok(u.input)}</span>`,
         u.cacheRead ? `<span class="chip mini cache" title="累计: 缓存命中读取 (计费约 0.1×), 含跨调用重读前缀">Σ↻ ${fmtTok(u.cacheRead)}</span>` : "",
         u.cacheWrite ? `<span class="chip mini cache" title="累计: 写入缓存 (计费约 1.25×)">Σ+ ${fmtTok(u.cacheWrite)}</span>` : "",
