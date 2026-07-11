@@ -114,6 +114,15 @@ export const recordTurnClose = (id: string): void => {
   if (full) forwardToRemote(full);
 };
 
+// 收尾此前遗留未关闭的 turn (按 target 限定, 排除仍在收尾的当前 turn)。
+export const recordCloseOpenTurns = (target?: string, exceptId?: string): void => {
+  if (!store) return;
+  for (const id of store.closeOpenTurns(target, exceptId)) {
+    const full = store.get(id);
+    if (full) forwardToRemote(full);
+  }
+};
+
 export const getDetail = (id: string): DetailRecord | undefined => store?.get(id);
 
 // URL 优先级: remoteBase (chat 端浏览器要连 svr) > publicBase (反代/自定义 host)

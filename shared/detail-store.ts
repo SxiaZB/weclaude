@@ -57,10 +57,14 @@ export type TurnItem =
 export interface TurnUsage {
   input: number;
   output: number;
-  cacheRead: number;   // cache_read_input_tokens
-  cacheWrite: number;  // cache_creation_input_tokens
+  cacheRead: number;   // cache_read_input_tokens — 累计, 含跨调用重读同一前缀
+  cacheWrite: number;  // cache_creation_input_tokens — 累计
   serviceTier?: string;
   calls: number;
+  // 单次 API 调用送入的上下文 (input+cacheRead+cacheWrite) 的峰值 = 窗口占用高水位。
+  // 与上面的累计字段不同: 不随调用次数增长, 反映"窗口有多满"而非"总共读了多少"。
+  // delta 传入时可缺省 (mirror 侧按单调用发, 由 store 计算并落库)。
+  ctxPeak?: number;
 }
 
 export interface TurnDetailRecord {
@@ -92,6 +96,9 @@ export interface DetailStore {
   appendTurnItem(id: string, item: TurnItem): void;
   addTurnUsage(id: string, delta: { model?: string; usage: TurnUsage }): void;
   closeTurn(id: string): void;
+  // 收尾所有仍开着的 turn (可选按 target 限定, 可选排除某一 id)。返回被关闭的 id。
+  // 用途: 新一轮发出 finish 消息时, 把此前遗留未关闭的 turn 一并标记结束。
+  closeOpenTurns(target?: string, exceptId?: string): string[];
   put(rec: DetailRecord): void;
   get(id: string): DetailRecord | undefined;
 }
@@ -199,6 +206,8 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
       const r = store.get(id);
       if (!r || r.kind !== "turn") return;
       const cur = r.usage;
+      // 这一次调用送入的上下文 = 新鲜输入 + 缓存读 + 缓存写 (delta 恒为单次调用)。
+      const callCtx = delta.usage.input + delta.usage.cacheRead + delta.usage.cacheWrite;
       const nextUsage: TurnUsage = cur
         ? {
             input: cur.input + delta.usage.input,
@@ -207,8 +216,9 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
             cacheWrite: cur.cacheWrite + delta.usage.cacheWrite,
             serviceTier: cur.serviceTier ?? delta.usage.serviceTier,
             calls: cur.calls + delta.usage.calls,
+            ctxPeak: Math.max(cur.ctxPeak ?? 0, callCtx),
           }
-        : { ...delta.usage };
+        : { ...delta.usage, ctxPeak: callCtx };
       let model = r.model;
       let modelAlt = r.modelAlt;
       if (delta.model) {
@@ -221,6 +231,18 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
       const r = store.get(id);
       if (!r || r.kind !== "turn" || r.closed) return;
       put({ ...r, closed: true, updatedAt: Date.now() });
+    },
+    closeOpenTurns: (target, exceptId) => {
+      const now = Date.now();
+      const closed: string[] = [];
+      for (const [id, r] of store) {
+        if (r.kind !== "turn" || r.closed) continue;
+        if (id === exceptId) continue;
+        if (target && r.target !== target) continue;
+        put({ ...r, closed: true, updatedAt: now });
+        closed.push(id);
+      }
+      return closed;
     },
   };
 };

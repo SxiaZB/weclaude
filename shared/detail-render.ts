@@ -360,9 +360,12 @@ const TURN_CSS = `
     font-variant-numeric:tabular-nums}
   .chip.model{color:#0969da;background:#0969da10;border-color:#0969da33;
     font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif}
-  .chip.cache{color:#8250df}
+  .chip.ctx{color:#0969da;background:#0969da10;border-color:#0969da33;font-weight:600}
+  .chip.ctx b{font-weight:700}
+  .chip.mini{font-size:10.5px;opacity:.72;padding:2px 6px}
+  .chip.mini.cache{color:#8250df;opacity:.85}
   .chip.tier{color:#9a6700;background:#9a670010;border-color:#9a670033}
-  .chip.muted{opacity:.6}
+  .chip.muted{opacity:.55}
 `;
 
 const renderJsonSection = (input: unknown): string =>
@@ -372,7 +375,6 @@ const renderToolBubble = (
   use: Extract<TurnItem, { t: "tool_use" }>,
   result: Extract<TurnItem, { t: "tool_result" }> | undefined,
 ): string => {
-  const compact = escHtml(oneLineCompact(use.toolInput));
   const isBash = use.toolName === "Bash";
   const isRead = use.toolName === "Read";
   const bashHtml = isBash ? renderBashCommand(use.toolInput) : "";
@@ -382,6 +384,8 @@ const renderToolBubble = (
   const readResultHtml = isRead && rawResult ? renderReadContent(rawResult, extractFilePath(use.toolInput)) : "";
   const diffResultHtml = rawResult && !isRead ? tryRenderUnifiedDiff(rawResult) : "";
   const primary = [bashHtml, diffHtml, readResultHtml, diffResultHtml].filter(Boolean).join("");
+  // primary 已把命令/路径完整展示 —— 头部的一行 compact 只会重复它, 有 primary 时省掉。
+  const compact = primary ? "" : `<span class="compact">${escHtml(oneLineCompact(use.toolInput))}</span>`;
   const inputSection = primary
     ? renderJsonSection(use.toolInput)
     : `<details open><summary>input</summary><pre><code>${highlightJson(toJson(use.toolInput))}</code></pre></details>`;
@@ -390,7 +394,7 @@ const renderToolBubble = (
     : `<details><summary>result</summary><pre style="color:#656d76;font-style:italic;margin:0;padding:12px"><code>(尚未捕获)</code></pre></details>`;
   return `<section class="bubble tool">
     <div class="bubble-head">🔧 <span class="role">${escHtml(use.toolName)}</span>
-      <span class="compact">${compact}</span>
+      ${compact}
       <span class="ts">${fmtTs(use.ts)}</span></div>
     ${primary}
     ${inputSection}
@@ -475,20 +479,28 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
     }
     return "";
   }).join("");
-  const ageMs = (r.closed ? r.updatedAt : Date.now()) - r.createdAt;
-  const statusBadge = r.closed
+  // 出现 assistant·final 即视为本轮结束 —— closeTurn 可能滞后, 但 final 就是最后一条。
+  const done = r.closed || items.some((it) => it.t === "text" && it.final === true);
+  const ageMs = (done ? r.updatedAt : Date.now()) - r.createdAt;
+  const statusBadge = done
     ? `<span class="badge allow">已完成 · ${fmtDuration(ageMs)}</span>`
     : `<span class="badge pending">进行中</span>`;
   const modelChip = r.model
     ? `<span class="chip model">${escHtml(r.model)}${r.modelAlt ? ` +${r.modelAlt}` : ""}</span>`
     : "";
   const u = r.usage;
+  // 上下文 = 单次 API 调用送入的 input+缓存读+缓存写 的峰值 —— 窗口占用高水位。
+  // 关键: 一个 turn 里 N 次调用各自重读同一缓存前缀, 累计 cacheRead 会远大于窗口实际
+  // 占用 (例: 43 次调用累计 2.6M, 窗口其实只有 ~82k)。所以主指标用峰值, 不用求和。
+  // Σ 前缀的 chip 是累计计费口径, 与上下文峰值语义分开。
+  const ctxPeak = u ? (u.ctxPeak ?? (u.input + u.cacheRead + u.cacheWrite)) : 0;
   const usageChips = u
     ? [
-        `<span class="chip">in ${fmtTok(u.input)}</span>`,
-        `<span class="chip">out ${fmtTok(u.output)}</span>`,
-        u.cacheRead ? `<span class="chip cache">cache↻ ${fmtTok(u.cacheRead)}</span>` : "",
-        u.cacheWrite ? `<span class="chip cache">cache+ ${fmtTok(u.cacheWrite)}</span>` : "",
+        `<span class="chip ctx" title="单次调用送入模型的上下文峰值 = 窗口占用高水位。${u.calls} 次调用各自重读缓存前缀, 故下方 Σ 累计值远大于此。">上下文 <b>${fmtTok(ctxPeak)}</b></span>`,
+        `<span class="chip mini" title="累计: 未命中缓存的新鲜输入">Σin ${fmtTok(u.input)}</span>`,
+        u.cacheRead ? `<span class="chip mini cache" title="累计: 缓存命中读取 (计费约 0.1×), 含跨调用重读前缀">Σ↻ ${fmtTok(u.cacheRead)}</span>` : "",
+        u.cacheWrite ? `<span class="chip mini cache" title="累计: 写入缓存 (计费约 1.25×)">Σ+ ${fmtTok(u.cacheWrite)}</span>` : "",
+        `<span class="chip mini" title="累计: 生成输出">Σout ${fmtTok(u.output)}</span>`,
         u.serviceTier && u.serviceTier !== "standard" ? `<span class="chip tier">${escHtml(u.serviceTier)}</span>` : "",
         `<span class="chip muted">${u.calls} call${u.calls > 1 ? "s" : ""}</span>`,
       ].filter(Boolean).join("")
@@ -500,7 +512,7 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
     r.target || null,
     `${items.length} 项`,
   ].filter(Boolean) as string[];
-  const typing = r.closed ? "" : `<div class="typing">Claude 正在思考</div>`;
+  const typing = done ? "" : `<div class="typing">Claude 正在思考</div>`;
   // markdown-it + highlight.js from unpkg CDN. html:false 防注入; linkify + breaks 更贴聊天。
   // 未 closed 时客户端 2s 轮询同一 URL — DOMParser 抽 .bubbles 换 innerHTML, 不做整页刷新,
   // 保留滚动位置 + CDN 缓存。closed 时 body[data-closed=1], 轮询自终止。
@@ -555,7 +567,7 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
 <style>${SHARED_CSS}${TURN_CSS}</style>
 <script src="https://unpkg.com/markdown-it@14/dist/markdown-it.min.js"></script>
 <script src="https://unpkg.com/@highlightjs/cdn-assets@11/highlight.min.js"></script>
-</head><body data-closed="${r.closed ? "1" : "0"}"><div class="wrap">
+</head><body data-closed="${done ? "1" : "0"}"><div class="wrap">
 <header><h1><span class="accent">本轮工具调用</span></h1>${statusBadge}</header>
 ${turnInfo}
 <div class="meta">${metaParts.map(escHtml).join('<span class="sep">·</span>')}</div>

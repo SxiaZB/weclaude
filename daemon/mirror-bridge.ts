@@ -21,7 +21,7 @@ import type { Config } from "../shared/config.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
 import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
-import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, buildDetailUrl } from "./detail.js";
+import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl } from "./detail.js";
 import type { TurnUsage } from "./detail.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
@@ -1322,6 +1322,14 @@ interface AttachState {
    *  brief 模式下所有 tool_use / tool_result / 中间 text 只写入 detail store,
    *  不发气泡; final text / turn_end 触发关闭 + finish 消息。 */
   briefTurnId?: string;
+  /** Brief turn 的 loading 气泡 —— 起始以 "…" (finish=false) 挂住不关闭。turn 收口
+   *  时才定最终内容: 无工具→直接把结论写进这个气泡; 有工具→写详情链接 (结论另发
+   *  standalone)。hardTimer 兜底 WeCom ~6min stream 窗口, 到点强制收口。 */
+  briefBubble?: { frame: WsFrameHeaders; streamId: string; hardTimer: NodeJS.Timeout; done: boolean };
+  /** 本 turn 是否出现过 tool_use —— 决定气泡收口写结论还是写详情链接。 */
+  briefHadTool?: boolean;
+  /** 本 turn 由 slash 命令 (/context…) 触发 —— 其 skill_output 即答案, 写进气泡而非 standalone。 */
+  briefIsSlash?: boolean;
 }
 
 // Mirror outbound state machine. See plan: defer stream open by N ms; flush
@@ -1758,30 +1766,61 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   };
 
   // ── Brief mode ────────────────────────────────────────────────────────
-  // 每个 turn 只发两条:
-  //   • 起始时 "🧵 [本轮详情](url)" —— 用 replyStream finish=true 关掉 WeCom loading 气泡
-  //   • 结束时 finish text (Claude 最终文本) —— standalone
+  // 每个 turn 挂一条 loading 气泡 (起始 "…" finish=false, 不立刻关掉)。收口时:
+  //   • 无工具 → 直接把 Claude 最终文本 (或 slash 命令的 skill_output) 写进这条气泡。
+  //   • 有工具 → 气泡收成 "✴️ 详情链接", 最终文本另发一条 standalone。
   // 其它所有 item 只写入 turn detail store。
-  const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string): Promise<void> => {
+  const briefDetailLink = (turnId: string): string =>
+    `✴️ [View turn details](${buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId)})`;
+
+  // 收口 loading 气泡: finish=true 写入最终内容, 只生效一次。发送失败则退回 standalone。
+  const finishBriefBubble = async (a: AttachState, content: string): Promise<void> => {
+    const b = a.briefBubble;
+    if (!b || b.done) return;
+    b.done = true;
+    clearTimeout(b.hardTimer);
+    a.briefBubble = undefined;
+    try {
+      await client.replyStream(b.frame, b.streamId, content || " ", true);
+    } catch (e) {
+      log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "brief: bubble finish failed; standalone fallback");
+      if (content.trim()) sendStandalone(a, content);
+    }
+  };
+
+  const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string, isSlash = false): Promise<void> => {
     if (a.briefTurnId) closeBriefTurn(a); // 上一 turn 未收尾, 强制关掉再开新的
     const turnId = newTurnId();
     a.briefTurnId = turnId;
+    a.briefHadTool = false;
+    a.briefIsSlash = isSlash;
     recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId });
-    const url = buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId);
-    const body = `🧵 [本轮详情](${url})`;
+    // hardTimer 兜底: turn 若无 final text / turn_end 收口 (卡死/漏收), 到点仍收气泡。
+    const hardTimer = setTimeout(
+      () => void finishBriefBubble(a, a.briefHadTool ? briefDetailLink(turnId) : " "),
+      HARD_TIMEOUT_MS,
+    );
+    a.briefBubble = { frame, streamId, hardTimer, done: false };
     try {
-      await client.replyStream(frame, streamId, body, true);
+      await client.replyStream(frame, streamId, "…", false); // 挂住 loading 气泡, 不关闭
     } catch (e) {
-      log.warn({ sessionId: a.sessionId, turnId, err: (e as Error).message }, "brief: turn URL reply failed");
+      log.warn({ sessionId: a.sessionId, turnId, err: (e as Error).message }, "brief: turn ack failed");
     }
-    log.info({ sessionId: a.sessionId, turnId, url }, "brief: turn started");
+    log.info({ sessionId: a.sessionId, turnId, isSlash }, "brief: turn started");
   };
 
   const closeBriefTurn = (a: AttachState): void => {
     if (!a.briefTurnId) return;
+    // 气泡还开着 (有工具的 turn: final text 只发了 standalone, 气泡留到这里收链接;
+    // 或空 turn 无 final text) —— 收口: 有工具写详情链接, 否则空占位。
+    if (a.briefBubble && !a.briefBubble.done) {
+      void finishBriefBubble(a, a.briefHadTool ? briefDetailLink(a.briefTurnId) : " ");
+    }
     recordTurnClose(a.briefTurnId);
     log.info({ sessionId: a.sessionId, turnId: a.briefTurnId }, "brief: turn closed");
     a.briefTurnId = undefined;
+    a.briefHadTool = false;
+    a.briefIsSlash = false;
   };
 
   // Route one RenderItem into the turn store. final text 会额外作为 standalone 发群。
@@ -1790,6 +1829,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (!turnId) return;
     const now = Date.now();
     if (item.kind === "tool_use") {
+      a.briefHadTool = true; // 有工具 → 气泡收口写详情链接, 结论另发 standalone
       for (const c of item.calls) {
         // 也走单卡 detail record — turn 页里 tool_use 段可点开链到独立详情 (以后有需要时)。
         if (c.toolUseId) {
@@ -1818,8 +1858,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (item.kind === "text") {
       recordTurnItem(turnId, { t: "text", body: item.body, ts: now, final: item.final === true });
       if (item.final === true) {
-        // finish text: 发一条 standalone 到群。closeBriefTurn 由 turn_end 触发。
-        sendStandalone(a, item.body);
+        // 收口结论: 无工具 → 直接写进 loading 气泡 (一条消息搞定); 有工具 → 气泡留给
+        // closeBriefTurn 收详情链接, 结论另发 standalone。本轮 closeBriefTurn 仍由
+        // turn_end 触发 (等尾随 turn_usage 落库); 此前遗留未关闭的 turn 借这次一并收尾。
+        if (a.briefHadTool) sendStandalone(a, item.body);
+        else void finishBriefBubble(a, item.body);
+        recordCloseOpenTurns(a.target, turnId);
       }
       return;
     }
@@ -1832,9 +1876,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       return;
     }
     if (item.kind === "skill_output") {
-      // /model 等 skill 输出照旧发群 (用户主动触发, 需要立刻看到反馈)。
       recordTurnItem(turnId, { t: "text", body: item.body, ts: now });
-      sendStandalone(a, item.body);
+      // slash 命令 (/context…) 的 skill_output 即本轮答案 (无 final text 收口) —— 写进
+      // loading 气泡。非 slash 场景的 skill_output (task 通知等) 是中间反馈, 照旧 standalone。
+      if (a.briefIsSlash && !a.briefHadTool && a.briefBubble && !a.briefBubble.done) {
+        void finishBriefBubble(a, item.body);
+      } else {
+        sendStandalone(a, item.body);
+      }
       return;
     }
     // user_text (CLI 侧输入) 在 brief 下丢弃 — turn 视角不需要展示。
@@ -2780,6 +2829,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // switch only lands after a confirm Enter. Bare `/model` is excluded:
       // auto-confirming it would just re-pick the current model.
       const isModelSwitch = /^\/model\s+\S/.test(text.trim());
+      // 任意 slash 命令 (/context, /cost, /status…): 产物走 skill_output standalone,
+      // 详情链接是纯噪声 —— brief 起 turn 时不推链接。
+      const isSlash = /^\/[a-z]/i.test(text.trim());
       // Auto-upgrade /clear → /new when the user has queued a project switch:
       // a plain /clear would only rotate sessionId in the same pane, which sits
       // in the OLD cwd. Killing+respawning is the only way to honor the switch.
@@ -2835,7 +2887,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       if (brief) {
         // 关闭上一 turn (若存在), 起新 turn: 立刻推详情 URL 覆盖 loading 气泡。
         // 后续 onItem 走 handleBriefItem, 不再走 stream / defer 路径。
-        await startBriefTurn(a, frame, streamId);
+        await startBriefTurn(a, frame, streamId, isSlash);
       } else if (!armMigration && !eagerOpen) {
         enterDeferred(a, frame, streamId);
       }
