@@ -21,7 +21,8 @@ import type { Config } from "../shared/config.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
 import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
-import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnClose, buildDetailUrl } from "./detail.js";
+import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, buildDetailUrl } from "./detail.js";
+import type { TurnUsage } from "./detail.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -237,6 +238,19 @@ interface TranscriptLine {
      *  quotable without waiting for the next inbound or the 6-min hard
      *  timeout). `tool_use` is NOT terminal — more turns will follow. */
     stop_reason?: string;
+    /** Model name (e.g. "claude-4.7-opus") on assistant lines. Extracted into
+     *  turn store so the detail page can display it as a muted chip. */
+    model?: string;
+    /** Per-API-call usage snapshot on assistant lines. Each assistant line has
+     *  its own independent counts; a multi-tool turn spans several lines and
+     *  needs field-level accumulation in the turn store. */
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+      service_tier?: string;
+    };
   };
   isMeta?: boolean;
   isSidechain?: boolean;
@@ -336,7 +350,11 @@ type RenderItem =
   // max_tokens}). Emitted AFTER any text/tool_use items from the same line so
   // onItem can finalize the bubble once the content has been appended. Pure
   // signal — no body to render.
-  | { kind: "turn_end" };
+  | { kind: "turn_end" }
+  // Per-assistant-line usage snapshot (model + token counts). Consumed only in
+  // brief mode where it's fed into the turn store for aggregate chip display.
+  // Non-brief onItem drops it silently — no bubble, no stream side effect.
+  | { kind: "turn_usage"; model?: string; usage: TurnUsage };
 
 const oneLineSummary = (s: string, max = 40): string => {
   const flat = s.replace(/\s+/g, " ").trim();
@@ -523,6 +541,24 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
       // thinking blocks intentionally skipped
     }
     flushPending();
+    // Emit per-line usage snapshot BEFORE turn_end so brief store gets the last
+    // increment before the turn closes. Non-brief onItem drops it silently.
+    const u = line.message?.usage;
+    if (u) {
+      const model = typeof line.message?.model === "string" ? line.message.model : undefined;
+      out.push({
+        kind: "turn_usage",
+        model,
+        usage: {
+          input: u.input_tokens ?? 0,
+          output: u.output_tokens ?? 0,
+          cacheRead: u.cache_read_input_tokens ?? 0,
+          cacheWrite: u.cache_creation_input_tokens ?? 0,
+          serviceTier: u.service_tier,
+          calls: 1,
+        },
+      });
+    }
     // Terminal stop_reason → emit turn_end so onItem closes the live bubble.
     // `tool_use` is intentionally excluded — more turns will follow once the
     // tool result lands; finalizing now would split a single logical reply.
@@ -1791,6 +1827,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       closeBriefTurn(a);
       return;
     }
+    if (item.kind === "turn_usage") {
+      recordTurnUsage(turnId, { model: item.model, usage: item.usage });
+      return;
+    }
     if (item.kind === "skill_output") {
       // /model 等 skill 输出照旧发群 (用户主动触发, 需要立刻看到反馈)。
       recordTurnItem(turnId, { t: "text", body: item.body, ts: now });
@@ -1816,6 +1856,22 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         }
       }
     }
+    // Usage snapshots never flow into WeCom bubbles — brief 分支下 handleBriefItem
+    // 会把它写进 turn store, 非 brief 下直接吞掉, 保持 onItem 主流程只处理有渲染
+    // 输出的 item 类型。
+    if (item.kind === "turn_usage" && !(cfg.wrc.mirror.brief && a.briefTurnId)) {
+      return;
+    }
+    // Brief mode 短路: 所有正常流/deferral/awaiting 全跳过, 只写入 turn store,
+    // 唯一发到群里的是 turn 结束时的 finish text (下文 handleBriefItem 处理)。
+    if (cfg.wrc.mirror.brief && a.briefTurnId) {
+      handleBriefItem(a, item);
+      return;
+    }
+    // 到这里已经过了 brief 分支; turn_usage 若还残留(brief=false 走上面早退,
+    // brief && briefTurnId 走 handleBriefItem), 逻辑上不可能, 兜底再吞一次让 TS
+    // 收窄类型 —— 下方 append/standalone 分支只处理带 body 的 item。
+    if (item.kind === "turn_usage") return;
     // Brief mode 短路: 所有正常流/deferral/awaiting 全跳过, 只写入 turn store,
     // 唯一发到群里的是 turn 结束时的 finish text (下文 handleBriefItem 处理)。
     if (cfg.wrc.mirror.brief && a.briefTurnId) {

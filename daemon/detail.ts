@@ -16,10 +16,11 @@ import {
   type ToolDetailRecord,
   type TurnDetailRecord,
   type TurnItem,
+  type TurnUsage,
 } from "../shared/detail-store.js";
 import { renderDetailPage, renderNotFound } from "../shared/detail-render.js";
 
-export type { ToolDetailRecord, ApprovalDetailRecord, TurnDetailRecord, TurnItem } from "../shared/detail-store.js";
+export type { ToolDetailRecord, ApprovalDetailRecord, TurnDetailRecord, TurnItem, TurnUsage } from "../shared/detail-store.js";
 
 let store: DetailStore | null = null;
 let remoteBase = "";
@@ -95,6 +96,13 @@ export const recordTurnStart = (
 export const recordTurnItem = (id: string, item: TurnItem): void => {
   if (!store) return;
   store.appendTurnItem(id, item);
+  const full = store.get(id);
+  if (full) forwardToRemote(full);
+};
+
+export const recordTurnUsage = (id: string, delta: { model?: string; usage: TurnUsage }): void => {
+  if (!store) return;
+  store.addTurnUsage(id, delta);
   const full = store.get(id);
   if (full) forwardToRemote(full);
 };

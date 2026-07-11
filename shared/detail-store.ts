@@ -51,6 +51,18 @@ export type TurnItem =
   | { t: "tool_result"; toolUseId: string; body: string; ts: number }
   | { t: "approval"; approvalId: string; toolName: string; decision?: ApprovalDecision; ts: number };
 
+// 累计一个 turn 内所有 assistant 行的 token usage — 每次 assistant 行都拿到独立
+// 的 usage 值 (Anthropic Messages API 语义), 需要字段级累加。serviceTier 只保留
+// 首见值; calls 记录累加了几次 (不是 tool 调用数, 是 API 调用数)。
+export interface TurnUsage {
+  input: number;
+  output: number;
+  cacheRead: number;   // cache_read_input_tokens
+  cacheWrite: number;  // cache_creation_input_tokens
+  serviceTier?: string;
+  calls: number;
+}
+
 export interface TurnDetailRecord {
   kind: "turn";
   id: string;
@@ -60,6 +72,9 @@ export interface TurnDetailRecord {
   target?: string;
   sessionId?: string;
   items: TurnItem[];
+  model?: string;      // 首个见到的 model 名
+  modelAlt?: number;   // 与 model 不同的后续行数, 用于渲染 "+N"
+  usage?: TurnUsage;
 }
 
 export type DetailRecord = ToolDetailRecord | ApprovalDetailRecord | TurnDetailRecord;
@@ -75,6 +90,7 @@ export interface DetailStore {
     rec: Omit<TurnDetailRecord, "kind" | "createdAt" | "updatedAt" | "closed" | "items"> & { createdAt?: number },
   ): void;
   appendTurnItem(id: string, item: TurnItem): void;
+  addTurnUsage(id: string, delta: { model?: string; usage: TurnUsage }): void;
   closeTurn(id: string): void;
   put(rec: DetailRecord): void;
   get(id: string): DetailRecord | undefined;
@@ -178,6 +194,28 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
       const r = store.get(id);
       if (!r || r.kind !== "turn") return;
       put({ ...r, items: [...r.items, item], updatedAt: Date.now() });
+    },
+    addTurnUsage: (id, delta) => {
+      const r = store.get(id);
+      if (!r || r.kind !== "turn") return;
+      const cur = r.usage;
+      const nextUsage: TurnUsage = cur
+        ? {
+            input: cur.input + delta.usage.input,
+            output: cur.output + delta.usage.output,
+            cacheRead: cur.cacheRead + delta.usage.cacheRead,
+            cacheWrite: cur.cacheWrite + delta.usage.cacheWrite,
+            serviceTier: cur.serviceTier ?? delta.usage.serviceTier,
+            calls: cur.calls + delta.usage.calls,
+          }
+        : { ...delta.usage };
+      let model = r.model;
+      let modelAlt = r.modelAlt;
+      if (delta.model) {
+        if (!model) model = delta.model;
+        else if (model !== delta.model) modelAlt = (modelAlt ?? 0) + 1;
+      }
+      put({ ...r, model, modelAlt, usage: nextUsage, updatedAt: Date.now() });
     },
     closeTurn: (id) => {
       const r = store.get(id);

@@ -33,6 +33,16 @@ const fmtDuration = (ms: number): string => {
   return `${m}m${rs}s`;
 };
 
+// 42431 → "42.4k"; 999 → "999"; 12345678 → "12.35M"
+const fmtTok = (n: number): string => {
+  if (n < 1000) return String(n);
+  if (n < 1e6) {
+    const v = n / 1000;
+    return (v >= 10 ? v.toFixed(0) : v.toFixed(1).replace(/\.0$/, "")) + "k";
+  }
+  return (n / 1e6).toFixed(2).replace(/\.?0+$/, "") + "M";
+};
+
 const decisionBadge = (d?: ApprovalDecision): { label: string; cls: string } => {
   if (!d) return { label: "待审批", cls: "pending" };
   if (d === "deny") return { label: "拒绝", cls: "deny" };
@@ -342,6 +352,17 @@ const TURN_CSS = `
     background:#8c959f;border-radius:50%;margin-left:6px;
     animation:blink 1.2s infinite}
   @keyframes blink{0%,60%,100%{opacity:.2}30%{opacity:1}}
+  .turn-info{display:flex;flex-wrap:wrap;gap:6px;margin:-6px 0 12px}
+  .turn-info:empty{display:none}
+  .chip{font-size:11px;padding:2px 8px;border-radius:10px;background:#f6f8fa;
+    color:#57606a;border:1px solid #d0d7de55;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-variant-numeric:tabular-nums}
+  .chip.model{color:#0969da;background:#0969da10;border-color:#0969da33;
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif}
+  .chip.cache{color:#8250df}
+  .chip.tier{color:#9a6700;background:#9a670010;border-color:#9a670033}
+  .chip.muted{opacity:.6}
 `;
 
 const renderJsonSection = (input: unknown): string =>
@@ -458,6 +479,21 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
   const statusBadge = r.closed
     ? `<span class="badge allow">已完成 · ${fmtDuration(ageMs)}</span>`
     : `<span class="badge pending">进行中</span>`;
+  const modelChip = r.model
+    ? `<span class="chip model">${escHtml(r.model)}${r.modelAlt ? ` +${r.modelAlt}` : ""}</span>`
+    : "";
+  const u = r.usage;
+  const usageChips = u
+    ? [
+        `<span class="chip">in ${fmtTok(u.input)}</span>`,
+        `<span class="chip">out ${fmtTok(u.output)}</span>`,
+        u.cacheRead ? `<span class="chip cache">cache↻ ${fmtTok(u.cacheRead)}</span>` : "",
+        u.cacheWrite ? `<span class="chip cache">cache+ ${fmtTok(u.cacheWrite)}</span>` : "",
+        u.serviceTier && u.serviceTier !== "standard" ? `<span class="chip tier">${escHtml(u.serviceTier)}</span>` : "",
+        `<span class="chip muted">${u.calls} call${u.calls > 1 ? "s" : ""}</span>`,
+      ].filter(Boolean).join("")
+    : "";
+  const turnInfo = `<div class="turn-info">${modelChip}${usageChips}</div>`;
   const metaParts = [
     fmtTs(r.createdAt),
     r.sessionId ? r.sessionId.slice(0, 8) : null,
@@ -501,6 +537,9 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
       var newBadge = doc.querySelector('header .badge');
       var curBadge = document.querySelector('header .badge');
       if(newBadge && curBadge){ curBadge.outerHTML = newBadge.outerHTML; }
+      var newInfo = doc.querySelector('.turn-info');
+      var curInfo = document.querySelector('.turn-info');
+      if(newInfo && curInfo){ curInfo.outerHTML = newInfo.outerHTML; }
       var nowClosed = doc.body.dataset.closed === '1';
       if(nowClosed){ document.body.dataset.closed = '1'; return; }
       setTimeout(tick, 2000);
@@ -518,6 +557,7 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
 <script src="https://unpkg.com/@highlightjs/cdn-assets@11/highlight.min.js"></script>
 </head><body data-closed="${r.closed ? "1" : "0"}"><div class="wrap">
 <header><h1><span class="accent">本轮工具调用</span></h1>${statusBadge}</header>
+${turnInfo}
 <div class="meta">${metaParts.map(escHtml).join('<span class="sep">·</span>')}</div>
 <div class="bubbles">${bodies}${typing}</div>
 </div>
