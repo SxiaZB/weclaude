@@ -495,11 +495,12 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
         const raw = extractToolResultText(b);
         if (!raw) continue;
         const toolUseId = b.tool_use_id ?? "";
-        // 始终把完整 result 落 detail 库 — 与 includeToolResults(气泡推送开关)解耦,
-        // 否则关掉气泡时点"详情"看不到 result。
-        if (toolUseId) recordToolResult(toolUseId, truncate(raw, DETAIL_RESULT_MAX));
-        if (!deps.includeToolResults) continue;
-        const full = truncate(raw, deps.toolResultMaxChars);
+        const full = truncate(raw, DETAIL_RESULT_MAX);
+        // 始终把完整 result 落 detail 库 + 作为 tool_result item 发出 — 与
+        // includeToolResults(气泡推送开关)彻底解耦: 关掉气泡时 detail 页与 brief
+        // turn 页(handleBriefItem 消费本 item 写 turn store)都仍要看到 result。
+        // 气泡推送的 gate 挪到非-brief 消费端 (onItem), 见下方 includeToolResults 判断。
+        if (toolUseId) recordToolResult(toolUseId, full);
         const compact = safeForMarkdown(oneLineSummary(full, 40));
         const url = deps.detailUrlFor(toolUseId);
         out.push({
@@ -1955,6 +1956,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // brief && briefTurnId 走 handleBriefItem), 逻辑上不可能, 兜底再吞一次让 TS
     // 收窄类型 —— 下方 append/standalone 分支只处理带 body 的 item。
     if (item.kind === "turn_usage") return;
+    // tool_result 气泡推送开关。parseLine 现在无条件发出 tool_result (供 detail/turn
+    // 页消费); 非-brief 的所有气泡消费路径(deferred/awaiting/streaming/standalone)
+    // 在此统一 gate: includeToolResults=false 时不把 result 推进气泡, 与旧行为一致。
+    if (item.kind === "tool_result" && !cfg.wrc.mirror.includeToolResults) return;
     // Brief mode 短路: 所有正常流/deferral/awaiting 全跳过, 只写入 turn store,
     // 唯一发到群里的是 turn 结束时的 finish text (下文 handleBriefItem 处理)。
     if (cfg.wrc.mirror.brief && a.briefTurnId) {
