@@ -43,15 +43,14 @@ const fmtTok = (n: number): string => {
   return (n / 1e6).toFixed(2).replace(/\.?0+$/, "") + "M";
 };
 
-// 上下文窗口大小 —— [1m] / 1m 后缀标记 1M 窗口 (Claude Code 长上下文变体), 否则按 200k。
-const ctxWindow = (model?: string): number =>
-  model && /\[?1m\]?/i.test(model) ? 1_000_000 : 200_000;
-
-// 窗口占用压力配色: <60% 绿, <85% 黄, 否则红。
-const ctxPressure = (pct: number): { fill: string; text: string } =>
-  pct < 60 ? { fill: "#1a7f37", text: "#1a7f37" }
-  : pct < 85 ? { fill: "#9a6700", text: "#9a6700" }
-  : { fill: "#cf222e", text: "#cf222e" };
+// token 分类配色 (统计卡片的堆叠条 + 图例共用)。
+const TOK_COLORS = {
+  ctx: "#0969da",       // 上下文峰值 (蓝)
+  input: "#0a7d6b",     // 新鲜输入 (青绿)
+  cacheRead: "#8250df", // 缓存读 (紫)
+  cacheWrite: "#953800",// 缓存写 (棕)
+  output: "#1a7f37",    // 输出 (绿)
+} as const;
 
 const decisionBadge = (d?: ApprovalDecision): { label: string; cls: string } => {
   if (!d) return { label: "待审批", cls: "pending" };
@@ -362,25 +361,47 @@ const TURN_CSS = `
     background:#8c959f;border-radius:50%;margin-left:6px;
     animation:blink 1.2s infinite}
   @keyframes blink{0%,60%,100%{opacity:.2}30%{opacity:1}}
-  .turn-info{display:flex;flex-wrap:wrap;gap:6px;margin:-6px 0 12px}
+  .turn-info{display:flex;flex-wrap:wrap;gap:6px;margin:-6px 0 12px;align-items:center}
   .turn-info:empty{display:none}
-  .chip{font-size:11px;padding:2px 8px;border-radius:10px;background:#f6f8fa;
-    color:#57606a;border:1px solid #d0d7de55;
+  .chip.model{font-size:12px;padding:3px 10px;border-radius:12px;color:#0969da;
+    background:#0969da10;border:1px solid #0969da33;font-weight:600;
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif}
+  .chip.model .alt{opacity:.6;font-weight:400}
+  .chip.tier{font-size:11px;padding:2px 8px;border-radius:10px;color:#9a6700;
+    background:#9a670010;border:1px solid #9a670033;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  /* ── 统计卡片 ── */
+  .stats{background:#fff;border:1px solid #d0d7de;border-radius:12px;
+    padding:18px 18px 16px;margin:0 0 16px;
+    box-shadow:0 1px 2px #1f23280a}
+  .stats-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+    gap:10px;margin-bottom:16px}
+  .tile{background:#f6f8fa;border:1px solid #eaeef2;border-radius:10px;
+    padding:12px 14px;display:flex;flex-direction:column;gap:3px}
+  .tile .k{font-size:11px;color:#8c959f;text-transform:uppercase;
+    letter-spacing:.5px;font-weight:600}
+  .tile .v{font-size:24px;font-weight:700;line-height:1.1;
+    font-variant-numeric:tabular-nums;color:#1f2328;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .tile .v .u{font-size:14px;font-weight:600;color:#8c959f;margin-left:1px}
+  .tile.accent .v{color:#0969da}
+  .stats-io .io-title{font-size:11px;color:#8c959f;text-transform:uppercase;
+    letter-spacing:.5px;font-weight:600;margin-bottom:8px}
+  .io-bar{display:flex;height:12px;border-radius:6px;overflow:hidden;
+    background:#eaeef2;margin-bottom:10px}
+  .io-bar .seg{height:100%}
+  .io-legend{display:flex;flex-wrap:wrap;gap:14px}
+  .io-legend .item{display:flex;align-items:center;gap:6px;font-size:12px;
+    color:#57606a}
+  .io-legend .dot{width:9px;height:9px;border-radius:3px;flex:none}
+  .io-legend .num{font-weight:700;color:#1f2328;
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
     font-variant-numeric:tabular-nums}
-  .chip.model{color:#0969da;background:#0969da10;border-color:#0969da33;
-    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif}
-  .chip.ctx{position:relative;font-weight:600;border-color:currentColor;
-    background:linear-gradient(to right,
-      color-mix(in srgb,var(--fc) 16%,transparent) var(--fill),
-      #f6f8fa var(--fill));overflow:hidden}
-  .chip.ctx::after{content:"";position:absolute;left:0;bottom:0;height:2px;
-    width:var(--fill);background:var(--fc)}
-  .chip.ctx b{font-weight:700}
-  .chip.mini{font-size:10.5px;opacity:.72;padding:2px 6px}
-  .chip.mini.cache{color:#8250df;opacity:.85}
-  .chip.tier{color:#9a6700;background:#9a670010;border-color:#9a670033}
-  .chip.muted{opacity:.55}
+  /* ── 用户提问气泡 ── */
+  .bubble.user{background:#0969da0a;border-color:#0969da33}
+  .bubble.user .bubble-head{color:#0969da}
+  .bubble.user .q-body{padding:2px 16px 14px;color:#1f2328;line-height:1.6;
+    font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
 `;
 
 const renderJsonSection = (input: unknown): string =>
@@ -389,6 +410,7 @@ const renderJsonSection = (input: unknown): string =>
 const renderToolBubble = (
   use: Extract<TurnItem, { t: "tool_use" }>,
   result: Extract<TurnItem, { t: "tool_result" }> | undefined,
+  key: string,
 ): string => {
   const isBash = use.toolName === "Bash";
   const isRead = use.toolName === "Read";
@@ -407,7 +429,7 @@ const renderToolBubble = (
   const resultRaw = rawResult
     ? `<details><summary>result (raw)</summary><pre><code>${ansiToHtml(rawResult)}</code></pre></details>`
     : `<details><summary>result</summary><pre style="color:#656d76;font-style:italic;margin:0;padding:12px"><code>(尚未捕获)</code></pre></details>`;
-  return `<section class="bubble tool">
+  return `<section class="bubble tool" data-key="${key}">
     <div class="bubble-head">🔧 <span class="role">${escHtml(use.toolName)}</span>
       ${compact}
       <span class="ts">${fmtTs(use.ts)}</span></div>
@@ -435,11 +457,11 @@ const extractFilePath = (input: unknown): string => {
   return typeof v === "string" ? v : "";
 };
 
-const renderTextBubble = (item: Extract<TurnItem, { t: "text" }>): string => {
+const renderTextBubble = (item: Extract<TurnItem, { t: "text" }>, key: string): string => {
   const role = item.final ? "assistant · final" : "assistant";
   const cls = item.final ? "bubble final" : "bubble assistant";
   // 原文用 <script type="text/plain"> 承载 —— 免转义歧义, JS 端 textContent 读回原样。
-  return `<section class="${cls}">
+  return `<section class="${cls}" data-key="${key}">
     <div class="bubble-head"><span class="role">${escHtml(role)}</span>
       <span class="ts">${fmtTs(item.ts)}</span></div>
     <div class="md-body"></div>
@@ -447,9 +469,9 @@ const renderTextBubble = (item: Extract<TurnItem, { t: "text" }>): string => {
   </section>`;
 };
 
-const renderApprovalItem = (item: Extract<TurnItem, { t: "approval" }>): string => {
+const renderApprovalItem = (item: Extract<TurnItem, { t: "approval" }>, key: string): string => {
   const b = decisionBadge(item.decision);
-  return `<section class="bubble approval">
+  return `<section class="bubble approval" data-key="${key}">
     <div class="bubble-head">🔐 <span class="role">${escHtml(item.toolName)}</span>
       <span class="badge ${b.cls}">${b.label}</span>
       <span class="ts">${fmtTs(item.ts)}</span></div>
@@ -476,16 +498,77 @@ const pairItems = (items: readonly TurnItem[]): Array<{ kind: "solo"; item: Turn
   return paired;
 };
 
+// token 数 → "42.4k" 拆成 {n, u} 供 tile 用大数字 + 小单位分开排版。
+const splitTok = (n: number): { n: string; u: string } => {
+  const s = fmtTok(n);
+  const m = /^([\d.]+)([kM]?)$/.exec(s);
+  return m ? { n: m[1]!, u: m[2]! } : { n: s, u: "" };
+};
+
+const tile = (label: string, n: number, accent = false): string => {
+  const { n: num, u } = splitTok(n);
+  return `<div class="tile${accent ? " accent" : ""}"><span class="k">${label}</span>
+    <span class="v">${num}${u ? `<span class="u">${u}</span>` : ""}</span></div>`;
+};
+
+// 累计 token I/O 的堆叠条 + 图例。上下文峰值单列一 tile, 这里画的是「总共读写了多少」
+// 的计费口径 (cacheRead 常远大于窗口占用, 属正常 —— 每次调用重读同一前缀累加)。
+const renderStats = (u: NonNullable<TurnDetailRecord["usage"]>, ctxPeak: number, ageMs: number, done: boolean): string => {
+  const allSegs: Array<{ key: keyof typeof TOK_COLORS; label: string; n: number }> = [
+    { key: "input", label: "Input", n: u.input },
+    { key: "cacheRead", label: "Cache read", n: u.cacheRead },
+    { key: "cacheWrite", label: "Cache write", n: u.cacheWrite },
+    { key: "output", label: "Output", n: u.output },
+  ];
+  const segs = allSegs.filter((s) => s.n > 0);
+  const total = segs.reduce((a, s) => a + s.n, 0) || 1;
+  const bar = segs
+    .map((s) => `<span class="seg" style="width:${((s.n / total) * 100).toFixed(2)}%;background:${TOK_COLORS[s.key]}" title="${s.label}: ${fmtTok(s.n)}"></span>`)
+    .join("");
+  const legend = segs
+    .map((s) => `<span class="item"><span class="dot" style="background:${TOK_COLORS[s.key]}"></span>${s.label} <span class="num">${fmtTok(s.n)}</span></span>`)
+    .join("");
+  const tiles = [
+    tile("Context", ctxPeak, true),
+    tile("Output", u.output),
+    `<div class="tile"><span class="k">API calls</span><span class="v">${u.calls}</span></div>`,
+    `<div class="tile"><span class="k">${done ? "Duration" : "Elapsed"}</span><span class="v" style="font-size:20px">${escHtml(fmtDuration(ageMs))}</span></div>`,
+  ].join("");
+  return `<section class="stats">
+    <div class="stats-tiles">${tiles}</div>
+    <div class="stats-io">
+      <div class="io-title">Token I/O · cumulative</div>
+      <div class="io-bar">${bar}</div>
+      <div class="io-legend">${legend}</div>
+    </div>
+  </section>`;
+};
+
+// djb2 → base36. reconcile 用它做「气泡内容变没变」的判据 —— 不用 outerHTML, 因为客户端
+// 会往 text 气泡的 .md-body 里填渲染结果, 污染 outerHTML; data-sig 是服务端算的纯内容指纹。
+const hashStr = (s: string): string => {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+};
+
+// 在气泡根 tag 的 data-key 后补一个 data-sig=内容指纹 (指纹基于未含 sig 的原 html)。
+const tagSig = (html: string): string =>
+  html ? html.replace(/(data-key="[^"]*")/, `$1 data-sig="${hashStr(html)}"`) : "";
+
 const renderTurnPage = (r: TurnDetailRecord): string => {
   const items = [...r.items].sort((a, b) => a.ts - b.ts);
   const paired = pairItems(items);
-  const bodies = paired.map((p) => {
-    if (p.kind === "pair") return renderToolBubble(p.use, p.result);
+  // data-key = 稳定项键 (items 只追加、按 ts 单调, 位置永不前移 → 索引稳定唯一)。
+  // 客户端 reconcile 按此键复用未变气泡的 DOM 节点, 从而保住用户手动展开/折叠的 <details>。
+  const bodies = paired.map((p, i) => {
+    const key = `b${i}`;
+    if (p.kind === "pair") return renderToolBubble(p.use, p.result, key);
     const it = p.item;
-    if (it.t === "text") return renderTextBubble(it);
-    if (it.t === "approval") return renderApprovalItem(it);
+    if (it.t === "text") return renderTextBubble(it, key);
+    if (it.t === "approval") return renderApprovalItem(it, key);
     if (it.t === "tool_result") {
-      return `<section class="bubble tool">
+      return `<section class="bubble tool" data-key="${key}">
         <div class="bubble-head">↩ <span class="role">tool_result</span>
           <span class="compact">${escHtml(it.toolUseId)}</span>
           <span class="ts">${fmtTs(it.ts)}</span></div>
@@ -493,7 +576,7 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
       </section>`;
     }
     return "";
-  }).join("");
+  });
   // 出现 assistant·final 即视为本轮结束 —— closeTurn 可能滞后, 但 final 就是最后一条。
   const done = r.closed || items.some((it) => it.t === "text" && it.final === true);
   const ageMs = (done ? r.updatedAt : Date.now()) - r.createdAt;
@@ -501,39 +584,34 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
     ? `<span class="badge allow">已完成 · ${fmtDuration(ageMs)}</span>`
     : `<span class="badge pending">进行中</span>`;
   const modelChip = r.model
-    ? `<span class="chip model">${escHtml(r.model)}${r.modelAlt ? ` +${r.modelAlt}` : ""}</span>`
+    ? `<span class="chip model">${escHtml(r.model)}${r.modelAlt ? `<span class="alt"> +${r.modelAlt}</span>` : ""}</span>`
     : "";
   const u = r.usage;
-  // 上下文 = 单次 API 调用送入的 input+缓存读+缓存写 的峰值 —— 窗口占用高水位。
-  // 关键: 一个 turn 里 N 次调用各自重读同一缓存前缀, 累计 cacheRead 会远大于窗口实际
-  // 占用 (例: 43 次调用累计 2.6M, 窗口其实只有 ~82k)。所以主指标用峰值, 不用求和。
-  // Σ 前缀的 chip 是累计计费口径, 与上下文峰值语义分开。
+  // 上下文 = 单次 API 调用送入的 input+缓存读+缓存写 的峰值 (窗口占用高水位), 与下方
+  // 累计 I/O 语义不同。窗口上限/占比不再展示 —— 长上下文变体口径不准, 易误导。
   const ctxPeak = u ? (u.ctxPeak ?? (u.input + u.cacheRead + u.cacheWrite)) : 0;
-  const win = ctxWindow(r.model);
-  const pct = Math.min(100, Math.round((ctxPeak / win) * 100));
-  const pres = ctxPressure(pct);
-  const usageChips = u
-    ? [
-        `<span class="chip ctx" style="--fill:${pct}%;--fc:${pres.fill};color:${pres.text}" title="单次调用送入模型的上下文峰值 = 窗口占用高水位, 占 ${fmtTok(win)} 窗口的 ${pct}%。${u.calls} 次调用各自重读缓存前缀, 故下方 Σ 累计值远大于此。">上下文 <b>${fmtTok(ctxPeak)}</b> / ${fmtTok(win)} · ${pct}%</span>`,
-        `<span class="chip mini" title="累计: 未命中缓存的新鲜输入">Σin ${fmtTok(u.input)}</span>`,
-        u.cacheRead ? `<span class="chip mini cache" title="累计: 缓存命中读取 (计费约 0.1×), 含跨调用重读前缀">Σ↻ ${fmtTok(u.cacheRead)}</span>` : "",
-        u.cacheWrite ? `<span class="chip mini cache" title="累计: 写入缓存 (计费约 1.25×)">Σ+ ${fmtTok(u.cacheWrite)}</span>` : "",
-        `<span class="chip mini" title="累计: 生成输出">Σout ${fmtTok(u.output)}</span>`,
-        u.serviceTier && u.serviceTier !== "standard" ? `<span class="chip tier">${escHtml(u.serviceTier)}</span>` : "",
-        `<span class="chip muted">${u.calls} call${u.calls > 1 ? "s" : ""}</span>`,
-      ].filter(Boolean).join("")
+  const tierChip = u?.serviceTier && u.serviceTier !== "standard"
+    ? `<span class="chip tier">${escHtml(u.serviceTier)}</span>` : "";
+  const turnInfo = modelChip || tierChip ? `<div class="turn-info">${modelChip}${tierChip}</div>` : "";
+  const statsCard = u ? renderStats(u, ctxPeak, ageMs, done) : "";
+  const queryBubble = r.userQuery
+    ? `<section class="bubble user" data-key="user">
+        <div class="bubble-head">💬 <span class="role">User</span></div>
+        <div class="q-body">${escHtml(r.userQuery)}</div>
+      </section>`
     : "";
-  const turnInfo = `<div class="turn-info">${modelChip}${usageChips}</div>`;
   const metaParts = [
     fmtTs(r.createdAt),
     r.sessionId ? r.sessionId.slice(0, 8) : null,
     r.target || null,
     `${items.length} 项`,
   ].filter(Boolean) as string[];
-  const typing = done ? "" : `<div class="typing">Claude 正在思考</div>`;
+  const typing = done ? "" : `<div class="typing" data-key="typing">Claude 正在思考</div>`;
   // markdown-it + highlight.js from unpkg CDN. html:false 防注入; linkify + breaks 更贴聊天。
-  // 未 closed 时客户端 2s 轮询同一 URL — DOMParser 抽 .bubbles 换 innerHTML, 不做整页刷新,
-  // 保留滚动位置 + CDN 缓存。closed 时 body[data-closed=1], 轮询自终止。
+  // 未 closed 时客户端 2s 轮询同一 URL — DOMParser 抽 .bubbles 后按 data-key reconcile:
+  // 未变气泡复用原 DOM 节点 (连带用户手动展开/折叠的 <details> 一并保住), 变化/新增气泡
+  // 才换成新节点、并从快照回填用户改过的折叠态。整页不重刷 → 保留滚动位置 + CDN 缓存。
+  // closed 时 body[data-closed=1], 轮询自终止。
   const script = `
 (function(){
   var render = function(scope){
@@ -549,8 +627,46 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
     scope.querySelectorAll('.bubble').forEach(function(b){
       var src = b.querySelector('script.md-src');
       var body = b.querySelector('.md-body');
-      if(src && body){ body.innerHTML = md.render(src.textContent||''); }
+      // 已渲染过的复用节点跳过 —— 免闪一下, 也不动其内部状态。
+      if(src && body && body.dataset.rendered !== '1'){
+        body.innerHTML = md.render(src.textContent||'');
+        body.dataset.rendered = '1';
+      }
     });
+  };
+  // key#idx → <details>.open 快照, 供换新节点后回填用户手动折叠态。
+  var snapOpen = function(scope){
+    var m = {};
+    scope.querySelectorAll('[data-key]').forEach(function(b){
+      var k = b.getAttribute('data-key');
+      b.querySelectorAll('details').forEach(function(d,i){ m[k+'#'+i] = d.open; });
+    });
+    return m;
+  };
+  var restoreOpen = function(scope, m){
+    scope.querySelectorAll('[data-key]').forEach(function(b){
+      var k = b.getAttribute('data-key');
+      b.querySelectorAll('details').forEach(function(d,i){
+        var v = m[k+'#'+i]; if(v !== undefined) d.open = v;
+      });
+    });
+  };
+  // 按 data-key diff: data-sig (服务端内容指纹) 相同则原样保留旧节点, 否则采纳新节点。
+  var reconcile = function(cur, next){
+    var open = snapOpen(cur);
+    var existing = {};
+    Array.prototype.forEach.call(cur.children, function(c){
+      var k = c.getAttribute('data-key'); if(k) existing[k] = c;
+    });
+    var nodes = Array.prototype.map.call(next.children, function(nc){
+      var k = nc.getAttribute('data-key');
+      var ex = k ? existing[k] : null;
+      var same = ex && ex.getAttribute('data-sig') === nc.getAttribute('data-sig');
+      return same ? ex : document.importNode(nc, true);
+    });
+    cur.replaceChildren.apply(cur, nodes);
+    restoreOpen(cur, open);
+    render(cur);
   };
   render(document);
   if(document.body.dataset.closed === '1') return;
@@ -561,8 +677,7 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
       var newBubbles = doc.querySelector('.bubbles');
       var curBubbles = document.querySelector('.bubbles');
       if(newBubbles && curBubbles){
-        curBubbles.innerHTML = newBubbles.innerHTML;
-        render(curBubbles);
+        reconcile(curBubbles, newBubbles);
       }
       var newBadge = doc.querySelector('header .badge');
       var curBadge = document.querySelector('header .badge');
@@ -570,6 +685,11 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
       var newInfo = doc.querySelector('.turn-info');
       var curInfo = document.querySelector('.turn-info');
       if(newInfo && curInfo){ curInfo.outerHTML = newInfo.outerHTML; }
+      var newStats = doc.querySelector('.stats');
+      var curStats = document.querySelector('.stats');
+      if(newStats && curStats){ curStats.outerHTML = newStats.outerHTML; }
+      else if(newStats && curBubbles){ curBubbles.parentNode.insertBefore(newStats, curBubbles); }
+      else if(newStats){ document.querySelector('.wrap').appendChild(newStats); }
       var nowClosed = doc.body.dataset.closed === '1';
       if(nowClosed){ document.body.dataset.closed = '1'; return; }
       setTimeout(tick, 2000);
@@ -580,16 +700,17 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
 `;
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>本轮工具调用</title>
+<title>Turn Details</title>
 <link rel="stylesheet" href="https://unpkg.com/highlight.js@11/styles/github.min.css">
 <style>${SHARED_CSS}${TURN_CSS}</style>
 <script src="https://unpkg.com/markdown-it@14/dist/markdown-it.min.js"></script>
 <script src="https://unpkg.com/@highlightjs/cdn-assets@11/highlight.min.js"></script>
 </head><body data-closed="${done ? "1" : "0"}"><div class="wrap">
-<header><h1><span class="accent">本轮工具调用</span></h1>${statusBadge}</header>
+<header><h1><span class="accent">Turn Details</span></h1>${statusBadge}</header>
 ${turnInfo}
 <div class="meta">${metaParts.map(escHtml).join('<span class="sep">·</span>')}</div>
-<div class="bubbles">${bodies}${typing}</div>
+${statsCard}
+<div class="bubbles">${[queryBubble, ...bodies, typing].map(tagSig).join("")}</div>
 </div>
 <script>${script}</script>
 </body></html>`;

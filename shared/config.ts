@@ -91,7 +91,7 @@ const Mirror = z.object({
   //   2. turn 结束时: Claude 的 finish text (最终 assistant 回复)
   // 中间 tool_use / tool_result / thinking / 非 final text 全部只写进详情页,不发气泡。
   // 授权卡照常发群 (交互无法替代)。false = 现状 (逐条气泡)。
-  brief: z.boolean().default(false),
+  brief: z.boolean().default(true),
 });
 
 const Wrc = z.object({

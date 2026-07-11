@@ -75,6 +75,7 @@ export interface TurnDetailRecord {
   closed: boolean;
   target?: string;
   sessionId?: string;
+  userQuery?: string;  // 触发本轮的用户输入原文 (mirror 侧 dispatch 的 text)
   items: TurnItem[];
   model?: string;      // 首个见到的 model 名
   modelAlt?: number;   // 与 model 不同的后续行数, 用于渲染 "+N"

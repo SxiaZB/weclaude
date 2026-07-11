@@ -1809,13 +1809,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
   };
 
-  const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string, isSlash = false): Promise<void> => {
+  const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string, isSlash = false, userQuery = ""): Promise<void> => {
     if (a.briefTurnId) closeBriefTurn(a); // 上一 turn 未收尾, 强制关掉再开新的
     const turnId = newTurnId();
     a.briefTurnId = turnId;
     a.briefHadTool = false;
     a.briefIsSlash = isSlash;
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId });
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: userQuery.trim() || undefined });
     // hardTimer 兜底: turn 若无 final text / turn_end 收口 (卡死/漏收), 到点仍收气泡。
     const hardTimer = setTimeout(
       () => void finishBriefBubble(a, a.briefHadTool ? briefDetailLink(turnId) : " "),
@@ -2973,7 +2973,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       if (brief) {
         // 关闭上一 turn (若存在), 起新 turn: 立刻推详情 URL 覆盖 loading 气泡。
         // 后续 onItem 走 handleBriefItem, 不再走 stream / defer 路径。
-        await startBriefTurn(a, frame, streamId, isSlash);
+        await startBriefTurn(a, frame, streamId, isSlash, text);
       } else if (!armMigration && !eagerOpen) {
         enterDeferred(a, frame, streamId);
       }
