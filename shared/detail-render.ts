@@ -327,7 +327,6 @@ const TURN_CSS = `
   .bubble{background:#fff;border:1px solid #d0d7de;border-radius:12px;overflow:hidden}
   .bubble.assistant{background:#fff}
   .bubble.final{border-color:#1a7f3766;box-shadow:0 0 0 2px #1a7f3714}
-  .bubble.tool{background:#fafbfc}
   .bubble.approval{background:#fbfaff}
   .bubble-head{display:flex;align-items:center;gap:8px;padding:10px 14px;
     font-size:13px;color:#1f2328;flex-wrap:wrap}
@@ -402,10 +401,88 @@ const TURN_CSS = `
   .bubble.user .bubble-head{color:#0969da}
   .bubble.user .q-body{padding:2px 16px 14px;color:#1f2328;line-height:1.6;
     font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
+  /* ── 工具调用 (Claude CLI 风): 去卡片, 默认折叠, ⎿ 结果预览 ── */
+  .bubble.tool{background:transparent;border:0;border-radius:0;overflow:visible}
+  .bubble .tool-call{border:0}
+  .bubble .tool-call>summary{list-style:none;cursor:pointer;display:flex;
+    align-items:baseline;gap:7px;padding:3px 6px;border-radius:6px;border:0;
+    background:transparent;color:#1f2328;font-size:13.5px;font-weight:400;
+    text-transform:none;letter-spacing:0}
+  .bubble .tool-call>summary::-webkit-details-marker{display:none}
+  .bubble .tool-call>summary::before{content:none}
+  .bubble .tool-call>summary:hover{background:#f0f3f6}
+  .tool-dot{color:#1a7f37;font-size:11px;align-self:center;flex:none}
+  .tool-call[open]>summary .tool-dot{color:#0969da}
+  .tool-name{font-weight:600;flex:none;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .tool-arg{color:#656d76;min-width:0;flex:0 1 auto;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tool-dur{color:#8c959f;font-size:11px;flex:none;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .tool-summary .ts{margin-left:auto;flex:none}
+  .tool-body{padding:8px 0 4px 16px;margin:2px 0 0 9px;
+    border-left:2px solid #eaeef2}
+  .tool-body>section{margin-bottom:8px}
+  .tool-body>section:last-child,.tool-body>details:last-child{margin-bottom:0}
+  .tool-result-line{padding:2px 6px 4px 24px;color:#57606a;font-size:12.5px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tool-call[open] ~ .tool-result-line{display:none}
+  .tool-result-line .corner{color:#b1bac4;margin-right:6px}
+  .tool-result-line .add{color:#1a7f37;font-weight:600}
+  .tool-result-line .del{color:#cf222e;font-weight:600}
+  .tool-result-line .more{color:#8c959f}
+  .tool-result-line .run{color:#9a6700}
 `;
 
 const renderJsonSection = (input: unknown): string =>
   `<details><summary>input</summary><pre><code>${highlightJson(toJson(input))}</code></pre></details>`;
+
+// 结果行数 (末尾换行不计)。
+const countLines = (s: string): number => {
+  if (!s) return 0;
+  const n = s.split("\n").length;
+  return s.endsWith("\n") ? n - 1 : n;
+};
+
+// Edit/Write/MultiEdit 的 +增 -删 汇总, 供折叠态 ⎿ 预览行用 (context:0 只数改动行)。
+const diffStat = (blocks: readonly DiffBlock[]): { adds: number; dels: number } => {
+  const norm = (s: string): string => (s === "" || s.endsWith("\n") ? s : `${s}\n`);
+  return blocks.reduce(
+    (acc, b) => {
+      const p = structuredPatch("a", "b", norm(b.oldStr), norm(b.newStr), "", "", { context: 0 });
+      for (const h of p.hunks)
+        for (const ln of h.lines) {
+          if (ln.startsWith("+")) acc.adds++;
+          else if (ln.startsWith("-")) acc.dels++;
+        }
+      return acc;
+    },
+    { adds: 0, dels: 0 },
+  );
+};
+
+// Claude CLI 的 ⎿ 结果摘要: diff 工具→增删数, Read→行数, 其余→首行 + 行数。
+const toolResultPreview = (
+  use: Extract<TurnItem, { t: "tool_use" }>,
+  diffBlocks: readonly DiffBlock[],
+  rawResult: string,
+  hasResult: boolean,
+): string => {
+  if (!hasResult) return `<span class="corner">⎿</span><span class="run">运行中…</span>`;
+  if (diffBlocks.length > 0) {
+    const { adds, dels } = diffStat(diffBlocks);
+    return `<span class="corner">⎿</span>更新 <span class="add">+${adds}</span> <span class="del">-${dels}</span>`;
+  }
+  if (use.toolName === "Read")
+    return `<span class="corner">⎿</span>读取 ${countLines(rawResult)} 行`;
+  const lines = countLines(rawResult);
+  const first = rawResult.split("\n").find((l) => l.trim() !== "") ?? "";
+  const head = escHtml(truncate(first.replace(/\s+/g, " ").trim(), 88));
+  const more = lines > 1 ? ` <span class="more">+${lines - 1} 行</span>` : "";
+  return `<span class="corner">⎿</span>${head || "(空)"}${more}`;
+};
 
 const renderToolBubble = (
   use: Extract<TurnItem, { t: "tool_use" }>,
@@ -421,21 +498,23 @@ const renderToolBubble = (
   const readResultHtml = isRead && rawResult ? renderReadContent(rawResult, extractFilePath(use.toolInput)) : "";
   const diffResultHtml = rawResult && !isRead ? tryRenderUnifiedDiff(rawResult) : "";
   const primary = [bashHtml, diffHtml, readResultHtml, diffResultHtml].filter(Boolean).join("");
-  // primary 已把命令/路径完整展示 —— 头部的一行 compact 只会重复它, 有 primary 时省掉。
-  const compact = primary ? "" : `<span class="compact">${escHtml(oneLineCompact(use.toolInput))}</span>`;
   const inputSection = primary
     ? renderJsonSection(use.toolInput)
     : `<details open><summary>input</summary><pre><code>${highlightJson(toJson(use.toolInput))}</code></pre></details>`;
   const resultRaw = rawResult
     ? `<details><summary>result (raw)</summary><pre><code>${ansiToHtml(rawResult)}</code></pre></details>`
     : `<details><summary>result</summary><pre style="color:#656d76;font-style:italic;margin:0;padding:12px"><code>(尚未捕获)</code></pre></details>`;
+  // 头部一行: ⏺ 工具名(参数) — 参数取命令/路径等主字段, 与 Claude CLI 同款。
+  const arg = oneLineCompact(use.toolInput, 72);
+  const dur = result ? `<span class="tool-dur">${escHtml(fmtDuration(result.ts - use.ts))}</span>` : "";
+  const preview = toolResultPreview(use, diffBlocks, rawResult, Boolean(result));
+  // 整个工具调用折叠进 <details> (默认收起); ⎿ 预览行是它的兄弟, 展开时 CSS 隐藏。
   return `<section class="bubble tool" data-key="${key}">
-    <div class="bubble-head">🔧 <span class="role">${escHtml(use.toolName)}</span>
-      ${compact}
-      <span class="ts">${fmtTs(use.ts)}</span></div>
-    ${primary}
-    ${inputSection}
-    ${resultRaw}
+    <details class="tool-call">
+      <summary class="tool-summary"><span class="tool-dot">⏺</span><span class="tool-name">${escHtml(use.toolName)}</span>${arg ? `<span class="tool-arg">(${escHtml(arg)})</span>` : ""}${dur}<span class="ts">${fmtTs(use.ts)}</span></summary>
+      <div class="tool-body">${primary}${inputSection}${resultRaw}</div>
+    </details>
+    <div class="tool-result-line">${preview}</div>
   </section>`;
 };
 
