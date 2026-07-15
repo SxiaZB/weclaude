@@ -149,6 +149,18 @@ const Sync = z.object({
   targets: z.array(SyncTarget).default([]),
 });
 
+// 独立 detail 中转服务 (weclaude svr) 的默认参数。CLI 参数 (--host/--port/…) 仍可覆盖,
+// 空则退回硬编码默认 (0.0.0.0:17891)。放在 top-level 而不是塞进 daemon: svr 是独立进程,
+// 与 daemon 生命周期解耦。
+const Svr = z.object({
+  host: z.string().default("0.0.0.0"),
+  port: z.number().int().min(1).max(65535).default(17891),
+  stateDir: z.string().default("~/.weclaude/svr"),
+  tokenFile: z.string().default("~/.weclaude/svr-token"),
+  token: z.string().default(""),
+  logLevel: z.enum(["trace", "debug", "info", "warn", "error"]).default("info"),
+});
+
 // 事件订阅 / 广播。subs 是 topic → 目标id数组 (`user:xxx` / `chat:xxx`),
 // 一个 topic 可以有多个订阅者; schedules 是「每天 HH:MM 触发某 topic」的定时任务。
 // 订阅关系与定时通过 IM 命令 (订阅 / 每天HH:MM广播 …) 增删,写回 config.jsonc。
@@ -172,6 +184,7 @@ export const ConfigSchema = z.object({
   wrc: Wrc.default({}),
   approval: Approval.default({}),
   sync: Sync.default({ targets: [] }),
+  svr: Svr.default({}),
   topics: Topics.default({ subs: {}, schedules: [] }),
 });
 

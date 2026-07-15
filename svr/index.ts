@@ -18,6 +18,7 @@ import { expandHome } from "../shared/paths.js";
 import { createDetailStore, type DetailRecord } from "../shared/detail-store.js";
 import { renderDetailPage, renderNotFound } from "../shared/detail-render.js";
 import { resolvePublicHost } from "../shared/lan-ip.js";
+import { loadConfig } from "../shared/config.js";
 
 interface Args {
   host: string;
@@ -28,14 +29,34 @@ interface Args {
   logLevel: pino.Level;
 }
 
-const parseArgs = (argv: readonly string[]): Args => {
-  const a: Args = {
+// Defaults: config.svr.* > 硬编码兜底。CLI 参数在 parseArgs 里再覆盖上去。
+// Config 加载失败 (缺 bot.botId 之类) 不该阻塞 svr 启动 —— svr 与 daemon 解耦。
+const buildDefaults = (): Args => {
+  const fallback: Args = {
     host: "0.0.0.0",
     port: 17891,
     stateDir: "~/.weclaude/svr",
     tokenFile: "~/.weclaude/svr-token",
     logLevel: "info",
   };
+  try {
+    const { config } = loadConfig();
+    const s = config.svr;
+    return {
+      host: s.host || fallback.host,
+      port: s.port || fallback.port,
+      stateDir: s.stateDir || fallback.stateDir,
+      tokenFile: s.tokenFile || fallback.tokenFile,
+      token: s.token || undefined,
+      logLevel: (s.logLevel as pino.Level) || fallback.logLevel,
+    };
+  } catch {
+    return fallback;
+  }
+};
+
+const parseArgs = (argv: readonly string[]): Args => {
+  const a: Args = buildDefaults();
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i];
     const v = argv[i + 1];
@@ -57,6 +78,8 @@ const parseArgs = (argv: readonly string[]): Args => {
 const printHelp = (): void => {
   // eslint-disable-next-line no-console
   console.log(`weclaude svr — standalone detail relay
+
+Defaults come from ~/.weclaude/config.jsonc (svr.*) when present; CLI overrides.
 
   --host <ip>        bind address (default 0.0.0.0)
   --port <n>         listen port  (default 17891)
