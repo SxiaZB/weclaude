@@ -1,7 +1,7 @@
 // 工具调用 / 授权详情。Store + rendering 都在 shared/, 本文件是 daemon 侧胶水:
 //   • 单例 store (init on boot, replay)
 //   • record*() 写本地 + 可选转发到 remote svr (共享网络上的 detail 服务)
-//   • buildDetailUrl 用 config.detailRemoteBase / detailPublicBase / LAN IP 兜底
+//   • buildDetailUrl 用 config.detailPublicBase / detailRemoteBase / LAN IP 兜底
 //   • makeDetailHandler 把 GET /detail?id=xxx 渲染成 HTML
 import type { Logger } from "pino";
 import type { Decision } from "./pending.js";
@@ -125,7 +125,7 @@ export const recordCloseOpenTurns = (target?: string, exceptId?: string): void =
 
 export const getDetail = (id: string): DetailRecord | undefined => store?.get(id);
 
-// URL 优先级: remoteBase (chat 端浏览器要连 svr) > publicBase (反代/自定义 host)
+// URL 优先级: publicBase (反代/自定义 host) > remoteBase (chat 端直连 svr)
 // > fallback host+port (回环 → LAN IP 替换)。
 // forceInnerBrowser=1 / ww_vw / ww_vh: WeCom 桌面端识别参数, 让链接在内置浏览器打开。
 export const buildDetailUrl = (
@@ -134,10 +134,10 @@ export const buildDetailUrl = (
   fallbackPort: number,
   id: string,
 ): string => {
-  const root = remoteBase && remoteBase.length > 0
-    ? remoteBase.replace(/\/+$/, "")
-    : publicBase && publicBase.length > 0
-      ? publicBase.replace(/\/+$/, "")
+  const root = publicBase && publicBase.length > 0
+    ? publicBase.replace(/\/+$/, "")
+    : remoteBase && remoteBase.length > 0
+      ? remoteBase.replace(/\/+$/, "")
       : `http://${resolvePublicHost(fallbackHost)}:${fallbackPort}`;
   const params = new URLSearchParams({
     id,
