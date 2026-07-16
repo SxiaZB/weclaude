@@ -259,6 +259,10 @@ interface TranscriptLine {
      *  quotable without waiting for the next inbound or the 6-min hard
      *  timeout). `tool_use` is NOT terminal — more turns will follow. */
     stop_reason?: string;
+    /** Anthropic message id — used to dedupe usage accounting: one API response
+     *  can be split into multiple assistant lines (e.g. thinking + tool_use),
+     *  each carrying the same usage snapshot. Same id ⇒ same API call. */
+    id?: string;
     /** Model name (e.g. "claude-4.7-opus") on assistant lines. Extracted into
      *  turn store so the detail page can display it as a muted chip. */
     model?: string;
@@ -375,7 +379,7 @@ type RenderItem =
   // Per-assistant-line usage snapshot (model + token counts). Consumed only in
   // brief mode where it's fed into the turn store for aggregate chip display.
   // Non-brief onItem drops it silently — no bubble, no stream side effect.
-  | { kind: "turn_usage"; model?: string; usage: TurnUsage };
+  | { kind: "turn_usage"; model?: string; messageId?: string; usage: TurnUsage };
 
 const oneLineSummary = (s: string, max = 40): string => {
   const flat = s.replace(/\s+/g, " ").trim();
@@ -568,9 +572,11 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
     const u = line.message?.usage;
     if (u) {
       const model = typeof line.message?.model === "string" ? line.message.model : undefined;
+      const messageId = typeof line.message?.id === "string" ? line.message.id : undefined;
       out.push({
         kind: "turn_usage",
         model,
+        messageId,
         usage: {
           input: u.input_tokens ?? 0,
           output: u.output_tokens ?? 0,

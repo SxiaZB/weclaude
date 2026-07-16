@@ -80,6 +80,10 @@ export interface TurnDetailRecord {
   model?: string;      // 首个见到的 model 名
   modelAlt?: number;   // 与 model 不同的后续行数, 用于渲染 "+N"
   usage?: TurnUsage;
+  // 已入账的 Anthropic message.id — Claude Code jsonl 会把一次 API 响应拆成
+  // 多条 assistant 行 (如 thinking + tool_use 各一条), 两条共享同一 message.id
+  // 且各自都带 usage 快照。按 id 去重, 避免 usage 被 N 倍夸大。
+  usageMsgIds?: string[];
 }
 
 export type DetailRecord = ToolDetailRecord | ApprovalDetailRecord | TurnDetailRecord;
@@ -95,7 +99,7 @@ export interface DetailStore {
     rec: Omit<TurnDetailRecord, "kind" | "createdAt" | "updatedAt" | "closed" | "items"> & { createdAt?: number },
   ): void;
   appendTurnItem(id: string, item: TurnItem): void;
-  addTurnUsage(id: string, delta: { model?: string; usage: TurnUsage }): void;
+  addTurnUsage(id: string, delta: { model?: string; messageId?: string; usage: TurnUsage }): void;
   closeTurn(id: string): void;
   // 收尾所有仍开着的 turn (可选按 target 限定, 可选排除某一 id)。返回被关闭的 id。
   // 用途: 新一轮发出 finish 消息时, 把此前遗留未关闭的 turn 一并标记结束。
@@ -206,27 +210,36 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
     addTurnUsage: (id, delta) => {
       const r = store.get(id);
       if (!r || r.kind !== "turn") return;
+      // 同一 message.id 的重复行只入账一次 (thinking / tool_use 拆行, 共享 usage)。
+      // 无 messageId 时保守累加 — 兼容早期 caller 或 headless (cc-bridge) 路径。
+      const seenIds = r.usageMsgIds ?? [];
+      const dupe = delta.messageId ? seenIds.includes(delta.messageId) : false;
       const cur = r.usage;
-      // 这一次调用送入的上下文 = 新鲜输入 + 缓存读 + 缓存写 (delta 恒为单次调用)。
-      const callCtx = delta.usage.input + delta.usage.cacheRead + delta.usage.cacheWrite;
-      const nextUsage: TurnUsage = cur
-        ? {
-            input: cur.input + delta.usage.input,
-            output: cur.output + delta.usage.output,
-            cacheRead: cur.cacheRead + delta.usage.cacheRead,
-            cacheWrite: cur.cacheWrite + delta.usage.cacheWrite,
-            serviceTier: cur.serviceTier ?? delta.usage.serviceTier,
-            calls: cur.calls + delta.usage.calls,
-            ctxPeak: Math.max(cur.ctxPeak ?? 0, callCtx),
-          }
-        : { ...delta.usage, ctxPeak: callCtx };
+      const nextUsage: TurnUsage = dupe
+        ? (cur ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0 })
+        : (() => {
+            // 这一次调用送入的上下文 = 新鲜输入 + 缓存读 + 缓存写 (delta 恒为单次调用)。
+            const callCtx = delta.usage.input + delta.usage.cacheRead + delta.usage.cacheWrite;
+            return cur
+              ? {
+                  input: cur.input + delta.usage.input,
+                  output: cur.output + delta.usage.output,
+                  cacheRead: cur.cacheRead + delta.usage.cacheRead,
+                  cacheWrite: cur.cacheWrite + delta.usage.cacheWrite,
+                  serviceTier: cur.serviceTier ?? delta.usage.serviceTier,
+                  calls: cur.calls + delta.usage.calls,
+                  ctxPeak: Math.max(cur.ctxPeak ?? 0, callCtx),
+                }
+              : { ...delta.usage, ctxPeak: callCtx };
+          })();
+      const nextIds = delta.messageId && !dupe ? [...seenIds, delta.messageId] : seenIds;
       let model = r.model;
       let modelAlt = r.modelAlt;
       if (delta.model) {
         if (!model) model = delta.model;
         else if (model !== delta.model) modelAlt = (modelAlt ?? 0) + 1;
       }
-      put({ ...r, model, modelAlt, usage: nextUsage, updatedAt: Date.now() });
+      put({ ...r, model, modelAlt, usage: nextUsage, usageMsgIds: nextIds.length ? nextIds : undefined, updatedAt: Date.now() });
     },
     closeTurn: (id) => {
       const r = store.get(id);
