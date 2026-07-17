@@ -4,9 +4,14 @@ import type { Logger } from "pino";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
 
+// Strip principal prefix (`user:` / `chat:`) AND `#tag` suffix so callers
+// can pass daemon-internal target keys (`user:xxx#foo`) verbatim; the WeCom
+// SDK only accepts bare chatid/userid.
 const stripPrefix = (s: string): string => {
   const i = s.indexOf(":");
-  return i >= 0 ? s.slice(i + 1) : s;
+  const rest = i >= 0 ? s.slice(i + 1) : s;
+  const h = rest.indexOf("#");
+  return h >= 0 ? rest.slice(0, h) : rest;
 };
 
 interface MsgReq {

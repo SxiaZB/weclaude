@@ -23,6 +23,7 @@ import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl } from "./detail.js";
 import type { TurnUsage } from "./detail.js";
+import { labelFor } from "./session-label.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -281,9 +282,29 @@ interface TranscriptLine {
   isSidechain?: boolean;
 }
 
+// Target keys are `user:xxx[#tag]` / `chat:xxx[#tag]`. Strip the principal
+// prefix AND the `#tag` suffix so WeCom's sendMessage receives just the bare
+// chatid/userid. Tag survives only inside the daemon's byTarget/store keys.
 const stripPrincipalPrefix = (s: string): string => {
   const i = s.indexOf(":");
-  return i >= 0 ? s.slice(i + 1) : s;
+  const rest = i >= 0 ? s.slice(i + 1) : s;
+  const h = rest.indexOf("#");
+  return h >= 0 ? rest.slice(0, h) : rest;
+};
+
+// Extract the `#tag` suffix from a target key, "" if untagged.
+const tagOfTarget = (s: string): string => {
+  const h = s.indexOf("#");
+  return h >= 0 ? s.slice(h + 1) : "";
+};
+
+// Prefix outbound content with `<emoji> #tag` header (blank line separator)
+// when the target carries a `#tag` suffix. Untagged targets pass through
+// unchanged — default session keeps its plain-bubble UX.
+const withSessionTag = (target: string, content: string): string => {
+  const tag = tagOfTarget(target);
+  if (!tag) return content;
+  return `${labelFor(tag)} \`#${tag}\`\n\n${content}`;
 };
 
 // Claude Code wraps slash-command invocations into the user message as
@@ -1566,7 +1587,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // pushes from a single mirror stay ordered; different mirrors run in parallel.
   const sendStandalone = (a: AttachState, content: string): void => {
     const chatId = stripPrincipalPrefix(a.target);
-    const chunks = splitChunks(content, cfg.wrc.mirror.chunkChars);
+    const tagged = withSessionTag(a.target, content);
+    const chunks = splitChunks(tagged, cfg.wrc.mirror.chunkChars);
     a.standalonePending = a.standalonePending
       .then(async () => {
         for (const c of chunks) {
@@ -2856,7 +2878,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // Same resume-fork hazard as dispatch: snapshot before spawn, re-bind
         // onto the forked jsonl once it appears (EOF offset — fork is seeded).
         const resumeBaseline = listJsonls(dirname(a.jsonlPath));
-        const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn-init", sessionId: sid }), resumeSessionId: sid, windowName: target, cwdOverride: a.runningCwd });
+        const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn-init", sessionId: sid }), resumeSessionId: sid, windowName: tagOfTarget(target) || target, cwdOverride: a.runningCwd });
         if (!r.ok || !r.tmuxPane) return { ok: false, reason: `respawn failed: ${r.reason ?? "unknown"}` };
         a.tmuxPane = r.tmuxPane;
         a.tmuxSession = r.tmuxSession ?? a.tmuxSession;
@@ -2946,7 +2968,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       if (armMigration && pending && pending !== a.runningCwd) {
         if (a.liveStream && !a.liveStream.closed) await finalizeStream(a, a.liveStream);
         log.info({ target: a.target, runningCwd: a.runningCwd, pendingCwd: pending }, "/clear upgraded to /new (cwd switch)");
-        const r = await newSession(a.target, a.target);
+        // Prefer the tag suffix as tmux window name when present (matches
+        // /new #tag behavior), fall back to the full target for untagged.
+        const tag = tagOfTarget(a.target);
+        const r = await newSession(a.target, tag || a.target);
         if (!r.ok) {
           try { await client.replyStream(frame, streamId, `[mirror] 切换失败: ${r.reason ?? "unknown"}`, true); } catch { /* ignore */ }
         }
@@ -3022,7 +3047,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           const resumeBaseline = !armMigration ? listJsonls(dirname(a.jsonlPath)) : undefined;
           // Respawn in the binding's runningCwd (pendingCwd doesn't apply to a
           // mid-turn reincarnation — only /new and /clear-with-pending swap cwd).
-          const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn", sessionId: sid }), resumeSessionId: sid, windowName: a.target, cwdOverride: a.runningCwd });
+          const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn", sessionId: sid }), resumeSessionId: sid, windowName: tagOfTarget(a.target) || a.target, cwdOverride: a.runningCwd });
           if (r.ok && r.tmuxPane && r.tmuxSession) {
             a.tmuxPane = r.tmuxPane;
             a.tmuxSession = r.tmuxSession;

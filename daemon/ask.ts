@@ -7,7 +7,9 @@ import { createPending, resolvePending } from "./pending.js";
 
 const stripPrefix = (s: string): string => {
   const i = s.indexOf(":");
-  return i >= 0 ? s.slice(i + 1) : s;
+  const rest = i >= 0 ? s.slice(i + 1) : s;
+  const h = rest.indexOf("#");
+  return h >= 0 ? rest.slice(0, h) : rest;
 };
 
 interface CardReq {

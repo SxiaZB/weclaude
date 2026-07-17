@@ -272,6 +272,48 @@ sequenceDiagram
 
 ---
 
+## 一个聊天里跑多个会话（`#tag` 路由）
+
+同一个 WeCom 聊天里可以同时挂多个并行 Claude session，靠消息里的 `#tag` 前缀路由。不带 tag 就是默认 session，与旧行为一致。
+
+**创建 & 切换**
+
+```
+/new #docs        新开一个标签为 docs 的会话（tmux 窗口名也叫 docs）
+/new #api         再开一个,与 #docs 完全独立(独立 sessionId / jsonl / cwd)
+/new              默认 session,老玩法
+```
+
+**消息路由**
+
+只要消息文本里任意位置带 `#tag`（空白/句首/句尾分隔），就路由到那个 tagged session：
+
+```
+#docs 帮我把 README 的目录补一下
+帮我看下这个报错 #api
+/pwd #docs        → 只看 docs 会话的项目路径
+/stop #api        → 只打断 api 会话
+/clear #docs      → 只清 docs 会话上下文
+```
+
+不带 tag 的消息始终落到默认 session。
+
+**回复标识**
+
+tagged session 的每条回复自带 `emoji #tag` 前缀（emoji 由 tag 名 hash 决定，稳定），一眼分辨来自哪个 session：
+
+```
+🦊 `#docs`
+
+（这里是 docs 会话的 Claude 回复……）
+```
+
+默认 session 无前缀，视觉上保持简洁。
+
+**tag 语法**：`[\p{L}\p{N}_-]{1,32}`，支持中英文数字与 `_`、`-`；一条消息里只识别**第一个** `#tag`，后续的 `#foo` 原样透传给 Claude（不会误伤代码里的 `#include` 或 issue 引用）。
+
+---
+
 ## 常用命令
 
 ```bash

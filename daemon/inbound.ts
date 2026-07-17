@@ -13,6 +13,7 @@ import { getLastResponse } from "./last-response.js";
 import { scanClaudeSessions, type SessionInfo } from "./session-scan.js";
 import { computeUsage, renderUsageReport } from "./usage.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
+import { labelFor } from "./session-label.js";
 import {
   parseSubscribe,
   parseUnsubscribe,
@@ -34,6 +35,31 @@ import {
 // session-map key, mirror target, defaultChat. NOT used for auth.
 const chatPrincipal = (msg: BaseMessage): string =>
   msg.chattype === "group" && msg.chatid ? `chat:${msg.chatid}` : `user:${msg.from.userid}`;
+
+// A single chat can host multiple concurrent Claude sessions via `#tag`. The
+// session key = base principal + optional `#tag` suffix. Untagged = default
+// session (backward-compatible). Tags: [\p{L}\p{N}_-]{1,32}, must be
+// space-delimited or edge-of-string so genuine URLs / paths like
+// "#L45-foo/bar" survive. Only the FIRST tag in a message is honored — that
+// tag is stripped from the forwarded text; any additional #foo tokens flow
+// through verbatim (may be actual references in the user's prompt).
+const TAG_RE = /(^|\s)#([\p{L}\p{N}_-]{1,32})(?=\s|$)/u;
+const parseTag = (text: string): { tag: string; cleaned: string } => {
+  const m = TAG_RE.exec(text);
+  if (!m) return { tag: "", cleaned: text };
+  const tag = m[2] ?? "";
+  const before = text.slice(0, m.index);
+  const sep = m[1] ?? "";
+  const after = text.slice(m.index + m[0].length);
+  const cleaned = (before + sep + after).replace(/[ \t]+/g, " ").trim();
+  return { tag, cleaned };
+};
+
+const sessionKey = (base: string, tag: string): string => (tag ? `${base}#${tag}` : base);
+const tagOf = (who: string): string => {
+  const h = who.indexOf("#");
+  return h >= 0 ? who.slice(h + 1) : "";
+};
 
 // Auth principals: any-of test against allowFrom. Tiered — allowing a user
 // grants them access in any chat; allowing a group grants every member of
@@ -86,9 +112,15 @@ const renderHelp = (): string =>
     "",
     "▎会话",
     "`/new` 新开 claude 会话并绑定本聊天",
+    "`/new #tag` 在本聊天中新开一个带标签的并行会话",
     "`/sessions` 列出 live 会话 · `/sessions <emoji|id>` 切换",
     "`/stop` 打断当前生成 (Esc)",
     "`/n` 向 CLI 输入回车 (Enter)",
+    "",
+    "▎多会话路由",
+    "同一聊天可同时运行多个 claude:消息中任意位置带 `#tag`(如 `#docs 帮我改 README`)",
+    "即路由到该标签会话;不带 tag = 默认会话。tagged 会话的回复以 `emoji #tag` 前缀标注。",
+    "`/clear #tag`、`/pwd #tag`、`/stop #tag` 等命令同理按 tag 路由。",
     "",
     "▎信息 (免授权)",
     "`/id` 查看会话/权限 id",
@@ -262,14 +294,21 @@ const withQuote = (msg: BaseMessage, text: string): string => {
 //   identical text sends, so re-quoting the same command is the only way to
 //   re-fire it — this makes that work. Self-quotes of weclaude's own last reply
 //   are excluded (would echo weclaude's text back as a command).
-const resolveTextBody = (msg: TextMessage): { text: string; promoted: boolean } => {
+// Also extracts the leading `#tag` (if any) from the effective body; the
+// returned `text` has the tag stripped so command matchers see clean
+// "/new"/"/pwd"/etc.
+const resolveTextBody = (msg: TextMessage): { text: string; tag: string; promoted: boolean } => {
   const body = maybeStripMentions(msg, msg.text?.content ?? "");
-  if (body.trim()) return { text: withQuote(msg, body), promoted: false };
+  if (body.trim()) {
+    const { tag, cleaned } = parseTag(body);
+    return { text: withQuote(msg, cleaned), tag, promoted: false };
+  }
   const quoted = msg.quote ? quoteToText(msg.quote).trim() : "";
   if (quoted && !isLastResponseQuote(chatPrincipal(msg), quoted)) {
-    return { text: maybeStripMentions(msg, quoted).trim(), promoted: true };
+    const { tag, cleaned } = parseTag(maybeStripMentions(msg, quoted).trim());
+    return { text: cleaned, tag, promoted: true };
   }
-  return { text: withQuote(msg, body), promoted: false };
+  return { text: withQuote(msg, body), tag: "", promoted: false };
 };
 
 const isAllowed = (cfg: Config, principals: string[]): boolean => {
@@ -354,10 +393,13 @@ export const installInboundRouter = (
   // Mirror-only auto-spawn / /new helper. Routes through bridge.newSession
   // which kills the old pane, spawns fresh in pendingCwd ?? runningCwd ??
   // default, attaches, and pushes "📂 当前项目" info to the chat. Returns
-  // the user-facing one-line ack.
+  // the user-facing one-line ack. When `who` carries a `#tag` suffix, use
+  // the raw tag as the tmux window name so the pane shows readably in the
+  // status bar (e.g. `#docs` → window `docs`, not the principal slug).
   const autoSpawnAndAttach = async (who: string): Promise<string> => {
     if (!("newSession" in bridge)) return "[weclaude] /new only available in mirror mode";
-    const r = await bridge.newSession(who, who);
+    const tag = tagOf(who);
+    const r = await bridge.newSession(who, tag || who);
     if (!r.ok) return `[weclaude] /new failed: ${r.reason ?? "unknown"}`;
     return `✅ 新会话已建立 \`${r.sessionId}\``;
   };
@@ -426,31 +468,48 @@ export const installInboundRouter = (
     return false;
   };
 
+  // Prefix user-visible daemon replies with `<emoji> #tag` when the routed
+  // session is tagged, so a chat hosting multiple concurrent tagged sessions
+  // stays visually disambiguated. Untagged (default) session passes through
+  // unchanged. Emoji is derived from the tag string (not sessionId) so it
+  // stays stable across /clear cycles.
+  const withTagPrefix = (who: string, text: string): string => {
+    const tag = tagOf(who);
+    if (!tag) return text;
+    return `${labelFor(tag)} \`#${tag}\`\n\n${text}`;
+  };
+  const replyText = async (frame: WsFrame<BaseMessage>, msg: BaseMessage, who: string, text: string): Promise<void> => {
+    try { await client.replyStream(frame, msg.msgid, withTagPrefix(who, text), true); } catch { /* ignore */ }
+  };
+
   // Common gating: claim bootstrap + allowFrom check. Returns true if the
   // caller should stop (claim consumed or message rejected).
-  const gate = async (frame: WsFrame<BaseMessage>, msg: BaseMessage, text: string): Promise<{ stop: boolean; who: string }> => {
-    const who = chatPrincipal(msg);
+  const gate = async (frame: WsFrame<BaseMessage>, msg: BaseMessage, text: string, who: string): Promise<{ stop: boolean }> => {
     const auths = authPrincipals(msg);
+    // Bootstrap / allowFrom operations are chat-scoped, not session-scoped;
+    // strip any `#tag` suffix so a first-time user typing `hello #foo`
+    // still promotes them as `user:xxx` (not `user:xxx#foo`).
+    const basePrincipal = chatPrincipal(msg);
     // /id — bypass allowFrom so users can discover their ids before configuring.
     if (isIdCommand(text)) {
-      try { await client.replyStream(frame, msg.msgid, renderIds(msg, cfg), true); } catch { /* ignore */ }
-      return { stop: true, who };
+      await replyText(frame, msg, who, renderIds(msg, cfg));
+      return { stop: true };
     }
     // /help — static command reference. Bypasses allowFrom like /id so a new
     // user can discover the command surface before being authorized.
     if (isHelpCommand(text)) {
-      try { await client.replyStream(frame, msg.msgid, renderHelp(), true); } catch { /* ignore */ }
-      return { stop: true, who };
+      await replyText(frame, msg, who, renderHelp());
+      return { stop: true };
     }
     // /pwd — bypass allowFrom too. Read-only project-path lookup.
     if (isPwdCommand(text)) {
-      try { await client.replyStream(frame, msg.msgid, renderPwd(who), true); } catch { /* ignore */ }
-      return { stop: true, who };
+      await replyText(frame, msg, who, renderPwd(who));
+      return { stop: true };
     }
     // /skill-b — 静态 prompt 回执,教 Claude 调用 /publish 广播接口。纯文本,bypass allowFrom。
     if (isSkillBCommand(text)) {
-      try { await client.replyStream(frame, msg.msgid, renderSkillBroadcast(), true); } catch { /* ignore */ }
-      return { stop: true, who };
+      await replyText(frame, msg, who, renderSkillBroadcast());
+      return { stop: true };
     }
     // /cost — token / cost ESTIMATE pulled from ~/.claude(-internal)?/projects
     // jsonl transcripts (ccusage-style). Read-only, no session state, so it
@@ -462,28 +521,28 @@ export const installInboundRouter = (
       } catch (e) {
         body = `[weclaude] /cost failed: ${(e as Error).message}`;
       }
-      try { await client.replyStream(frame, msg.msgid, body, true); } catch { /* ignore */ }
-      return { stop: true, who };
+      await replyText(frame, msg, who, body);
+      return { stop: true };
     }
-    if (tryConsumeClaim(text, who)) {
-      log.info({ who }, "claim consumed — bootstrapping defaultChat + allowFrom");
-      try { persistClaim(cfg, sourcePath, who); } catch (e) {
+    if (tryConsumeClaim(text, basePrincipal)) {
+      log.info({ who: basePrincipal }, "claim consumed — bootstrapping defaultChat + allowFrom");
+      try { persistClaim(cfg, sourcePath, basePrincipal); } catch (e) {
         log.error({ err: (e as Error).message }, "persistClaim failed");
       }
-      await ackClaim(client, who, log);
-      try { await client.replyStream(frame, msg.msgid, "✅ done", true); } catch { /* ignore */ }
-      return { stop: true, who };
+      await ackClaim(client, basePrincipal, log);
+      await replyText(frame, msg, who, "✅ done");
+      return { stop: true };
     }
     // Auto-claim: empty allowFrom + DM ⇒ first sender becomes super admin.
     // Falls through so the same message is also dispatched as a real prompt —
     // user types "hi" and gets both the promotion ack and the assistant reply.
     const isDm = !(msg.chattype === "group" && msg.chatid);
     if (shouldAutoClaim(cfg, isDm)) {
-      log.info({ who }, "auto-claim — empty allowFrom, first DM sender promoted");
-      try { persistClaim(cfg, sourcePath, who); } catch (e) {
+      log.info({ who: basePrincipal }, "auto-claim — empty allowFrom, first DM sender promoted");
+      try { persistClaim(cfg, sourcePath, basePrincipal); } catch (e) {
         log.error({ err: (e as Error).message }, "auto-claim persistClaim failed");
       }
-      await ackAutoClaim(client, who, log);
+      await ackAutoClaim(client, basePrincipal, log);
       // fall through to dispatch
     }
     if (!isAllowed(cfg, auths) && !isMirrorTarget(bridge, who)) {
@@ -496,7 +555,7 @@ export const installInboundRouter = (
           true,
         );
       } catch { /* ignore */ }
-      return { stop: true, who };
+      return { stop: true };
     }
     // Authorized `/usage` — real subscription rate-limit %, scraped from Claude
     // Code's own `/usage` TUI (/cost can only estimate cost/tokens; the true
@@ -504,7 +563,7 @@ export const installInboundRouter = (
     // ack, then replace with the result.
     if (isUsageCommand(text)) {
       log.info({ who }, "/usage panel: start");
-      try { await client.replyStream(frame, msg.msgid, "⏳ 正在拉起 /usage 面板查询真实额度…", false); } catch (e) { log.warn({ err: (e as Error).message }, "/usage: interim ack failed"); }
+      try { await client.replyStream(frame, msg.msgid, withTagPrefix(who, "⏳ 正在拉起 /usage 面板查询真实额度…"), false); } catch (e) { log.warn({ err: (e as Error).message }, "/usage: interim ack failed"); }
       let body: string;
       try {
         const report = await captureQuota(cfg, log);
@@ -516,46 +575,45 @@ export const installInboundRouter = (
         body = `[weclaude] /usage failed: ${(e as Error).message}`;
         log.error({ who, err: (e as Error).message }, "/usage panel: failed");
       }
-      try { await client.replyStream(frame, msg.msgid, body, true); } catch (e) { log.warn({ err: (e as Error).message }, "/usage: final reply failed"); }
-      return { stop: true, who };
+      await replyText(frame, msg, who, body);
+      return { stop: true };
     }
     // Authorized `/new` — spawn a tmux+claude pair and attach it to this chat.
     // Runs BEFORE the mirror-not-attached short-circuit so it works as the
-    // very first message from a fresh user.
+    // very first message from a fresh user. When routed with a `#tag`, the
+    // tag becomes both the mirror-store key and the tmux window name.
     if (isNewCommand(text)) {
       const reply = await autoSpawnAndAttach(who);
-      try { await client.replyStream(frame, msg.msgid, reply, true); } catch { /* ignore */ }
-      return { stop: true, who };
+      await replyText(frame, msg, who, reply);
+      return { stop: true };
     }
     // 事件订阅 / 广播 / 定时。授权后即可使用,任意 principal 可对本会话订阅/退订,
     // 广播权限同 allowFrom(已过上面的 auth 门)。命令不进入 bridge dispatch,
     // 用轻量 replyStream 回执。
     const topicHandled = await handleTopicCommand(frame, msg, who, text);
-    if (topicHandled) return { stop: true, who };
+    if (topicHandled) return { stop: true };
     // Authorized `/stop` — Esc the live pane to interrupt whatever Claude is
     // currently doing. Mirror-mode only; bails cleanly when no attachment.
     if (isStopCommand(text)) {
       if (!("interruptPane" in bridge)) {
-        try { await client.replyStream(frame, msg.msgid, "[weclaude] /stop only available in mirror mode", true); } catch { /* ignore */ }
+        await replyText(frame, msg, who, "[weclaude] /stop only available in mirror mode");
       } else {
         const r = await bridge.interruptPane(who);
-        const reply = r.ok ? "✅ Esc sent" : `[weclaude] /stop failed: ${r.reason ?? "unknown"}`;
-        try { await client.replyStream(frame, msg.msgid, reply, true); } catch { /* ignore */ }
+        await replyText(frame, msg, who, r.ok ? "✅ Esc sent" : `[weclaude] /stop failed: ${r.reason ?? "unknown"}`);
       }
-      return { stop: true, who };
+      return { stop: true };
     }
     // Authorized `/n` — send a bare Enter to the live pane. Confirms a prompt /
     // dismisses a "press enter to continue", or submits whatever's already in
     // the input box. Mirror-mode only; bails cleanly when no attachment.
     if (isEnterCommand(text)) {
       if (!("submitPane" in bridge)) {
-        try { await client.replyStream(frame, msg.msgid, "[weclaude] /n only available in mirror mode", true); } catch { /* ignore */ }
+        await replyText(frame, msg, who, "[weclaude] /n only available in mirror mode");
       } else {
         const r = await bridge.submitPane(who);
-        const reply = r.ok ? "✅ Enter sent" : `[weclaude] /n failed: ${r.reason ?? "unknown"}`;
-        try { await client.replyStream(frame, msg.msgid, reply, true); } catch { /* ignore */ }
+        await replyText(frame, msg, who, r.ok ? "✅ Enter sent" : `[weclaude] /n failed: ${r.reason ?? "unknown"}`);
       }
-      return { stop: true, who };
+      return { stop: true };
     }
     // /sessions [arg] — list live Claude sessions, or switch the mirror to one.
     // Bare lists; with an arg (emoji / sessionId / ≥6-char prefix) it re-points
@@ -564,8 +622,8 @@ export const installInboundRouter = (
     const sc = parseSessionsCommand(text);
     if (sc) {
       if (!("attach" in bridge)) {
-        try { await client.replyStream(frame, msg.msgid, "[weclaude] /sessions only available in mirror mode", true); } catch { /* ignore */ }
-        return { stop: true, who };
+        await replyText(frame, msg, who, "[weclaude] /sessions only available in mirror mode");
+        return { stop: true };
       }
       let sessions: SessionInfo[] = [];
       try {
@@ -576,25 +634,27 @@ export const installInboundRouter = (
       // Resolve which session is currently mirrored to THIS chat.
       const currentSid = bridge.status().mirrors.find((mm) => mm.target === who)?.sessionId ?? "";
       if (!sc.arg) {
-        try { await client.replyStream(frame, msg.msgid, renderSessionsList(sessions, currentSid), true); } catch { /* ignore */ }
-        return { stop: true, who };
+        await replyText(frame, msg, who, renderSessionsList(sessions, currentSid));
+        return { stop: true };
       }
       const hit = matchSession(sessions, sc.arg);
       if (!hit) {
         const avail = sessions.map((s) => `${s.label || "▫️"} ${s.sessionId.slice(0, 8)}`).join("、") || "无";
-        try { await client.replyStream(frame, msg.msgid, `[weclaude] 未找到会话 \`${sc.arg}\`。可用：${avail}`, true); } catch { /* ignore */ }
-        return { stop: true, who };
+        await replyText(frame, msg, who, `[weclaude] 未找到会话 \`${sc.arg}\`。可用：${avail}`);
+        return { stop: true };
       }
       if (hit.sessionId === currentSid) {
-        try { await client.replyStream(frame, msg.msgid, `[weclaude] 已经在该会话 ${hit.label} \`${hit.sessionId.slice(0, 8)}\``, true); } catch { /* ignore */ }
-        return { stop: true, who };
+        await replyText(frame, msg, who, `[weclaude] 已经在该会话 ${hit.label} \`${hit.sessionId.slice(0, 8)}\``);
+        return { stop: true };
       }
       const att = bridge.attach({ sessionId: hit.sessionId, jsonlPath: hit.jsonlPath, target: who, tmuxPane: hit.tmuxPane, tmuxSession: hit.tmuxSession, cwd: hit.cwd });
-      const reply = att.ok
-        ? `✅ 已切到 ${hit.label} \`${hit.sessionId.slice(0, 8)}\` (${hit.cwd})`
-        : `[weclaude] 切换失败: ${att.reason ?? "unknown"}`;
-      try { await client.replyStream(frame, msg.msgid, reply, true); } catch { /* ignore */ }
-      return { stop: true, who };
+      await replyText(
+        frame, msg, who,
+        att.ok
+          ? `✅ 已切到 ${hit.label} \`${hit.sessionId.slice(0, 8)}\` (${hit.cwd})`
+          : `[weclaude] 切换失败: ${att.reason ?? "unknown"}`,
+      );
+      return { stop: true };
     }
     // Mirror mode but no Claude session attached for this chat yet. Since the
     // sender is already in allowFrom, we treat that authorization as license
@@ -603,12 +663,12 @@ export const installInboundRouter = (
     if ("hasMirrorTarget" in bridge && !bridge.hasMirrorTarget(who)) {
       const reply = await autoSpawnAndAttach(who);
       if (!reply.startsWith("✅")) {
-        try { await client.replyStream(frame, msg.msgid, reply, true); } catch { /* ignore */ }
-        return { stop: true, who };
+        await replyText(frame, msg, who, reply);
+        return { stop: true };
       }
       // attached — fall through to dispatch
     }
-    return { stop: false, who };
+    return { stop: false };
   };
 
   const send = async (frame: WsFrame<BaseMessage>, msg: BaseMessage, who: string, text: string, images: string[] = []): Promise<void> => {
@@ -623,9 +683,10 @@ export const installInboundRouter = (
   client.on("message.text", async (frame: WsFrame<TextMessage>) => {
     const msg = frame.body;
     if (!msg) return;
-    const { text, promoted } = resolveTextBody(msg);
-    log.info({ msgid: msg.msgid, len: text.length, hasQuote: !!msg.quote, promoted }, "rx text");
-    const { stop, who } = await gate(frame, msg, text);
+    const { text, tag, promoted } = resolveTextBody(msg);
+    const who = sessionKey(chatPrincipal(msg), tag);
+    log.info({ msgid: msg.msgid, len: text.length, tag, hasQuote: !!msg.quote, promoted }, "rx text");
+    const { stop } = await gate(frame, msg, text, who);
     if (stop) return;
     await send(frame, msg, who, text);
   });
@@ -634,7 +695,9 @@ export const installInboundRouter = (
     const msg = frame.body;
     if (!msg) return;
     log.info({ msgid: msg.msgid, hasQuote: !!msg.quote }, "rx image");
-    const { stop, who } = await gate(frame, msg, "");
+    // Images carry no text — always route to the chat's default session.
+    const who = chatPrincipal(msg);
+    const { stop } = await gate(frame, msg, "", who);
     if (stop) return;
     const path = await downloadToInbox({ client, log, inboxDir }, msg.image.url, msg.image.aeskey, msg.msgid, 0);
     if (!path) {
@@ -652,7 +715,15 @@ export const installInboundRouter = (
     const msg = frame.body;
     if (!msg) return;
     log.info({ msgid: msg.msgid, items: msg.mixed?.msg_item?.length, hasQuote: !!msg.quote }, "rx mixed");
-    const { stop, who } = await gate(frame, msg, "");
+    // Concatenate all text items to sniff a leading `#tag`, then strip it from
+    // the effective body before forwarding to Claude.
+    const rawText = (msg.mixed?.msg_item ?? [])
+      .filter((it) => it.msgtype === "text")
+      .map((it) => (it as { text?: { content?: string } }).text?.content ?? "")
+      .join("\n");
+    const { tag } = parseTag(maybeStripMentions(msg, rawText));
+    const who = sessionKey(chatPrincipal(msg), tag);
+    const { stop } = await gate(frame, msg, "", who);
     if (stop) return;
     const texts: string[] = [];
     const images: string[] = [];
@@ -673,7 +744,11 @@ export const installInboundRouter = (
       }
     }
     if (texts.length === 0 && images.length === 0 && !msg.quote) return;
-    await send(frame, msg, who, withQuote(msg, texts.join("\n")), images);
+    // Strip the routing `#tag` from the concatenated body before forwarding —
+    // it was consumed by parseTag above; leaving it in would leak into Claude.
+    const joined = texts.join("\n");
+    const bodyForClaude = tag ? parseTag(joined).cleaned : joined;
+    await send(frame, msg, who, withQuote(msg, bodyForClaude), images);
   });
 
   // template_card_event is handled in approval module; no listener here.

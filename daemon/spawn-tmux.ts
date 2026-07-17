@@ -72,15 +72,18 @@ const shQuote = (a: string): string => (/[\s"'`$\\]/.test(a) ? `'${a.replace(/'/
 
 // tmux window names are free-form but a status-bar friendly slug avoids
 // surprises (no whitespace / colons / quoting hazards). Principals are
-// shortened: `user:foo` → `u-foo`, `chat:foo` → `c-foo`. Everything is
-// truncated to 8 chars total (status bar real estate is scarce; collisions
-// don't matter — we always address windows by pane id, never by name).
+// shortened: `user:foo` → `u-foo`, `chat:foo` → `c-foo`, and get truncated to
+// 8 chars total (status bar real estate is scarce; collisions don't matter —
+// we always address windows by pane id, never by name). Explicit tag names
+// (not `user:`/`chat:` prefixed) are treated as user-authored labels and kept
+// up to 24 chars so `/new #my-tag` shows readably in the tmux status bar.
 const safeWindowName = (s: string): string => {
+  const isPrincipal = s.startsWith("user:") || s.startsWith("chat:");
   const compact = s.startsWith("user:") ? `u-${s.slice(5)}`
     : s.startsWith("chat:") ? `c-${s.slice(5)}`
     : s;
   const slug = compact.replace(/[^A-Za-z0-9_.\-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-  return (slug || "claude").slice(0, 8);
+  return (slug || "claude").slice(0, isPrincipal ? 8 : 24);
 };
 
 // Time the daemon waits between launching claude and returning. Covers shell

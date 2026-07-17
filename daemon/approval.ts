@@ -30,9 +30,12 @@ import { labelFor } from "./session-label.js";
 const targetChatId = (principal: string): string => {
   // "user:abc" → "abc" (DM chatid == userid for aibot)
   // "chat:wc..." → "wc..."
+  // "user:abc#tag" → "abc" (drop the routing tag; WeCom SDK only knows chatids)
   // raw fallthrough
   const i = principal.indexOf(":");
-  return i >= 0 ? principal.slice(i + 1) : principal;
+  const rest = i >= 0 ? principal.slice(i + 1) : principal;
+  const h = rest.indexOf("#");
+  return h >= 0 ? rest.slice(0, h) : rest;
 };
 
 const pickApprover = (cfg: Config): string | undefined => {
