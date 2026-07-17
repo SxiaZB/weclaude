@@ -199,10 +199,20 @@ const detailJumpList = (url?: string): TemplateCard["jump_list"] | undefined =>
 // Show the session emoji ONLY on cards bound to a tagged session — the tag
 // (`user:xxx#foo`) is the visual disambiguator for chats hosting parallel
 // sessions. Untagged (default-session) cards drop the emoji so single-session
-// users don't see a chunk of extra glyphs in every approval title.
-const isTaggedTarget = (target: string | undefined): boolean => !!target && target.includes("#");
-const tagOf = (a: CardArgs): string =>
-  (a.sessionId && isTaggedTarget(a.chatKey)) ? `${labelFor(a.sessionId)} ` : "";
+// users don't see a chunk of extra glyphs in every approval title. Emoji is
+// keyed on the tag STRING (not sessionId) so it matches the `emoji #tag`
+// prefix that outbound mirror bubbles carry — one visual per tag, regardless
+// of how many times `/clear` rotates the underlying sessionId.
+const tagStringOf = (target: string | undefined): string => {
+  if (!target) return "";
+  const h = target.indexOf("#");
+  return h >= 0 ? target.slice(h + 1) : "";
+};
+const emojiFor = (target: string | undefined): string => {
+  const tag = tagStringOf(target);
+  return tag ? `${labelFor(tag)} ` : "";
+};
+const tagOf = (a: CardArgs): string => emojiFor(a.chatKey);
 
 const buildCard = (a: CardArgs): TemplateCard => {
   const r = renderInput(a.toolName, a.toolInput, a.toolInputStr, a.cwd);
@@ -373,7 +383,7 @@ const renderBatchBody = (batch: ActiveBatch): string => {
 const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCard => {
   const dir = dirName(batch.members[0]?.cwd ?? "");
   const tail = oneLine(transcriptTail).trim();
-  const emoji = batch.sessionId && isTaggedTarget(batch.approver) ? labelFor(batch.sessionId) + " " : "";
+  const emoji = emojiFor(batch.approver);
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
@@ -409,7 +419,7 @@ const buildBatchResolvedCard = (
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `${batch.sessionId && isTaggedTarget(batch.approver) ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    main_title: { title: `${emojiFor(batch.approver)}${batch.toolName} ×${batch.members.length} · ${dir}/` },
     quote_area: quoteArea(renderBatchBody(batch)),
     task_id: batch.batchId,
     button_list: [button],
@@ -422,7 +432,7 @@ const buildBatchAlreadyResolvedCard = (batch: ActiveBatch, transcriptTail: strin
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `${batch.sessionId && isTaggedTarget(batch.approver) ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    main_title: { title: `${emojiFor(batch.approver)}${batch.toolName} ×${batch.members.length} · ${dir}/` },
     quote_area: quoteArea(renderBatchBody(batch)),
     task_id: batch.batchId,
     button_list: [{ text: "已经放行", style: 4, key: encodeBatchNoopKey(batch.batchId) }],
@@ -634,9 +644,9 @@ const buildPlanMarkdown = (plan: string): string => {
   return `**📋 计划待审批**\n\n${body}`;
 };
 
-const buildPlanCard = (reqId: string, sessionId: string, cwd: string, transcriptTail: string, approver: string): TemplateCard => {
+const buildPlanCard = (reqId: string, _sessionId: string, cwd: string, transcriptTail: string, approver: string): TemplateCard => {
   const tail = oneLine(transcriptTail).trim();
-  const tag = sessionId && isTaggedTarget(approver) ? `${labelFor(sessionId)} ` : "";
+  const tag = emojiFor(approver);
   const dir = dirName(cwd);
   return {
     card_type: "button_interaction",
