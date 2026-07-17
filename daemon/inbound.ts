@@ -182,8 +182,17 @@ const stripMentions = (text: string): string => {
 // DMs can't @ a bot — any "@" the user types is content (e.g. "@src/foo.ts"),
 // so we only strip mentions in group chats.
 const isGroup = (msg: BaseMessage): boolean => msg.chattype === "group" && !!msg.chatid;
-const maybeStripMentions = (msg: BaseMessage, text: string): string =>
-  isGroup(msg) ? stripMentions(text) : text;
+// Always kill "@weclaude" (bot's own name) regardless of chat type / @-count:
+// a DM user typing "@weclaude start …" would otherwise leak the mention into
+// Claude's prompt and get semantically parsed (e.g. spawning wrc). Word-tail
+// guard `(?![A-Za-z0-9_])` keeps identifiers like "@weclaude-foo" intact
+// while allowing CJK / punctuation right after.
+const stripBotName = (text: string): string =>
+  text.replace(/[ \t]*@weclaude(?![A-Za-z0-9_])[ \t]*/giu, " ").replace(/[ \t]{2,}/g, " ").trim();
+const maybeStripMentions = (msg: BaseMessage, text: string): string => {
+  const cleaned = stripBotName(text);
+  return isGroup(msg) ? stripMentions(cleaned) : cleaned;
+};
 
 // Render the user's "引用" (quoted message) into a markdown blockquote so the
 // claude prompt carries the upstream context. WeCom delivers `quote` as a
