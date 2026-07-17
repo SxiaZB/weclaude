@@ -134,10 +134,18 @@ const readUsageEntries = (path: string, sinceMs: number): UsageEntry[] => {
     const model = String(msg.model ?? "");
     if (!model || model === "<synthetic>") continue;
     const u = (msg.usage ?? {}) as Record<string, unknown>;
-    const input = Number(u.input_tokens ?? 0);
+    const rawIn = Number(u.input_tokens ?? 0);
     const output = Number(u.output_tokens ?? 0);
     const cacheCreate = Number(u.cache_creation_input_tokens ?? 0);
     const cacheRead = Number(u.cache_read_input_tokens ?? 0);
+    // CodeBuddy (claude-internal) 网关把 input_tokens 报成 cr+cw+fresh 的合计,
+    // 与 Anthropic 官方口径 (input_tokens 仅含 fresh, 与 cache_* 互不相交) 冲突。
+    // 按模型命名风格判定: CodeBuddy 形如 "claude-4.7-opus" (点号版本),
+    // 官方形如 "claude-opus-4-7"。只对 CodeBuddy 反推, 不影响原生会话。
+    const isGatewayTotalized = /\d\.\d/.test(model);
+    const input = isGatewayTotalized && rawIn >= cacheRead + cacheCreate
+      ? rawIn - cacheRead - cacheCreate
+      : rawIn;
     if (input + output + cacheCreate + cacheRead === 0) continue;
     // Dedup: `--resume` copies the parent transcript into the new session's
     // jsonl, so every historical message would otherwise count many times.
