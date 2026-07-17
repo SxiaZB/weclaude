@@ -196,7 +196,13 @@ const detailJumpList = (url?: string): TemplateCard["jump_list"] | undefined =>
 // can tell which session a card belongs to when several un-mirrored sessions
 // fall back to the same WeCom chat. Needs the FULL sessionId; returns "" when
 // only a short id / none is available.
-const tagOf = (a: CardArgs): string => (a.sessionId ? `${labelFor(a.sessionId)} ` : "");
+// Show the session emoji ONLY on cards bound to a tagged session — the tag
+// (`user:xxx#foo`) is the visual disambiguator for chats hosting parallel
+// sessions. Untagged (default-session) cards drop the emoji so single-session
+// users don't see a chunk of extra glyphs in every approval title.
+const isTaggedTarget = (target: string | undefined): boolean => !!target && target.includes("#");
+const tagOf = (a: CardArgs): string =>
+  (a.sessionId && isTaggedTarget(a.chatKey)) ? `${labelFor(a.sessionId)} ` : "";
 
 const buildCard = (a: CardArgs): TemplateCard => {
   const r = renderInput(a.toolName, a.toolInput, a.toolInputStr, a.cwd);
@@ -367,10 +373,11 @@ const renderBatchBody = (batch: ActiveBatch): string => {
 const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCard => {
   const dir = dirName(batch.members[0]?.cwd ?? "");
   const tail = oneLine(transcriptTail).trim();
+  const emoji = batch.sessionId && isTaggedTarget(batch.approver) ? labelFor(batch.sessionId) + " " : "";
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `🔐 授权 · ${batch.sessionId ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    main_title: { title: `🔐 授权 · ${emoji}${batch.toolName} ×${batch.members.length} · ${dir}/` },
     quote_area: quoteArea(renderBatchBody(batch)),
     task_id: batch.batchId,
     button_list: [
@@ -402,7 +409,7 @@ const buildBatchResolvedCard = (
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `${batch.sessionId ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    main_title: { title: `${batch.sessionId && isTaggedTarget(batch.approver) ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
     quote_area: quoteArea(renderBatchBody(batch)),
     task_id: batch.batchId,
     button_list: [button],
@@ -415,7 +422,7 @@ const buildBatchAlreadyResolvedCard = (batch: ActiveBatch, transcriptTail: strin
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: `${batch.sessionId ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
+    main_title: { title: `${batch.sessionId && isTaggedTarget(batch.approver) ? labelFor(batch.sessionId) + " " : ""}${batch.toolName} ×${batch.members.length} · ${dir}/` },
     quote_area: quoteArea(renderBatchBody(batch)),
     task_id: batch.batchId,
     button_list: [{ text: "已经放行", style: 4, key: encodeBatchNoopKey(batch.batchId) }],
@@ -627,9 +634,9 @@ const buildPlanMarkdown = (plan: string): string => {
   return `**📋 计划待审批**\n\n${body}`;
 };
 
-const buildPlanCard = (reqId: string, sessionId: string, cwd: string, transcriptTail: string): TemplateCard => {
+const buildPlanCard = (reqId: string, sessionId: string, cwd: string, transcriptTail: string, approver: string): TemplateCard => {
   const tail = oneLine(transcriptTail).trim();
-  const tag = sessionId ? `${labelFor(sessionId)} ` : "";
+  const tag = sessionId && isTaggedTarget(approver) ? `${labelFor(sessionId)} ` : "";
   const dir = dirName(cwd);
   return {
     card_type: "button_interaction",
@@ -710,7 +717,7 @@ const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flu
     }
     await client.sendMessage(target, {
       msgtype: "template_card",
-      template_card: buildPlanCard(reqId, body.session_id, body.cwd ?? "", body.transcript_tail ?? ""),
+      template_card: buildPlanCard(reqId, body.session_id, body.cwd ?? "", body.transcript_tail ?? "", approver),
     });
     log.info({ reqId, approver }, "plan card sent");
   } catch (e) {
@@ -969,6 +976,10 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
             cwd: m.cwd,
             sessionId: batch.sessionId ?? "",
             sessionShort: batch.sessionId ? batch.sessionId.slice(-8) : "?",
+            // Approver target — needed for `tagOf` to decide whether to prefix
+            // the emoji (only tagged sessions get it now). Also flows through
+            // to the resolved card's cancel key path.
+            chatKey: batch.approver,
             transcriptTail: m.transcriptTail,
             windowMinutes: batch.windowMinutes,
             detailUrl: detailUrlFor(m.reqId),
@@ -1497,6 +1508,7 @@ export const installApprovalEventListener = (
               cwd: meta?.cwd ?? "",
               sessionShort,
               sessionId: meta?.sessionId ?? "",
+              chatKey: meta?.chatKey ?? "",
               transcriptTail: meta?.transcriptTail ?? "",
               windowMinutes: cfg.approval.windowMinutes,
               detailUrl: detailUrlFor(reqId),
