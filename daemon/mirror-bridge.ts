@@ -298,6 +298,14 @@ const tagOfTarget = (s: string): string => {
   return h >= 0 ? s.slice(h + 1) : "";
 };
 
+// Drop the `#tag` suffix — collapses tagged session keys to the chat-scoped
+// base principal (`user:xxx#foo` → `user:xxx`). Used to share cwd state
+// across all sessions that live in the same WeCom chat.
+const basePrincipalOf = (s: string): string => {
+  const h = s.indexOf("#");
+  return h >= 0 ? s.slice(0, h) : s;
+};
+
 // Prefix outbound content with `<emoji> #tag` header (blank line separator)
 // when the target carries a `#tag` suffix. Untagged targets pass through
 // unchanged — default session keeps its plain-bubble UX.
@@ -2619,7 +2627,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const a = byTarget.get(target);
     const rec = a ? undefined : deps.store.get(target);
     const running = (a?.runningCwd?.trim()) || rec?.cwd?.trim() || expandedDefaultCwd;
-    const pending = (a?.pendingCwd?.trim()) || rec?.pendingCwd?.trim() || "";
+    // pendingCwd is chat-scoped — the queued switch applies to every session
+    // in this chat, so read it from the shared base slot rather than the
+    // caller's own (now-empty) attachment record.
+    const pending = chatCwdFallback(target).pending;
     const lines = [`📂 当前项目: \`${running}\``];
     if (pending && pending !== running) {
       lines.push(`下次切换: \`${pending}\` (使用 /new 或 /clear 生效)`);
@@ -2643,6 +2654,21 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       .catch((e: unknown) => log.warn({ err: (e as Error).message, target }, "pushProjectInfo (no attach) failed"));
   };
 
+  // Cwd is CHAT-SCOPED, not session-scoped: all sessions in the same chat
+  // (default + any `#tag` siblings) share one cwd/pendingCwd, tracked on the
+  // BASE principal's byTarget/store record. Tagged sessions still have their
+  // own `runningCwd` (the tmux pane's actual working dir at spawn time), but
+  // cwd fallbacks and `cd` pendingCwd writes always resolve against the base.
+  const chatCwdFallback = (target: string): { pending: string; running: string } => {
+    const base = basePrincipalOf(target);
+    const baseA = byTarget.get(base);
+    const baseRec = deps.store.get(base);
+    return {
+      pending: (baseA?.pendingCwd?.trim()) || (baseRec?.pendingCwd?.trim()) || "",
+      running: (baseA?.runningCwd?.trim()) || (baseRec?.cwd?.trim()) || "",
+    };
+  };
+
   // /new path: kill the old pane (so we don't leak orphan tmux windows) and
   // spawn a fresh claude in pendingCwd ?? runningCwd ?? default. Returns the
   // new sessionId/cwd so callers can render the user-facing reply.
@@ -2651,15 +2677,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     windowName?: string,
   ): Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }> => {
     const prev = byTarget.get(target);
-    // Honor persisted cwd/pendingCwd when no live attachment yet — otherwise
-    // a fresh-chat /new in a daemon-just-rebooted state would lose the user's
-    // bound project. Same precedence as getCwd: live > stored, pending > running.
+    // Resolution precedence (all chat-scoped except the running-cwd fallback):
+    //   base.pending > target.running > base.running > default
+    // A fresh tagged session inherits the chat's current cwd; re-`/new`ing a
+    // live tagged session keeps its pane cwd unless the base session queued a
+    // `cd`. This keeps siblings aligned by default without forcibly clobbering
+    // an already-spawned tagged pane on every base-cwd change.
+    const chat = chatCwdFallback(target);
     const rec = !prev ? deps.store.get(target) : undefined;
     const eff =
-      (prev?.pendingCwd?.trim()) ||
-      (rec?.pendingCwd?.trim()) ||
+      chat.pending ||
       (prev?.runningCwd?.trim()) ||
       (rec?.cwd?.trim()) ||
+      chat.running ||
       expandedDefaultCwd;
     if (prev?.tmuxPane) {
       // Best-effort kill; ignore errors (pane may already be dead).
@@ -2684,18 +2714,48 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       pendingCwd: "",
     });
     if (!att.ok) return { ok: false, reason: att.reason };
+    // Clear the chat's pendingCwd on the BASE record too — the queued switch
+    // has just been consumed by this respawn. Without this, a subsequent /new
+    // #other would re-apply the same cd and diverge from user intent.
+    const base = basePrincipalOf(target);
+    if (base !== target) {
+      const baseA = byTarget.get(base);
+      if (baseA?.pendingCwd) {
+        baseA.pendingCwd = "";
+        deps.store.set(base, {
+          sessionId: baseA.sessionId,
+          jsonlPath: baseA.jsonlPath,
+          tmuxSession: baseA.tmuxSession || undefined,
+          tmuxPane: baseA.tmuxPane || undefined,
+          cwd: baseA.runningCwd || undefined,
+          pendingCwd: undefined,
+        });
+      } else {
+        const baseRec = deps.store.get(base);
+        if (baseRec?.pendingCwd) deps.store.set(base, { ...baseRec, pendingCwd: undefined });
+      }
+    }
     pushProjectInfo(target);
     return { ok: true, sessionId: r.sessionId, cwd: r.cwd };
   };
 
   const getCwd = (target: string): { runningCwd: string; pendingCwd: string; defaultCwd: string } => {
+    // pendingCwd is chat-scoped — a `cd` from any sibling session queues the
+    // switch for the whole chat. runningCwd stays per-session (each pane has
+    // its own spawn dir).
+    const chat = chatCwdFallback(target);
+    const pending = chat.pending;
     const a = byTarget.get(target);
-    if (a) return { runningCwd: a.runningCwd || expandedDefaultCwd, pendingCwd: a.pendingCwd || "", defaultCwd: expandedDefaultCwd };
+    if (a) return { runningCwd: a.runningCwd || expandedDefaultCwd, pendingCwd: pending, defaultCwd: expandedDefaultCwd };
     const rec = deps.store.get(target);
-    if (rec) return { runningCwd: rec.cwd?.trim() || expandedDefaultCwd, pendingCwd: rec.pendingCwd?.trim() || "", defaultCwd: expandedDefaultCwd };
-    return { runningCwd: expandedDefaultCwd, pendingCwd: "", defaultCwd: expandedDefaultCwd };
+    if (rec) return { runningCwd: rec.cwd?.trim() || expandedDefaultCwd, pendingCwd: pending, defaultCwd: expandedDefaultCwd };
+    return { runningCwd: chat.running || expandedDefaultCwd, pendingCwd: pending, defaultCwd: expandedDefaultCwd };
   };
 
+  // Write `pendingCwd` to the BASE principal so the switch applies chat-wide —
+  // the next /new in any tagged/untagged session picks it up. `cd` from a
+  // tagged session still writes to the shared slot, not the tagged session's
+  // own record, matching "sessions share the chat's cwd".
   const setPendingCwd = (
     target: string,
     cwd: string,
@@ -2704,25 +2764,51 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (!trimmed) return { ok: false, reason: "empty cwd", runningCwd: "", pendingCwd: "" };
     const expanded = expandHome(trimmed);
     if (!expanded.startsWith("/")) return { ok: false, reason: "cwd must be absolute (or start with ~)", runningCwd: "", pendingCwd: "" };
-    const a = byTarget.get(target);
-    if (a) {
-      a.pendingCwd = expanded;
-      deps.store.set(target, {
-        sessionId: a.sessionId,
-        jsonlPath: a.jsonlPath,
-        tmuxSession: a.tmuxSession || undefined,
-        tmuxPane: a.tmuxPane || undefined,
-        cwd: a.runningCwd || undefined,
-        pendingCwd: a.pendingCwd || undefined,
+    const base = basePrincipalOf(target);
+    const callerA = byTarget.get(target);
+    const callerRunning = callerA?.runningCwd?.trim() || deps.store.get(target)?.cwd?.trim() || expandedDefaultCwd;
+    const baseA = byTarget.get(base);
+    if (baseA) {
+      baseA.pendingCwd = expanded;
+      deps.store.set(base, {
+        sessionId: baseA.sessionId,
+        jsonlPath: baseA.jsonlPath,
+        tmuxSession: baseA.tmuxSession || undefined,
+        tmuxPane: baseA.tmuxPane || undefined,
+        cwd: baseA.runningCwd || undefined,
+        pendingCwd: baseA.pendingCwd || undefined,
       });
-      log.info({ target, runningCwd: a.runningCwd, pendingCwd: a.pendingCwd }, "setPendingCwd (live attach)");
-      return { ok: true, runningCwd: a.runningCwd, pendingCwd: a.pendingCwd };
+      log.info({ target, base, runningCwd: callerRunning, pendingCwd: expanded }, "setPendingCwd (chat-scoped, live base)");
+      return { ok: true, runningCwd: callerRunning, pendingCwd: expanded };
     }
-    const rec = deps.store.get(target);
-    if (rec) {
-      deps.store.set(target, { ...rec, pendingCwd: expanded });
-      log.info({ target, runningCwd: rec.cwd, pendingCwd: expanded }, "setPendingCwd (persisted only)");
-      return { ok: true, runningCwd: rec.cwd?.trim() || expandedDefaultCwd, pendingCwd: expanded };
+    const baseRec = deps.store.get(base);
+    if (baseRec) {
+      deps.store.set(base, { ...baseRec, pendingCwd: expanded });
+      log.info({ target, base, runningCwd: callerRunning, pendingCwd: expanded }, "setPendingCwd (chat-scoped, persisted base)");
+      return { ok: true, runningCwd: callerRunning, pendingCwd: expanded };
+    }
+    // No base binding yet (caller is a tagged session created before any
+    // default session existed). Fall back to writing on the caller's own
+    // record so the pending switch isn't lost — the next default /new will
+    // then inherit via chatCwdFallback and normalize onto the base.
+    if (callerA) {
+      callerA.pendingCwd = expanded;
+      deps.store.set(target, {
+        sessionId: callerA.sessionId,
+        jsonlPath: callerA.jsonlPath,
+        tmuxSession: callerA.tmuxSession || undefined,
+        tmuxPane: callerA.tmuxPane || undefined,
+        cwd: callerA.runningCwd || undefined,
+        pendingCwd: callerA.pendingCwd || undefined,
+      });
+      log.info({ target, runningCwd: callerA.runningCwd, pendingCwd: callerA.pendingCwd }, "setPendingCwd (fallback: no base, wrote to caller)");
+      return { ok: true, runningCwd: callerA.runningCwd, pendingCwd: callerA.pendingCwd };
+    }
+    const callerRec = deps.store.get(target);
+    if (callerRec) {
+      deps.store.set(target, { ...callerRec, pendingCwd: expanded });
+      log.info({ target, runningCwd: callerRec.cwd, pendingCwd: expanded }, "setPendingCwd (fallback: no base, wrote to caller persist)");
+      return { ok: true, runningCwd: callerRec.cwd?.trim() || expandedDefaultCwd, pendingCwd: expanded };
     }
     return { ok: false, reason: "no mirror binding for target — send a message in the WeCom chat first", runningCwd: "", pendingCwd: "" };
   };
@@ -2964,7 +3050,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // Auto-upgrade /clear → /new when the user has queued a project switch:
       // a plain /clear would only rotate sessionId in the same pane, which sits
       // in the OLD cwd. Killing+respawning is the only way to honor the switch.
-      const pending = (a.pendingCwd ?? "").trim();
+      // pendingCwd is chat-scoped, so read it via the shared fallback rather
+      // than from this attachment's own record (which is now always empty for
+      // tagged sessions).
+      const pending = chatCwdFallback(a.target).pending;
       if (armMigration && pending && pending !== a.runningCwd) {
         if (a.liveStream && !a.liveStream.closed) await finalizeStream(a, a.liveStream);
         log.info({ target: a.target, runningCwd: a.runningCwd, pendingCwd: pending }, "/clear upgraded to /new (cwd switch)");
