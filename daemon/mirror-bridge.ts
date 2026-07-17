@@ -1923,7 +1923,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       return;
     }
     if (item.kind === "turn_usage") {
-      recordTurnUsage(turnId, { model: item.model, usage: item.usage });
+      recordTurnUsage(turnId, { model: item.model, messageId: item.messageId, usage: item.usage });
       return;
     }
     if (item.kind === "skill_output") {
