@@ -1835,7 +1835,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: userQuery.trim() || undefined });
     // hardTimer 兜底: turn 若无 final text / turn_end 收口 (卡死/漏收), 到点仍收气泡。
     const hardTimer = setTimeout(
-      () => void finishBriefBubble(a, a.briefHadTool ? briefDetailLink(turnId) : " "),
+      () => void finishBriefBubble(a, briefDetailLink(turnId)),
       HARD_TIMEOUT_MS,
     );
     a.briefBubble = { frame, streamId, hardTimer, done: false };
@@ -1860,9 +1860,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const closeBriefTurn = (a: AttachState): void => {
     if (!a.briefTurnId) return;
     // 气泡还开着 (有工具的 turn: final text 只发了 standalone, 气泡留到这里收链接;
-    // 或空 turn 无 final text) —— 收口: 有工具写详情链接, 否则空占位。
+    // 或空 turn 无 final text) —— 收口: 统一写详情链接, 保证每个 turn 都有可点入口。
     if (a.briefBubble && !a.briefBubble.done) {
-      void finishBriefBubble(a, a.briefHadTool ? briefDetailLink(a.briefTurnId) : " ");
+      void finishBriefBubble(a, briefDetailLink(a.briefTurnId));
     }
     recordTurnClose(a.briefTurnId);
     log.info({ sessionId: a.sessionId, turnId: a.briefTurnId }, "brief: turn closed");
@@ -1909,11 +1909,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       recordTurnItem(turnId, { t: "text", body: item.body, ts: now, final: item.final === true });
       if (item.final !== true) earlyLinkBubble(a); // 非 final 中间输出 → 立刻推链接
       if (item.final === true) {
-        // 收口结论: 无工具 → 直接写进 loading 气泡 (一条消息搞定); 有工具 → 气泡留给
-        // closeBriefTurn 收详情链接, 结论另发 standalone。本轮 closeBriefTurn 仍由
-        // turn_end 触发 (等尾随 turn_usage 落库); 此前遗留未关闭的 turn 借这次一并收尾。
+        // 收口结论: 无工具 → 答案 + 详情链接一并写进 loading 气泡 (仍是一条消息);
+        // 有工具 → 气泡留给 closeBriefTurn 收详情链接, 结论另发 standalone。
+        // 每个 turn 都必须留一个可回溯入口, 单句回答也要带链接。
         if (a.briefHadTool) sendStandalone(a, item.body);
-        else void finishBriefBubble(a, item.body);
+        else void finishBriefBubble(a, `${item.body}\n\n${briefDetailLink(turnId)}`);
         recordCloseOpenTurns(a.target, turnId);
       }
       return;
