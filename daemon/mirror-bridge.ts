@@ -1333,6 +1333,10 @@ interface ActiveStream {
   turnId: string;
   frame: WsFrameHeaders;
   streamId: string;
+  /** Target key of the owning attachment. Duplicated onto the stream so
+   *  flush/finalize can prefix outbound content with `emoji #tag` without
+   *  threading `a` through every call site. */
+  target: string;
   acc: string;
   lastSent: string;
   capped: boolean;
@@ -1516,11 +1520,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const TOOL_DETAIL_PREFIX = "TOOL_DETAIL|";
   const newTurnId = (): string => `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 
-  const detailCardFor = (s: ActiveStream): TemplateCard | undefined => {
+  const detailCardFor = (s: ActiveStream, target: string): TemplateCard | undefined => {
     if (s.tools.length === 0) return undefined;
+    const tag = tagOfTarget(target);
+    const titlePrefix = tag ? `${labelFor(tag)} #${tag} · ` : "";
     return {
       card_type: "button_interaction" as const,
-      main_title: { title: "本轮工具调用" },
+      main_title: { title: `${titlePrefix}本轮工具调用` },
       sub_title_text: `共 ${s.tools.length} 次调用，点击查看详情`,
       task_id: s.turnId,
       button_list: [{ text: "查看详情", style: 1, key: `${TOOL_DETAIL_PREFIX}${s.turnId}` }],
@@ -1533,7 +1539,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const content = s.acc;
     s.lastSent = content;
     try {
-      await client.replyStream(s.frame, s.streamId, content || " ", false);
+      await client.replyStream(s.frame, s.streamId, withSessionTag(s.target, content || " "), false);
       log.debug({ turnId: s.turnId, len: content.length }, "stream flush ok");
     } catch (e) {
       log.warn({ turnId: s.turnId, err: (e as Error).message }, "stream flush failed; marking dead");
@@ -1551,13 +1557,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (s.idleTimer) { clearTimeout(s.idleTimer); s.idleTimer = undefined; }
     if (s.hardTimer) { clearTimeout(s.hardTimer); s.hardTimer = undefined; }
     if (!s.dead) {
-      const card = detailCardFor(s);
+      const card = detailCardFor(s, a.target);
       try {
         if (card) {
           s.cardSent = true;
-          await client.replyStreamWithCard(s.frame, s.streamId, s.acc || " ", true, { templateCard: card });
+          await client.replyStreamWithCard(s.frame, s.streamId, withSessionTag(a.target, s.acc || " "), true, { templateCard: card });
         } else {
-          await client.replyStream(s.frame, s.streamId, s.acc || " ", true);
+          await client.replyStream(s.frame, s.streamId, withSessionTag(a.target, s.acc || " "), true);
         }
         log.info({ sessionId: a.sessionId, turnId: s.turnId, accLen: s.acc.length, tools: s.tools.length, withCard: !!card }, "stream finalize");
       } catch (e) {
@@ -1582,6 +1588,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const s: ActiveStream = {
       turnId: newTurnId(),
       frame, streamId,
+      target: a.target,
       acc: "", lastSent: "",
       capped: false, closed: false, dead: false, cardSent: false,
       tools: [], sawTool: false,
@@ -1743,7 +1750,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     flushPendingStandalone(a);
     void (async () => {
       try {
-        await client.replyStream(out.frame, out.streamId, bubbleMd || " ", true);
+        await client.replyStream(out.frame, out.streamId, withSessionTag(a.target, bubbleMd || " "), true);
       } catch (e) {
         log.warn(
           { sessionId: a.sessionId, err: (e as Error).message },
@@ -1774,7 +1781,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // sees the bubble; subsequent items grow it as today.
       void (async () => {
         try {
-          await client.replyStream(frame, streamId, "…", false);
+          await client.replyStream(frame, streamId, withSessionTag(a.target, "…"), false);
         } catch (e) {
           log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "stream initial ack failed");
         }
@@ -1849,7 +1856,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     clearTimeout(b.hardTimer);
     a.briefBubble = undefined;
     try {
-      await client.replyStream(b.frame, b.streamId, content || " ", true);
+      await client.replyStream(b.frame, b.streamId, withSessionTag(a.target, content || " "), true);
     } catch (e) {
       log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "brief: bubble finish failed; standalone fallback");
       if (content.trim()) sendStandalone(a, content);
@@ -1870,7 +1877,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     );
     a.briefBubble = { frame, streamId, hardTimer, done: false };
     try {
-      await client.replyStream(frame, streamId, "…", false); // 挂住 loading 气泡, 不关闭
+      await client.replyStream(frame, streamId, withSessionTag(a.target, "…"), false); // 挂住 loading 气泡, 不关闭
     } catch (e) {
       log.warn({ sessionId: a.sessionId, turnId, err: (e as Error).message }, "brief: turn ack failed");
     }
@@ -2650,7 +2657,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // Send via plain sendMessage so the user still gets the info.
     const chatId = stripPrincipalPrefix(target);
     void client
-      .sendMessage(chatId, { msgtype: "markdown", markdown: { content: md } })
+      .sendMessage(chatId, { msgtype: "markdown", markdown: { content: withSessionTag(target, md) } })
       .catch((e: unknown) => log.warn({ err: (e as Error).message, target }, "pushProjectInfo (no attach) failed"));
   };
 
@@ -3028,7 +3035,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           await client.replyStream(
             frame,
             streamId,
-            "[weclaude] wecom remote control not attached — run `/wrc` inside the target Claude session",
+            withSessionTag(principal, "[weclaude] wecom remote control not attached — run `/wrc` inside the target Claude session"),
             true,
           );
         } catch {
@@ -3062,7 +3069,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         const tag = tagOfTarget(a.target);
         const r = await newSession(a.target, tag || a.target);
         if (!r.ok) {
-          try { await client.replyStream(frame, streamId, `[mirror] 切换失败: ${r.reason ?? "unknown"}`, true); } catch { /* ignore */ }
+          try { await client.replyStream(frame, streamId, withSessionTag(a.target, `[mirror] 切换失败: ${r.reason ?? "unknown"}`), true); } catch { /* ignore */ }
         }
         return;
       }
@@ -3100,7 +3107,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       if (s) {
         a.liveStream = s;
         try {
-          await client.replyStream(frame, streamId, "…", false);
+          await client.replyStream(frame, streamId, withSessionTag(a.target, "…"), false);
         } catch (e) {
           log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "stream initial ack failed");
         }
@@ -3181,7 +3188,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           } else if (armMigration) {
             // /clear path has no live stream — surface failure as a one-shot
             // terse reply ("clean" per project convention).
-            try { await client.replyStream(frame, streamId, "clean", true); } catch { /* ignore */ }
+            try { await client.replyStream(frame, streamId, withSessionTag(a.target, "clean"), true); } catch { /* ignore */ }
           } else {
             // Deferred path: tear down outbound, surface error as standalone.
             // promote* may have already cleared the slot if a tail item raced
@@ -3261,11 +3268,11 @@ export const installMirrorEventListener = (
       log.warn({ turnId }, "tool detail expired or unknown");
       return;
     }
-    const chatId = detail.target.includes(":") ? detail.target.slice(detail.target.indexOf(":") + 1) : detail.target;
+    const chatId = stripPrincipalPrefix(detail.target);
     void (async () => {
       for (const md of detail.markdown) {
         try {
-          await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content: md } });
+          await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content: withSessionTag(detail.target, md) } });
         } catch (e) {
           log.warn({ err: (e as Error).message, turnId }, "tool detail push failed");
         }
