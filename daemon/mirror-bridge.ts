@@ -573,15 +573,25 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
     if (u) {
       const model = typeof line.message?.model === "string" ? line.message.model : undefined;
       const messageId = typeof line.message?.id === "string" ? line.message.id : undefined;
+      const rawIn = u.input_tokens ?? 0;
+      const cr = u.cache_read_input_tokens ?? 0;
+      const cw = u.cache_creation_input_tokens ?? 0;
+      // CodeBuddy (claude-internal) 网关把 input_tokens 报成 cr+cw+fresh 的总和,
+      // 而 Anthropic 官方 input_tokens 只含 fresh (与 cache_creation/cache_read disjoint)。
+      // 按模型命名风格判定源头: CodeBuddy 是 "claude-4.7-opus" (点号版本),
+      // Anthropic 官方是 "claude-opus-4-7" (纯连字符)。只对 CodeBuddy 风格反推,
+      // 普通 Anthropic-native 会话保持原样, 不影响其 usage 计算。
+      const isGatewayTotalized = typeof model === "string" && /\d\.\d/.test(model);
+      const input = isGatewayTotalized && rawIn >= cr + cw ? rawIn - cr - cw : rawIn;
       out.push({
         kind: "turn_usage",
         model,
         messageId,
         usage: {
-          input: u.input_tokens ?? 0,
+          input,
           output: u.output_tokens ?? 0,
-          cacheRead: u.cache_read_input_tokens ?? 0,
-          cacheWrite: u.cache_creation_input_tokens ?? 0,
+          cacheRead: cr,
+          cacheWrite: cw,
           serviceTier: u.service_tier,
           calls: 1,
         },
