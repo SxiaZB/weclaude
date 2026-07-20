@@ -78,6 +78,12 @@ if [[ "$TOOL_NAME" != "AskUserQuestion" ]] && [[ "${WECLAUDE_HONOR_AUTO_MODE:-1}
   esac
 fi
 
+# ExitPlanMode 只是把 plan mode 的产出交给用户确认, 本地 CLI 会再弹一次原生
+# 确认框, 走 IM 审批纯属多此一举, 直接放行。
+if [[ "$TOOL_NAME" == "ExitPlanMode" ]]; then
+  emit "allow" "ExitPlanMode passthrough"
+fi
+
 # weclaude 自家 MCP 工具全部走 loopback 到本 daemon, 自审会把 /wrc 首次绑定卡死
 # (还没 defaultChat, 卡片无处可推 → 鸡生蛋), 直接放行。
 # 命名两条路径:
