@@ -1,6 +1,6 @@
 {
   "name": "weclaude",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Bridge Claude Code and WeCom: PreToolUse approval cards + bidirectional tmux session mirror with image paste",
   "type": "module",
   "license": "MIT",
@@ -36,6 +36,8 @@
     "dist/cli/init.js.map",
     "dist/cli/sync.js",
     "dist/cli/sync.js.map",
+    "dist/cli/audit.js",
+    "dist/cli/audit.js.map",
     "dist/daemon/**/*.js",
     "dist/daemon/**/*.js.map",
     "dist/mcp/**/*.js",
@@ -53,12 +55,13 @@
     "systemd/weclaude.service.template",
     "config.example.jsonc",
     "commands/wrc.md",
+    "commands/audit.md",
     "README.md",
     "CLAUDE.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && chmod +x dist/cli/init.js dist/daemon/index.js dist/mcp/server.js dist/svr/index.js",
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli/init.js dist/cli/audit.js dist/daemon/index.js dist/mcp/server.js dist/svr/index.js",
     "dev:daemon": "tsx daemon/index.ts",
     "dev:cli": "tsx cli/weclaude.ts",
     "typecheck": "tsc --noEmit",

@@ -1,6 +1,6 @@
 // Inbound text router. Hands the message off to either the headless CC bridge
 // (mode=headless) or the mirror bridge (mode=mirror).
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { WSClient, WsFrame, TextMessage, ImageMessage, MixedMessage, BaseMessage, QuoteContent } from "@wecom/aibot-node-sdk";
 import type { Logger } from "pino";
@@ -12,6 +12,7 @@ import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim 
 import { getLastResponse } from "./last-response.js";
 import { scanClaudeSessions, type SessionInfo } from "./session-scan.js";
 import { computeUsage, renderUsageReport } from "./usage.js";
+import { computeAuditReport } from "./audit.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
 import { labelFor } from "./session-label.js";
 import {
@@ -96,6 +97,38 @@ const renderIds = (msg: BaseMessage, cfg: Config): string => {
 const isIdCommand = (text: string): boolean => text.trim() === "/id";
 const isPwdCommand = (text: string): boolean => text.trim() === "/pwd";
 const isCostCommand = (text: string): boolean => text.trim() === "/cost";
+// `/audit` or `/audit some-tag`. With a tag, `/audit` re-routes to the
+// newest-by-mtime mirror whose target carries `#<tag>` (see resolveAuditMirror);
+// without a tag, falls back to the caller's own mirror binding.
+const parseAuditCommand = (text: string): { tag: string } | undefined => {
+  const m = /^\/audit(?:\s+(.+))?$/u.exec(text.trim());
+  return m ? { tag: (m[1] ?? "").trim().replace(/^#/, "") } : undefined;
+};
+
+// Resolve /audit target: with an explicit tag → newest-by-mtime mirror whose
+// target carries `#<tag>` (regardless of caller). Without a tag → caller's own
+// binding. Returns undefined when nothing matches.
+interface MirrorRef { sessionId: string; jsonlPath: string; target: string; }
+const resolveAuditMirror = (
+  mirrors: MirrorRef[],
+  tag: string,
+  who: string,
+  chatWho: string,
+): MirrorRef | undefined => {
+  if (tag) {
+    const wanted = tag.replace(/^#/, "");
+    const matches = mirrors.filter((m) => (m.target.split("#")[1] ?? "") === wanted);
+    if (matches.length <= 1) return matches[0];
+    return matches
+      .map((m) => {
+        let mt = 0;
+        try { mt = statSync(expandHome(m.jsonlPath)).mtimeMs; } catch { /* ignore */ }
+        return { m, mt };
+      })
+      .sort((a, b) => b.mt - a.mt)[0]?.m;
+  }
+  return mirrors.find((m) => m.target === who || m.target === chatWho);
+};
 const isNewCommand = (text: string): boolean => text.trim() === "/new";
 const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
@@ -520,6 +553,40 @@ export const installInboundRouter = (
         body = renderUsageReport(computeUsage());
       } catch (e) {
         body = `[weclaude] /cost failed: ${(e as Error).message}`;
+      }
+      await replyText(frame, msg, who, body);
+      return { stop: true };
+    }
+    // /audit [tag] — per-session cost/token breakdown (main + subagents). We
+    // handle it here instead of paste-forwarding to the Claude REPL because
+    // (a) tmux paste + Enter is racy for slash commands and often fails to
+    // submit, and (b) even when it does, the LLM turn adds 30-40s over what
+    // is really just a jsonl read. Read-only, no state — bypasses allowFrom.
+    //
+    // Tag routing: `/audit <tag>` resolves to the SINGLE most-recently-active
+    // mirror whose target carries `#<tag>` (by jsonl mtime), NOT the caller's
+    // current session and NOT a sum over all sessions sharing the tag.
+    // Untagged form falls back to the caller's own mirror binding.
+    const audit = parseAuditCommand(text);
+    if (audit) {
+      const mirror = "status" in bridge
+        ? resolveAuditMirror(bridge.status().mirrors, audit.tag, who, chatPrincipal(msg))
+        : undefined;
+      let body: string;
+      if (!mirror) {
+        body = audit.tag
+          ? `[weclaude] /audit: 未找到 tag \`${audit.tag}\` 对应的 Claude 会话。`
+          : `[weclaude] /audit: 未找到 ${who} 绑定的 Claude 会话。先 \`/new\` 或用 \`weclaude mirror\` 绑定后再试。`;
+      } else {
+        try {
+          body = computeAuditReport({
+            sessionId: mirror.sessionId,
+            jsonlPath: mirror.jsonlPath,
+            tag: audit.tag || undefined,
+          });
+        } catch (e) {
+          body = `[weclaude] /audit failed: ${(e as Error).message}`;
+        }
       }
       await replyText(frame, msg, who, body);
       return { stop: true };

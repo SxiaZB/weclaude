@@ -10,23 +10,40 @@ import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-interface ModelTotals {
+export interface ModelTotals {
   input: number;
   output: number;
   cacheCreate: number;
   cacheRead: number;
 }
 
-const emptyTotals = (): ModelTotals => ({ input: 0, output: 0, cacheCreate: 0, cacheRead: 0 });
+export const emptyTotals = (): ModelTotals => ({ input: 0, output: 0, cacheCreate: 0, cacheRead: 0 });
 
-const addInto = (a: ModelTotals, b: ModelTotals): void => {
+export const addInto = (a: ModelTotals, b: ModelTotals): void => {
   a.input += b.input;
   a.output += b.output;
   a.cacheCreate += b.cacheCreate;
   a.cacheRead += b.cacheRead;
 };
 
-const sumTotal = (t: ModelTotals): number => t.input + t.output + t.cacheCreate + t.cacheRead;
+export const sumTotal = (t: ModelTotals): number => t.input + t.output + t.cacheCreate + t.cacheRead;
+
+// Pull the four token counts off a raw `message.usage` blob, applying the
+// CodeBuddy gateway totalized-input adjustment when the model id looks dotted
+// (see readUsageEntries below for the full rationale). Returns null if the row
+// carries no meaningful token counts.
+export const extractTokens = (usage: Record<string, unknown>, model: string): ModelTotals | null => {
+  const rawIn = Number(usage.input_tokens ?? 0);
+  const output = Number(usage.output_tokens ?? 0);
+  const cacheCreate = Number(usage.cache_creation_input_tokens ?? 0);
+  const cacheRead = Number(usage.cache_read_input_tokens ?? 0);
+  const isGatewayTotalized = /\d\.\d/.test(model);
+  const input = isGatewayTotalized && rawIn >= cacheRead + cacheCreate
+    ? rawIn - cacheRead - cacheCreate
+    : rawIn;
+  if (input + output + cacheCreate + cacheRead === 0) return null;
+  return { input, output, cacheCreate, cacheRead };
+};
 
 interface UsageEntry {
   ts: number;
@@ -59,7 +76,7 @@ const DAY_MS = 24 * HOUR_MS;
 // Sonnet 4.6, Haiku 4.5). Drift over time is expected — accuracy here matters
 // less than order-of-magnitude for the burn-rate readout.
 interface Price { in: number; out: number; cacheWrite: number; cacheRead: number; }
-const PRICES: Array<{ match: RegExp; price: Price }> = [
+export const PRICES: Array<{ match: RegExp; price: Price }> = [
   { match: /opus/i, price: { in: 5, out: 25, cacheWrite: 6.25, cacheRead: 0.5 } },
   { match: /sonnet/i, price: { in: 3, out: 15, cacheWrite: 3.75, cacheRead: 0.3 } },
   { match: /haiku/i, price: { in: 1, out: 5, cacheWrite: 1.25, cacheRead: 0.1 } },
@@ -68,7 +85,7 @@ const PRICES: Array<{ match: RegExp; price: Price }> = [
 const priceFor = (model: string): Price | undefined =>
   PRICES.find((p) => p.match.test(model))?.price;
 
-const costOf = (model: string, t: ModelTotals): number => {
+export const costOf = (model: string, t: ModelTotals): number => {
   const p = priceFor(model);
   if (!p) return 0;
   return (
@@ -134,19 +151,11 @@ const readUsageEntries = (path: string, sinceMs: number): UsageEntry[] => {
     const model = String(msg.model ?? "");
     if (!model || model === "<synthetic>") continue;
     const u = (msg.usage ?? {}) as Record<string, unknown>;
-    const rawIn = Number(u.input_tokens ?? 0);
-    const output = Number(u.output_tokens ?? 0);
-    const cacheCreate = Number(u.cache_creation_input_tokens ?? 0);
-    const cacheRead = Number(u.cache_read_input_tokens ?? 0);
     // CodeBuddy (claude-internal) 网关把 input_tokens 报成 cr+cw+fresh 的合计,
     // 与 Anthropic 官方口径 (input_tokens 仅含 fresh, 与 cache_* 互不相交) 冲突。
-    // 按模型命名风格判定: CodeBuddy 形如 "claude-4.7-opus" (点号版本),
-    // 官方形如 "claude-opus-4-7"。只对 CodeBuddy 反推, 不影响原生会话。
-    const isGatewayTotalized = /\d\.\d/.test(model);
-    const input = isGatewayTotalized && rawIn >= cacheRead + cacheCreate
-      ? rawIn - cacheRead - cacheCreate
-      : rawIn;
-    if (input + output + cacheCreate + cacheRead === 0) continue;
+    // extractTokens 按模型名点号版本判定, 只对 CodeBuddy 反推, 不影响原生会话。
+    const tokens = extractTokens(u, model);
+    if (!tokens) continue;
     // Dedup: `--resume` copies the parent transcript into the new session's
     // jsonl, so every historical message would otherwise count many times.
     // ccusage keys on `message.id + requestId`; we do the same. Fall back to
@@ -155,7 +164,7 @@ const readUsageEntries = (path: string, sinceMs: number): UsageEntry[] => {
     const reqId = String(row.requestId ?? "");
     const dedupKey = msgId ? `${msgId}|${reqId}` : String(row.uuid ?? "");
     if (!dedupKey) continue;
-    out.push({ ts, model, tokens: { input, output, cacheCreate, cacheRead }, dedupKey });
+    out.push({ ts, model, tokens, dedupKey });
   }
   return out;
 };
@@ -258,13 +267,13 @@ export const computeUsage = (): UsageReport => {
   return { now, todayStart, today, weekStart, week, active };
 };
 
-const fmtTokens = (n: number): string => {
+export const fmtTokens = (n: number): string => {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
 };
 
-const fmtCost = (usd: number): string => (usd >= 0.005 ? `$${usd.toFixed(2)}` : "—");
+export const fmtCost = (usd: number): string => (usd >= 0.005 ? `$${usd.toFixed(2)}` : "—");
 
 const fmtDuration = (ms: number): string => {
   if (ms <= 0) return "0m";
@@ -279,7 +288,7 @@ const fmtHHMM = (ts: number): string => {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 };
 
-const renderModelLines = (byModel: Map<string, ModelTotals>): { lines: string[]; totalTokens: number; totalCost: number } => {
+export const renderModelLines = (byModel: Map<string, ModelTotals>): { lines: string[]; totalTokens: number; totalCost: number } => {
   let totalTokens = 0;
   let totalCost = 0;
   const lines: string[] = [];

@@ -40,6 +40,7 @@ weclaude <subcommand>
   config-path            show resolved config path
   sync                   write hooks/MCP/env into sync.targets settings.json
   unsync                 remove our entries from sync.targets settings.json
+  audit [tag]            token/cost breakdown for current Claude session (main + subagents)
   uninstall              full teardown: stop daemon + unsync + plugin uninstall + remove daemon (run before `npm uninstall -g`)
                          add `--purge` to also delete ~/.weclaude state
   version                print weclaude version
@@ -204,6 +205,12 @@ case "$cmd" in
     SCRIPT="$REPO_ROOT/dist/cli/sync.js"
     [[ -f "$SCRIPT" ]] || { echo "build first: npm run build"; exit 1; }
     exec "$NODE_BIN" "$SCRIPT" --remove "$@"
+    ;;
+  audit)
+    NODE_BIN="$(command -v node)"
+    SCRIPT="$REPO_ROOT/dist/cli/audit.js"
+    [[ -f "$SCRIPT" ]] || { echo "build first: npm run build"; exit 1; }
+    exec "$NODE_BIN" "$SCRIPT" "$@"
     ;;
   help|-h|--help) usage ;;
   version|-v|--version)
