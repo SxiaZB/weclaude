@@ -329,6 +329,26 @@ const SLASH_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
 const META_TAG_RE = /<(command-message|command-name|command-args|local-command-stdout|local-command-caveat|system-reminder|task-notification)>[\s\S]*?<\/\1>/g;
 const TASK_NOTIF_RE = /<task-notification>([\s\S]*?)<\/task-notification>/;
 
+// Claude Code's `/goal` installs a session-scoped Stop hook and injects this
+// marker (type:"user", plain string content) telling the model to self-drive
+// toward the condition. Crucially the model then NEVER emits a terminal
+// stop_reason — every assistant line stays stop_reason:"tool_use" until the goal
+// auto-clears — so `turn_end` (and thus brief-mode's closeBriefTurn / any
+// per-turn flush) never fires, and the entire run goes silent on WeCom. Detect
+// the marker on a stable English substring so the mirror can enter a
+// progress-streaming mode for the goal's duration.
+const GOAL_START_RE = /session-scoped Stop hook is now active with condition:\s*"?([^"\n]*)"?/;
+
+// Pure: goal marker → goal_start item. The marker line ships as `type:"user",
+// isMeta:true, content:string` (verified against real /goal transcripts), so
+// detection MUST run before renderLine's isMeta gate — behind it the signal is
+// dropped and the whole goal adaptation never engages.
+const goalStartOf = (c: unknown): RenderItem | undefined => {
+  if (typeof c !== "string") return undefined;
+  const m = c.match(GOAL_START_RE);
+  return m ? { kind: "goal_start", condition: (m[1] ?? "").trim() } : undefined;
+};
+
 // Background task completion notification (Claude Code emits these into the
 // user channel when a backgrounded Bash/Agent task finishes). Render the
 // summary + status as a single styled line; drop the noisy tool-use-id /
@@ -388,6 +408,12 @@ type RenderItem =
   // NOT originate from the still-open WeCom liveStream — onItem uses this to
   // finalize the prior bubble so the new conversation gets its own bubble.
   | { kind: "user_text"; body: string }
+  // Claude Code's /goal command was activated (session-scoped Stop hook marker
+  // detected in the transcript). Carries the goal condition. onItem switches the
+  // attachment into goal-progress mode — see handleGoalItem. Emitted regardless
+  // of includeUser, because a goal run never emits a terminal stop_reason and
+  // brief-mode's turn_end-gated flush would otherwise swallow the whole run.
+  | { kind: "goal_start"; condition: string }
   // Skill stdout (e.g. /model). Always emitted as a standalone bubble — bypasses
   // deferred-state filtering so the user sees /model output even when no
   // assistant turn is active.
@@ -486,7 +512,13 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
   } catch {
     return [];
   }
-  if (line.isMeta || line.isSidechain) return [];
+  if (line.isSidechain) return [];
+  if (line.isMeta) {
+    // isMeta 行整体丢弃, 唯一例外是 /goal 的激活 marker (isMeta:true 的 user
+    // 行) — 它是 goal 模式的进入信号, 吞掉它 = 整个 goal run 在 WeCom 静默。
+    const goal = line.type === "user" ? goalStartOf(line.message?.content) : undefined;
+    return goal ? [goal] : [];
+  }
 
   const out: RenderItem[] = [];
 
@@ -514,6 +546,11 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
         out.push({ kind: "skill_output", body: renderTaskNotification(taskMatch[1]) });
         return out;
       }
+
+      // /goal activation — non-isMeta 形态兜底 (marker 格式漂移防御), emit
+      // REGARDLESS of includeUser; isMeta 形态已在上方 isMeta 门截获。
+      const goal = goalStartOf(c);
+      if (goal) return [goal];
 
       if (!deps.includeUser) return [];
 
@@ -1401,6 +1438,13 @@ interface AttachState {
   briefHadTool?: boolean;
   /** 本 turn 由 slash 命令 (/context…) 触发 —— 其 skill_output 即答案, 写进气泡而非 standalone。 */
   briefIsSlash?: boolean;
+  /** True while a `/goal` is active (session-scoped Stop hook self-driving the
+   *  model). Goal runs never emit a terminal stop_reason, so brief-mode's
+   *  turn_end-gated flush would swallow the whole run into the turn store while
+   *  WeCom stays silent. While set, onItem streams assistant text as progress
+   *  standalone and drops per-tool bubbles (kept in the detail store). Set on the
+   *  goal marker, cleared on the completing turn's turn_end. */
+  goalActive?: boolean;
 }
 
 // Mirror outbound state machine. See plan: defer stream open by N ms; flush
@@ -1977,6 +2021,40 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // user_text (CLI 侧输入) 在 brief 下丢弃 — turn 视角不需要展示。
   };
 
+  const goalBanner = (cond: string): string =>
+    cond
+      ? `🎯 目标已设置，进入自主执行：${cond}\n进度将实时推送。`
+      : "🎯 进入目标自主执行模式，进度将实时推送。";
+
+  // Enter goal-progress mode. The /goal was (usually) sent from WeCom, so a brief
+  // loading bubble is open — finalize it to the goal banner and close the brief
+  // turn so its turn_end-gated state doesn't dangle for the whole (never-ending)
+  // run. When goal was set from the CLI there's no brief turn — just announce.
+  const enterGoalMode = (a: AttachState, condition: string): void => {
+    if (a.goalActive) return; // 幂等: 重放/重复 marker 不再重发 banner
+    const banner = goalBanner(condition);
+    if (a.briefBubble && !a.briefBubble.done) void finishBriefBubble(a, banner);
+    else enqueueStandalone(a, banner);
+    if (a.briefTurnId) closeBriefTurn(a); // bubble now done → closeBriefTurn skips re-finalizing
+    a.goalActive = true;
+    log.info({ sessionId: a.sessionId, target: a.target, condition }, "goal: entered progress mode");
+  };
+
+  // Route items while a goal is active. Text (the model's inter-tool narration and
+  // the final answer) streams as standalone progress; tools/results stay in the
+  // detail store only (renderLine already recorded them) to avoid flooding the
+  // chat with hundreds of tool bubbles. turn_end = the goal auto-cleared and the
+  // model finally stopped → leave goal mode; normal brief resumes next turn.
+  const handleGoalItem = (a: AttachState, item: RenderItem): void => {
+    if (item.kind === "text" || item.kind === "skill_output") { enqueueStandalone(a, item.body); return; }
+    if (item.kind === "turn_end") {
+      a.goalActive = false;
+      log.info({ sessionId: a.sessionId, target: a.target }, "goal: cleared (turn ended)");
+      return;
+    }
+    // tool_use / tool_result / user_text / turn_usage: recorded to detail store; no bubble.
+  };
+
   const onItem = (a: AttachState, item: RenderItem): void => {
     // Record tool_use signatures unconditionally (before any state branching),
     // so flushBeforeCard's poll-drain can detect that the to-be-approved tool
@@ -1993,6 +2071,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         }
       }
     }
+    // /goal mode overrides everything below: the session-scoped Stop hook
+    // self-drives the model with no terminal stop_reason, so turn_end never fires
+    // and brief-mode would swallow the entire run into the turn store (silent
+    // WeCom for the whole goal). Enter progress-streaming on the marker; while
+    // active, stream text + drop tool bubbles until the completing turn's
+    // turn_end. Placed before the brief short-circuit so goal wins over brief.
+    if (item.kind === "goal_start") { enterGoalMode(a, item.condition); return; }
+    if (a.goalActive) { handleGoalItem(a, item); return; }
     // Usage snapshots never flow into WeCom bubbles — brief 分支下 handleBriefItem
     // 会把它写进 turn store, 非 brief 下直接吞掉, 保持 onItem 主流程只处理有渲染
     // 输出的 item 类型。
@@ -2528,14 +2614,26 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // wants a cross-dir move). The tail then sits on the dead old jsonl and the "…"
   // bubble never updates. After every inject, if the bound jsonl stays silent
   // while a same-dir sibling swallowed our exact injected text, rebind onto it —
-  // replaying from our message so the response is mirrored. Fingerprint match on
-  // the injected text is what keeps this from mis-migrating across the many
-  // sessions that legitimately share one project dir.
+  // replaying from our message so the response is mirrored.
+  //
+  // The rebind is only safe because the fork lives under THIS chat's own pane.
+  // Three guards keep it from mis-migrating across the many sessions that
+  // legitimately share one project dir (the classic "串session"):
+  //   1. pane liveness — a dead pane means the fork premise is void (the
+  //      dead-pane respawn path owns that); never cross-rebind then.
+  //   2. pane cwd — the pane must still sit in the bound project dir; if it
+  //      drifted elsewhere, followPaneDrift is the right handler.
+  //   3. ownership — never adopt a sid another live mirror is already tailing;
+  //      a fingerprint hit on a concurrently-busy sibling is a false positive,
+  //      not our fork. A genuine TUI fork is a brand-new, unowned session.
+  // The fingerprint itself is lengthened (and its min-length raised) so short /
+  // common messages can't collide onto a stranger's transcript in the first place.
   const armSilentForkRebind = (a: AttachState, text: string): void => {
     if (a.migrationWatcher) return;                 // don't race an in-flight watcher
+    if (!a.tmuxPane) return;                         // spawn-mode: no pane to fork under
     const stripped = text.replace(/\s+/gu, "");
-    if (stripped.length < 8) return;                // too short to fingerprint safely
-    const fp = stripped.slice(0, 40);
+    if (stripped.length < 16) return;               // too short to fingerprint safely
+    const fp = stripped.slice(0, 120);              // long contiguous run → collision-resistant
     const dir = dirname(a.jsonlPath);
     const boundPath = a.jsonlPath;
     let baseSize = 0; try { baseSize = statSync(boundPath).size; } catch { /* fresh */ }
@@ -2544,11 +2642,21 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const t0 = Date.now();
     let stopped = false;
     let timer: NodeJS.Timeout | undefined;
-    const tick = (): void => {
+    const reschedule = (): void => { timer = setTimeout(() => void tick(), POLL_MS); };
+    const tick = async (): Promise<void> => {
       if (stopped) return;
       if (Date.now() - t0 > TIMEOUT_MS) { a.migrationWatcher = undefined; return; }
       // Bound jsonl grew → our message landed in the right session; nothing to do.
       try { if (statSync(boundPath).size > baseSize) { a.migrationWatcher = undefined; return; } } catch { /* */ }
+      // Guard 1+2: pane must be alive AND still in the bound project dir. One
+      // display-message gives both — it fails on a dead pane, and its cwd tells
+      // us whether the pane still belongs here.
+      const r = await tmuxRun(["display-message", "-p", "-t", a.tmuxPane, "#{pane_current_path}"]);
+      if (stopped) return;
+      const paneCwd = r.code === 0 ? r.stdout.trim() : "";
+      if (!paneCwd) { a.migrationWatcher = undefined; return; } // pane gone → dead-pane path owns it
+      const paneDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(expandHome(paneCwd)));
+      if (paneDir !== dir) { reschedule(); return; }            // pane drifted → followPaneDrift owns it
       let names: string[] = [];
       try { names = readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { /* */ }
       const boundName = boundPath.slice(dir.length + 1);
@@ -2559,19 +2667,27 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       for (const c of ranked) {
         const off = findInjectOffset(join(dir, c.n), fp);
         if (off === undefined) continue;
+        const newSid = c.n.replace(/\.jsonl$/, "");
+        // Guard 3: a sid another live mirror already tails is that chat's
+        // session, not our fork — a fingerprint false positive. Skip it and
+        // keep scanning; a real fork is unowned.
+        const owner = bySessionId.get(newSid);
+        if (owner && owner !== a) {
+          log.warn({ target: a.target, newSid, ownerTarget: owner.target }, "mirror: skip fork rebind — session owned by another mirror (fingerprint false positive)");
+          continue;
+        }
         stopped = true;
         a.migrationWatcher = undefined;
-        const newSid = c.n.replace(/\.jsonl$/, "");
         if (newSid !== a.sessionId) {
           log.info({ target: a.target, oldSid: a.sessionId, newSid, off }, "mirror: silent same-dir fork, rebinding onto forked session");
           migrateAttachment(a, newSid, join(dir, c.n), off);
         }
         return;
       }
-      timer = setTimeout(tick, POLL_MS);
+      reschedule();
     };
     a.migrationWatcher = { cancel: () => { stopped = true; if (timer) clearTimeout(timer); } };
-    timer = setTimeout(tick, POLL_MS);
+    reschedule();
   };
 
   // ── Worktree / session drift follow ─────────────────────────────────
@@ -3235,8 +3351,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // and surface a standalone "cleared" so the user gets explicit
         // feedback (the skip-stream path otherwise leaves WeCom silent).
         if (armMigration) {
-          sendStandalone(a, "cleared");
-          pushProjectInfo(a.target);
+          sendStandalone(a, `cleared\n\n${renderProjectInfo(a.target)}`);
           startMigrationWatcher(a, preClearBaseline!, jsonlIsPostClearChild, 0);
         }
         // Don't await the stream's lifetime — it stays open until next inbound
