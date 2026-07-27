@@ -55,6 +55,15 @@
   "approval": {
     "enabled": true,
     "matcher": ".*",             // 全量拦截；Bash 只读命令(grep/ls/cat/...)走脚本 fast-path
+    // Claude-Code 风格放行规则(语法子集): 命中的调用跳过发卡直接放行。与 matcher
+    // 的分工: matcher 按工具名圈定审批范围, allowRules 在范围内做细粒度豁免 ——
+    // 尤其 Bash 可按命令前缀区分(matcher 只认工具名做不到)。支持:
+    //   "Read" | "mcp__server" | "mcp__server__tool"
+    //   | "Bash(git status)" 精确 | "Bash(git log *)" 前缀(空格-星)
+    //   | "Bash(npm run test:*)" 前缀(冒号-星) | "Bash(python3 .claude/skills/*)"
+    // 安全语义: 复合命令(&&/;/|)逐段校验、段首 VAR= 前缀剥掉、含 $()/反引号不命中;
+    // AskUserQuestion / ExitPlanMode / EnterPlanMode 永不可被规则放行。
+    "allowRules": [],            // 例: ["Bash(git log *)", "Bash(python3 .claude/skills/*)"]
     "approvers": [],             // ["user:zhangsan"] empty → defaultChat
     "hookTimeoutSec": 43210,     // hook curl --max-time (12h + 10s)
     "longPollSec": 43200,        // daemon long-poll (12h)
