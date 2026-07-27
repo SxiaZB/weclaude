@@ -19,14 +19,21 @@ const DAEMON_BASE = process.env.WECLAUDE_DAEMON_BASE || "http://127.0.0.1:17890"
 const PROJECT_BASES = [
   join(homedir(), ".claude-internal", "projects"),
   join(homedir(), ".claude", "projects"),
+  join(homedir(), ".codebuddy", "projects"),
 ];
+
+// Encoding differs by backend: Claude Code uses `/`/`.`→`-` (leading `-` kept);
+// CodeBuddy strips the leading separator first (no leading `-`).
+const encodeFor = (base: string, probe: string): string => {
+  if (base.includes(".codebuddy")) return probe.replace(/^[/]+/, "").replace(/[/.]/g, "-");
+  return probe.replace(/[/.]/g, "-");
+};
 
 const findProjectDir = (cwd: string): string | null => {
   let probe = cwd;
   while (probe) {
-    const enc = probe.replace(/[/.]/g, "-");
     for (const base of PROJECT_BASES) {
-      const p = join(base, enc);
+      const p = join(base, encodeFor(base, probe));
       if (existsSync(p)) return p;
     }
     if (probe === "/") break;

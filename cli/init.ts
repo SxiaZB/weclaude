@@ -37,17 +37,25 @@ const step = (n: number, title: string): void =>
   log(`\n${c.cyan(`[${n}/3]`)} ${c.bold(title)}`);
 
 // ── Agent kind → settings.json path ──────────────────────────────────
-type AgentKind = "claude" | "claude-internal" | "custom";
+type AgentKind = "claude" | "claude-internal" | "codebuddy" | "custom";
 type WrcMode = "headless" | "mirror";
 const settingsPathFor = (kind: AgentKind, custom?: string): string => {
   switch (kind) {
     case "claude": return "~/.claude/settings.json";
     case "claude-internal": return "~/.claude-internal/settings.json";
+    case "codebuddy": return "~/.codebuddy/settings.json";
     case "custom": return custom ?? "";
   }
 };
-const claudeBinFor = (kind: AgentKind): string =>
-  kind === "claude-internal" ? "claude-internal" : "claude";
+const claudeBinFor = (kind: AgentKind): string => {
+  if (kind === "claude-internal") return "claude-internal";
+  if (kind === "codebuddy") return "codebuddy";
+  return "claude";
+};
+// Backend name to pin into wrc.defaultCli. "custom" defaults to claude —
+// user can edit config.jsonc afterwards if their custom bin is a fork.
+const backendNameFor = (kind: AgentKind): "claude" | "claude-internal" | "codebuddy" =>
+  kind === "claude-internal" || kind === "codebuddy" ? kind : "claude";
 
 // ── HTTP helpers (talk to local daemon) ──────────────────────────────
 const DAEMON = "http://127.0.0.1:17890";
@@ -151,6 +159,7 @@ const main = async (): Promise<void> => {
     choices: [
       { name: "claude (Anthropic 官方)", value: "claude" },
       { name: "claude-internal (Tencent 内部)", value: "claude-internal" },
+      { name: "codebuddy (Tencent CodeBuddy)", value: "codebuddy" },
       { name: "自定义路径", value: "custom" },
     ],
     default: "claude",
@@ -188,6 +197,7 @@ const main = async (): Promise<void> => {
     { path: ["defaultChat"], value: "" },
     { path: ["wrc", "mode"], value: wrcMode },
     { path: ["wrc", "claudeBin"], value: claudeBin },
+    { path: ["wrc", "defaultCli"], value: backendNameFor(agentKind) },
     { path: ["wrc", "cwd"], value: "~/.weclaude/workspace" },
     { path: ["wrc", "allowFrom"], value: [] },
     { path: ["approval", "enabled"], value: enableHook },

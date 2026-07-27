@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { parse as parseJsonc } from "jsonc-parser";
 import { z } from "zod";
 import { expandHome } from "./paths.js";
+import { resolveCliBackend } from "./cli-backends.js";
 
 // ── Schema ──────────────────────────────────────────────────────────
 const Bot = z.object({
@@ -97,7 +98,27 @@ const Mirror = z.object({
 const Wrc = z.object({
   allowFrom: z.array(z.string()).default([]),
   mode: z.enum(["headless", "mirror"]).default("headless"),
+  // Legacy pre-v0.3: single binary path. Still honored as a back-compat alias
+  // — resolveCliBackend picks it up when cliBackends.<name>.bin is unset. Kept
+  // on the schema so existing configs keep parsing without migration.
   claudeBin: z.string().default("claude"),
+  // Active CLI backend. Drives projectsDir auto-derive, encodeProjectDir, and
+  // (Phase 3) transcript-line normalization + slash-tag dialect. Optional —
+  // when unset, resolveCliBackend infers from claudeBin basename (so legacy
+  // `claudeBin: "claude-internal"` configs still resolve correctly without
+  // needing to also set defaultCli). The Wrc transform below pins the inferred
+  // name back into v.defaultCli so downstream readers see a concrete value.
+  defaultCli: z.enum(["claude", "claude-internal", "codebuddy"]).optional(),
+  // Per-backend bin overrides. Missing entry → built-in default (`claude`,
+  // `claude-internal`, `codebuddy`). Example:
+  //   cliBackends: { codebuddy: { bin: "/usr/local/bin/codebuddy" } }
+  cliBackends: z
+    .object({
+      claude: z.object({ bin: z.string().optional() }).optional(),
+      "claude-internal": z.object({ bin: z.string().optional() }).optional(),
+      codebuddy: z.object({ bin: z.string().optional() }).optional(),
+    })
+    .default({}),
   cwd: z.string().default("~/.weclaude/workspace"),
   sessionMapFile: z.string().default("~/.weclaude/sessions.json"),
   extraArgs: z.array(z.string()).default([]),
@@ -107,13 +128,26 @@ const Wrc = z.object({
   // mirror attached for that chat — allowFrom IS the authorization.
   tmuxPrefix: z.string().default("weclaude"),
 }).transform((v) => {
-  // Auto-derive projectsDir from claudeBin basename when not explicitly set.
-  // `claude` → `~/.claude/projects`, `claude-internal` → `~/.claude-internal/projects`.
-  // Without this, a user running claude-internal sees the daemon tailing the
-  // wrong dir → pane→chat silently drops every reply.
+  // Resolve the active backend once — honors defaultCli if set, otherwise
+  // infers from claudeBin basename (legacy back-compat). Pin the inferred
+  // name back into v.defaultCli so downstream readers see a concrete value
+  // and so logs / sync labels can report the effective backend.
+  const backend = resolveCliBackend(v);
+  if (!v.defaultCli) v.defaultCli = backend.name;
+  // Sync claudeBin to the resolved backend's bin so every daemon file that
+  // reads cfg.wrc.claudeBin (cc-bridge, mirror-bridge, spawn-tmux, quota)
+  // spawns the correct binary — even when the user set only `defaultCli`
+  // without an explicit `claudeBin`. Without this, defaultCli:"codebuddy"
+  // + inherited claudeBin:"claude" would spawn the wrong CLI.
+  v.claudeBin = backend.bin;
+
+  // Auto-derive projectsDir from the resolved backend when not explicitly
+  // set. Replaces the old claudeBin-basename derivation — same result for the
+  // standard cases (claude → ~/.claude/projects, claude-internal →
+  // ~/.claude-internal/projects), plus now supports codebuddy →
+  // ~/.codebuddy/projects. Explicit projectsDir still wins.
   if (!v.mirror.projectsDir) {
-    const name = v.claudeBin.split("/").pop() || "claude";
-    v.mirror.projectsDir = `~/.${name}/projects`;
+    v.mirror.projectsDir = backend.projectsDir;
   }
   return v;
 });

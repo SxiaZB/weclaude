@@ -19,6 +19,7 @@ import type { WSClient, WsFrame, WsFrameHeaders, EventMessageWith, TemplateCard,
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
+import { encodeProjectDir, resolveCliBackend, type NormalizedTranscriptLine } from "../shared/cli-backends.js";
 import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl } from "./detail.js";
@@ -46,11 +47,10 @@ const augmentedPath = (orig: string | undefined): string => {
     .join(":");
 };
 
-// Claude Code encodes a project's cwd into a directory name by replacing each
-// `/` AND `.` with `-`. Absolute path `/Users/foo/.bar` → `-Users-foo--bar`
-// (note the double dash from the dot). Missing the dot rule sends the tail
-// to a non-existent dir → ENOENT → silent pane→chat dropout.
-const encodeProjectDir = (absCwd: string): string => absCwd.replace(/[/.]/g, "-");
+// Project-dir encoding is backend-specific (Claude: leading `-`, CodeBuddy:
+// none). Imported from shared/cli-backends — bound once at daemon boot via
+// bindCliBackend(). The encodeProjectDir re-export below is the bound function.
+// (Old local definition removed in Phase 3 — was: absCwd.replace(/[/.]/g, "-").)
 
 // Pull the bound session's actual project cwd from its transcript head. Each
 // jsonl line carries a `cwd` field; the encoded directory name is lossy (both
@@ -223,6 +223,12 @@ interface TailDeps {
   /** Originating session/target for the detail page header. */
   sessionId: string;
   target: string;
+  /** Backend-specific jsonl normalizer. Converts a parsed line from the
+   *  active CLI's transcript schema into the Claude Code TranscriptLine shape
+   *  that renderLine consumes. Returns null to drop the line. Claude backends
+   *  are identity; codebuddy maps message/function_call/function_call_result
+   *  records into the nested message.content shape. */
+  normalizeLine?: (raw: unknown) => NormalizedTranscriptLine | null;
   /** Override the initial read offset. Default: current EOF (or 0 if missing).
    *  Used by /clear migration to replay the freshly-rotated jsonl from start —
    *  the user line dedupes via isOwnInject, assistant lines stream normally. */
@@ -511,6 +517,15 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
     line = JSON.parse(raw) as TranscriptLine;
   } catch {
     return [];
+  }
+  // Phase 3: normalize backend-specific jsonl (codebuddy splits tool_use /
+  // tool_result into independent top-level records; Claude is identity). Done
+  // AFTER JSON.parse so the adapter works on structured data, BEFORE the
+  // isMeta/isSidechain gates so backend-mapped fields flow through.
+  if (deps.normalizeLine) {
+    const normalized = deps.normalizeLine(line);
+    if (!normalized) return [];
+    line = normalized as TranscriptLine;
   }
   if (line.isSidechain) return [];
   if (line.isMeta) {
@@ -2254,6 +2269,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       detailUrlFor,
       sessionId,
       target,
+      normalizeLine: resolveCliBackend(cfg.wrc).normalizeTranscriptLine,
     });
     bySessionId.set(sessionId, a);
     byTarget.set(target, a);
@@ -2539,6 +2555,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       sessionId: newSessionId,
       target: a.target,
       startOffset,
+      normalizeLine: resolveCliBackend(cfg.wrc).normalizeTranscriptLine,
     });
     deps.store.set(a.target, {
       sessionId: newSessionId,

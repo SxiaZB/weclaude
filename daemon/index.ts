@@ -1,6 +1,7 @@
 // Daemon entry. Resident process — exits only on signal or fatal WS auth failure.
 import { loadConfig } from "../shared/config.js";
 import { makeLogger } from "../shared/log.js";
+import { bindCliBackend } from "../shared/cli-backends.js";
 import { startWs } from "./ws.js";
 import { startHttp, json } from "./http.js";
 import { installInboundRouter } from "./inbound.js";
@@ -40,6 +41,12 @@ const main = async (): Promise<void> => {
     name: "weclaude-daemon",
   });
   log.info({ sourcePath, pid: process.pid }, "daemon start");
+
+  // Bind the active CLI backend's dialect (project-dir encoding) into
+  // module-level state in mirror-bridge + spawn-tmux. Must run BEFORE any
+  // mirror attach / tmux spawn. Returns the resolved backend for logging.
+  const backend = bindCliBackend(cfg.wrc);
+  log.info({ backend: backend.name, bin: backend.bin }, "cli backend bound");
 
   // Restore auto-approve windows persisted across daemon restarts —
   // otherwise a `weclaude reload` silently drops the user's "10min" choice.

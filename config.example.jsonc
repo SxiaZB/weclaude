@@ -34,6 +34,14 @@
     //          jsonl, pushing live assistant output to WeCom.
     "mode": "headless",
     "claudeBin": "claude",
+    // CLI backend selection. Three built-ins: "claude" / "claude-internal" /
+    // "codebuddy". Empty/omitted → inferred from claudeBin basename (back-compat).
+    "defaultCli": "claude",
+    // Per-backend binary overrides (when the executable isn't on $PATH under
+    // its canonical name). Missing entry → built-in default.
+    // "cliBackends": {
+    //   "codebuddy": { "bin": "/usr/local/bin/codebuddy" }
+    // },
     "cwd": "~",                  // workdir (mirror: must match the running claude's cwd)
     "sessionMapFile": "~/.weclaude/sessions.json",
     "extraArgs": [],             // appended to `claude -p`

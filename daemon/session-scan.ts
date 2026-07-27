@@ -107,7 +107,8 @@ const looksLikeClaude = (cmd: string): boolean => /claude/i.test(cmd);
 // Project roots claude writes transcripts under, internal build first.
 const PROJECT_ROOT_INTERNAL = join(homedir(), ".claude-internal", "projects");
 const PROJECT_ROOT_DEFAULT = join(homedir(), ".claude", "projects");
-const PROJECT_ROOTS = [PROJECT_ROOT_INTERNAL, PROJECT_ROOT_DEFAULT];
+const PROJECT_ROOT_CODEBUDDY = join(homedir(), ".codebuddy", "projects");
+const PROJECT_ROOTS = [PROJECT_ROOT_INTERNAL, PROJECT_ROOT_DEFAULT, PROJECT_ROOT_CODEBUDDY];
 
 // Locate `<sessionId>.jsonl` (UUID is globally unique, so we don't have to
 // reverse the cwd→dir encoding). Skips subagent transcripts (they live under a
@@ -131,19 +132,25 @@ const findJsonl = (sessionId: string): string => {
   return "";
 };
 
-// claude's cwd→projectDir encoding: replace each `/` `.` `_` with `-`.
-const encodeProjectDir = (absCwd: string): string => absCwd.replace(/[/._]/g, "-");
+// cwd→projectDir encoding is backend-specific:
+//   Claude Code / claude-internal: `/` `.` `_` → `-`   (leading `-` kept)
+//   CodeBuddy:                     strip leading `/`, then `/` `.` → `-`
+const encodeClaude = (absCwd: string): string => absCwd.replace(/[/._]/g, "-");
+const encodeCodebuddy = (absCwd: string): string =>
+  absCwd.replace(/^[/]+/, "").replace(/[/.]/g, "-");
+const encodeForRoot = (root: string, absCwd: string): string =>
+  root === PROJECT_ROOT_CODEBUDDY ? encodeCodebuddy(absCwd) : encodeClaude(absCwd);
 
 // Expected jsonl path for a freshly-spawned session whose transcript doesn't
 // exist on disk yet (claude only writes it after the first user input). Used so
 // a brand-new `new_claude_session` still shows up in the list immediately.
 const expectedJsonl = (cwd: string, sessionId: string): string => {
   if (!cwd || !sessionId) return "";
-  const enc = encodeProjectDir(cwd);
   for (const root of PROJECT_ROOTS) {
+    const enc = encodeForRoot(root, cwd);
     if (existsSync(join(root, enc))) return join(root, enc, `${sessionId}.jsonl`);
   }
-  return join(PROJECT_ROOT_INTERNAL, enc, `${sessionId}.jsonl`);
+  return join(PROJECT_ROOT_INTERNAL, encodeClaude(cwd), `${sessionId}.jsonl`);
 };
 
 // Resume-mode fallback: a claude launched with bare `-r`/`--resume` carries no
@@ -153,9 +160,8 @@ const expectedJsonl = (cwd: string, sessionId: string): string => {
 // sharing a cwd don't both resolve to the same newest file.
 const inferByCwd = (cwd: string, taken: Set<string>): { sessionId: string; jsonlPath: string } | null => {
   if (!cwd) return null;
-  const enc = encodeProjectDir(cwd);
   for (const root of PROJECT_ROOTS) {
-    const dir = join(root, enc);
+    const dir = join(root, encodeForRoot(root, cwd));
     if (!existsSync(dir)) continue;
     let files: string[];
     try {

@@ -20,16 +20,29 @@ const fail = (msg: string) => ({
   content: [{ type: "text" as const, text: msg }],
 });
 
-// claude encodes a project's cwd into a dir name by replacing each `/` AND `.`
-// with `-`. `/Users/foo/.bar` → `-Users-foo--bar` (double dash from the dot).
-const encodeProjectDir = (absCwd: string): string => absCwd.replace(/[/.]/g, "-");
+// Project-dir encoding is backend-specific:
+//   Claude Code / claude-internal: `/` `.` → `-`  (yields leading `-`)
+//   CodeBuddy:                     strip leading `/`, then `/` `.` → `-`  (no leading `-`)
+const encodeClaude = (absCwd: string): string => absCwd.replace(/[/.]/g, "-");
+const encodeCodebuddy = (absCwd: string): string =>
+  absCwd.replace(/^[/]+/, "").replace(/[/.]/g, "-");
+
+interface ProjectRoot {
+  dir: string;
+  encode: (absCwd: string) => string;
+}
+const PROJECT_ROOTS: ProjectRoot[] = [
+  { dir: join(homedir(), ".claude-internal", "projects"), encode: encodeClaude },
+  { dir: join(homedir(), ".claude", "projects"), encode: encodeClaude },
+  { dir: join(homedir(), ".codebuddy", "projects"), encode: encodeCodebuddy },
+];
 
 const findProjectDir = (cwd: string): string | undefined => {
-  const enc = encodeProjectDir(cwd);
-  return [
-    join(homedir(), ".claude-internal", "projects", enc),
-    join(homedir(), ".claude", "projects", enc),
-  ].find((p) => existsSync(p));
+  for (const root of PROJECT_ROOTS) {
+    const p = join(root.dir, root.encode(cwd));
+    if (existsSync(p)) return p;
+  }
+  return undefined;
 };
 
 const latestJsonlByMtime = (projectDir: string): string | null => {
@@ -43,7 +56,12 @@ const latestJsonlByMtime = (projectDir: string): string | null => {
 const resolveCallerSession = ():
   | { sessionId: string; jsonlPath: string }
   | { error: string } => {
-  const cwd = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+  // CodeBuddy exports CODEBUDDY_PROJECT_DIR / CODEBUDDY_SESSION_ID (native) and
+  // also CLAUDE_PROJECT_DIR / CLAUDE_SESSION_ID (compat). Check native first so
+  // a codebuddy session inside a claude project dir doesn't mis-resolve.
+  const cwd = process.env.CODEBUDDY_PROJECT_DIR
+    ?? process.env.CLAUDE_PROJECT_DIR
+    ?? process.cwd();
   const projectDir = findProjectDir(cwd);
   if (!projectDir) return { error: `no claude project dir for cwd ${cwd}` };
 
@@ -53,7 +71,9 @@ const resolveCallerSession = ():
   // CLI window) will have envSid set but no file yet. The daemon's tail
   // tolerates a missing path (see mirror-bridge.ts attach()), and any
   // existsSync gate here would mis-route to a stale jsonl picked by mtime.
-  const envSid = process.env.CLAUDE_CODE_SESSION_ID ?? process.env.CLAUDE_SESSION_ID;
+  const envSid = process.env.CODEBUDDY_SESSION_ID
+    ?? process.env.CLAUDE_CODE_SESSION_ID
+    ?? process.env.CLAUDE_SESSION_ID;
   if (envSid) return { sessionId: envSid, jsonlPath: join(projectDir, `${envSid}.jsonl`) };
   // Fallback: most-recently-written jsonl. Only reached when env is absent
   // (older claude versions, exotic launchers).

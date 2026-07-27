@@ -31,6 +31,7 @@ import { basename, dirname, join } from "node:path";
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import { expandHome } from "../shared/paths.js";
+import { encodeProjectDir } from "../shared/cli-backends.js";
 
 const NODE_BIN_DIR = dirname(process.execPath);
 const augmentedPath = (orig: string | undefined): string => {
@@ -42,7 +43,8 @@ const augmentedPath = (orig: string | undefined): string => {
     .join(":");
 };
 
-const encodeProjectDir = (absCwd: string): string => absCwd.replace(/[/.]/g, "-");
+// Project-dir encoding imported from shared/cli-backends — backend-specific
+// (Claude: leading `-`, CodeBuddy: none), bound once at daemon boot.
 
 interface ExecResult {
   ok: boolean;

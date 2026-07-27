@@ -8,6 +8,7 @@ import type { WSClient, WsFrameHeaders } from "@wecom/aibot-node-sdk";
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import { expandHome } from "../shared/paths.js";
+import { resolveCliBackend } from "../shared/cli-backends.js";
 import type { SessionStore } from "./sessions.js";
 
 // launchd 默认 PATH 不含 nvm / homebrew，spawn `claude-internal` 会 ENOENT。
@@ -98,7 +99,7 @@ const runOne = async (args: RunArgs): Promise<void> => {
     text,
     "--output-format",
     "stream-json",
-    "--verbose",
+    ...resolveCliBackend(cfg.wrc).headlessStreamingArgs,
     ...cfg.wrc.extraArgs,
   ];
   if (resumeSid) cliArgs.push("--resume", resumeSid);

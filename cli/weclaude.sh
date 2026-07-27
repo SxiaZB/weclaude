@@ -144,29 +144,42 @@ case "$cmd" in
     echo "[weclaude] safe to 'npm uninstall -g weclaude' now"
     ;;
   mirror)
-    cwd="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+    cwd="${CLAUDE_PROJECT_DIR:-${CODEBUDDY_PROJECT_DIR:-$(pwd)}}"
     # claude-internal stores under ~/.claude-internal/projects/, official claude
-    # under ~/.claude/projects/. Walk up parent dirs — caller may be in a
-    # subdirectory of the cwd Claude was launched in (e.g. monorepo subpackage).
+    # under ~/.claude/projects/, codebuddy under ~/.codebuddy/projects/. Walk up
+    # parent dirs — caller may be in a subdirectory of the cwd the CLI was
+    # launched in (e.g. monorepo subpackage). Encoding differs: claude keeps a
+    # leading `-` ([/.]→-), codebuddy trims it first (no leading `-`).
+    # Prioritize the base matching the active CLI (detected via env vars) so a
+    # codebuddy session doesn't fall through to a stale claude project dir.
+    if [[ -n "${CODEBUDDY_SESSION_ID:-}" ]]; then
+      bases=("$HOME/.codebuddy/projects" "$HOME/.claude-internal/projects" "$HOME/.claude/projects")
+    else
+      bases=("$HOME/.claude-internal/projects" "$HOME/.claude/projects" "$HOME/.codebuddy/projects")
+    fi
     proj=""
     probe="$cwd"
     while [[ -z "$proj" && -n "$probe" ]]; do
-      enc="$(printf %s "$probe" | sed 's|[/.]|-|g')"
-      for base in "$HOME/.claude-internal/projects" "$HOME/.claude/projects"; do
+      for base in "${bases[@]}"; do
+        if [[ "$base" == *codebuddy* ]]; then
+          enc="$(printf %s "$probe" | sed 's|^[/]*||; s|[/.]|-|g')"
+        else
+          enc="$(printf %s "$probe" | sed 's|[/.]|-|g')"
+        fi
         if [[ -d "$base/$enc" ]]; then proj="$base/$enc"; break; fi
       done
       [[ "$probe" == "/" ]] && break
       probe="$(dirname "$probe")"
     done
     if [[ -z "$proj" ]]; then
-      echo "no claude project dir for cwd: $cwd (or any ancestor)"
-      echo "tried encodings up to $HOME/.claude{,-internal}/projects/<encoded-ancestor>"
+      echo "no claude/codebuddy project dir for cwd: $cwd (or any ancestor)"
+      echo "tried encodings up to $HOME/.claude{,-internal}/projects/ + $HOME/.codebuddy/projects/<encoded-ancestor>"
       exit 1
     fi
-    # Resolve the *calling* session via env var Claude Code injects into every
-    # child process. lsof can't help — claude doesn't keep the jsonl fd open
-    # across writes, so the file appears unbound between turns.
-    sid="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
+    # Resolve the *calling* session via env var the CLI injects into every
+    # child process. Both Claude Code and CodeBuddy export CLAUDE_SESSION_ID
+    # (back-compat); CODEBUDDY_SESSION_ID is the codebuddy-native name.
+    sid="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-${CODEBUDDY_SESSION_ID:-}}}"
     latest=""
     if [[ -n "$sid" && -f "$proj/$sid.jsonl" ]]; then
       latest="$proj/$sid.jsonl"
