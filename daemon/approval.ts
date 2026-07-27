@@ -20,7 +20,8 @@ import {
   clearAutoWindow,
   getWindowMeta,
 } from "./session-cache.js";
-import { ruleAllows } from "./allow-rules.js";
+import { alwaysAllowRulesFor, ruleAllows, ruleMatchesAny } from "./allow-rules.js";
+import { appendUnique } from "../shared/config-writer.js";
 import { redact } from "./redact.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";
 import type { Handler } from "./http.js";
@@ -230,6 +231,7 @@ const buildCard = (a: CardArgs): TemplateCard => {
     button_list: [
       { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
       { text: fmtWindow(a.windowMinutes), style: 3, key: encodeKey(a.reqId, "allow_window") },
+      { text: "✅总是", style: 4, key: encodeKey(a.reqId, "allow_always") },
       { text: "✅", style: 4, key: encodeKey(a.reqId, "allow") },
     ],
   };
@@ -243,6 +245,7 @@ const verbOf = (d: Decision, windowMinutes: number): string => {
     case "deny": return "已拒绝";
     case "allow_window": return `${fmtWindow(windowMinutes)}会话内全过`;
     case "allow_session": return "本会话通过";
+    case "allow_always": return "已通过·规则已保存";
     default: return "已通过";
   }
 };
@@ -394,6 +397,7 @@ const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCar
     button_list: [
       { text: "❌", style: 4, key: encodeBatchKey(batch.batchId, "deny") },
       { text: fmtWindow(batch.windowMinutes), style: 3, key: encodeBatchKey(batch.batchId, "allow_window") },
+      { text: "✅总是", style: 4, key: encodeBatchKey(batch.batchId, "allow_always") },
       { text: "✅", style: 4, key: encodeBatchKey(batch.batchId, "allow") },
     ],
   };
@@ -453,7 +457,7 @@ const decodeBatchKey = (key: string): { batchId: string; decision: Decision } | 
   if (!key.startsWith(BATCH_PREFIX)) return undefined;
   const [batchId, d] = key.slice(BATCH_PREFIX.length).split("|");
   if (!batchId || !d) return undefined;
-  if (d !== "allow" && d !== "allow_session" && d !== "allow_window" && d !== "deny") return undefined;
+  if (d !== "allow" && d !== "allow_session" && d !== "allow_window" && d !== "allow_always" && d !== "deny") return undefined;
   return { batchId, decision: d };
 };
 const decodeBatchNoopKey = (key: string): string | undefined =>
@@ -470,7 +474,7 @@ const decodeKey = (
   }
   const [reqId, d] = key.split("|");
   if (!reqId || !d) return {};
-  if (d !== "allow" && d !== "allow_session" && d !== "allow_window" && d !== "deny") return {};
+  if (d !== "allow" && d !== "allow_session" && d !== "allow_window" && d !== "allow_always" && d !== "deny") return {};
   return { reqId, decision: d };
 };
 
@@ -942,6 +946,8 @@ interface ApprovalDeps {
   cfg: Config;
   log: Logger;
   client: WSClient;
+  /** config.jsonc 的绝对路径 — 「✅ 总是」写回 allowRules 用。缺省时只热生效不落盘。 */
+  sourcePath?: string;
   /** Optional: resolve a Claude sessionId to its bound WeCom mirror target (e.g. "chat:xxx").
    *  When set and the request's session has a mirror, the approval card is routed there
    *  instead of cfg.approval.approvers[0] / cfg.defaultChat — keeps the conversation and
@@ -963,7 +969,7 @@ const resolveApprover = (
   return mirror || pickApprover(cfg);
 };
 
-export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBeforeCard }: ApprovalDeps): Handler => {
+export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarget, flushBeforeCard }: ApprovalDeps): Handler => {
   const detailUrlFor = (id: string): string =>
     buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
 
@@ -1045,10 +1051,24 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
       return;
     }
 
-    // Claude-Code 风格 allowRules: matcher 拦下的工具里再挖细粒度豁免 (Bash 可
-    // 按命令前缀区分)。交互卡工具 (AskUserQuestion 等) 在 ruleAllows 内部硬保护,
-    // 规则写了也不会被放行。
-    const ruleHit = ruleAllows(cfg.approval.allowRules, toolName, toolInput);
+    // Claude-Code 三层规则语义: deny > ask > allow (语法同源, 见 allow-rules.ts)。
+    // denyRules: 命中直接拒, 不发卡 (Bash 复合命令任一段命中即拒)。
+    const denyHit = ruleMatchesAny(cfg.approval.denyRules, toolName, toolInput);
+    if (denyHit) {
+      log.info({ toolName, sessionId, rule: denyHit }, "deny-rule reject");
+      json(res, 200, { decision: "deny", reason: `deny_rule:${denyHit}` } satisfies ApproveResp);
+      return;
+    }
+    // askRules: 命中必发卡 — 压过 allowRules、自动放行窗口与会话缓存 (对齐
+    // Claude permissions.ask 的"即使 allowlist 命中也要确认"语义)。
+    const askHit = ruleMatchesAny(cfg.approval.askRules, toolName, toolInput);
+    if (askHit) {
+      log.info({ toolName, sessionId, rule: askHit }, "ask-rule force card");
+    }
+
+    // allowRules: matcher 拦下的工具里再挖细粒度豁免 (Bash 可按命令前缀区分)。
+    // 交互卡工具 (AskUserQuestion 等) 在 ruleAllows 内部硬保护, 规则写了也不放行。
+    const ruleHit = askHit ? undefined : ruleAllows(cfg.approval.allowRules, toolName, toolInput);
     if (ruleHit) {
       log.info({ toolName, sessionId, rule: ruleHit }, "allow-rule skip");
       json(res, 200, { decision: "allow", reason: `allow_rule:${ruleHit}` } satisfies ApproveResp);
@@ -1121,7 +1141,8 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
     const approver = resolveApprover(cfg, sessionId, getMirrorTarget);
 
     // Auto-approve window: while active for THIS chat, requests short-circuit to allow.
-    if (approver && isAutoWindowActive(approver)) {
+    // askRules 命中的请求不吃窗口 — 危险前缀即使开着 ⏱ 也逐条确认。
+    if (!askHit && approver && isAutoWindowActive(approver)) {
       const remainSec = Math.ceil(autoWindowRemainingMs(approver) / 1000);
       log.info({ toolName, sessionId, chatKey: approver, remainSec }, "auto-window allow");
       json(res, 200, {
@@ -1131,9 +1152,9 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
       return;
     }
 
-    // Session cache
+    // Session cache (askRules 命中的请求同样不吃缓存)
     const ck = cacheKey(sessionId, toolName, toolInput);
-    const cached = cacheGet(ck);
+    const cached = askHit ? undefined : cacheGet(ck);
     if (cached) {
       log.info({ ck, cached }, "cache hit");
       json(res, 200, {
@@ -1229,6 +1250,40 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
 
     if (decision === "allow_session" && cfg.approval.sessionCacheMinutes > 0) {
       cachePut(ck, decision, cfg.approval.sessionCacheMinutes * 60_000);
+    }
+    // 「✅ 总是」: 由本次调用生成规则, 热生效 + 写回 config.jsonc (对齐 Claude
+    // 弹窗的 Always allow)。规则生成用未脱敏的原始 toolInput (display 可能被
+    // redact 改写过, 拿它生成的前缀会匹配不上真实命令)。
+    if (decision === "allow_always") {
+      const gen = alwaysAllowRulesFor(toolName, toolInput);
+      const added = gen.filter((r) => !cfg.approval.allowRules.includes(r));
+      if (added.length > 0) {
+        cfg.approval.allowRules.push(...added); // 同步热生效; 文件写入失败也不回滚
+        if (sourcePath) {
+          try {
+            for (const r of added) appendUnique(sourcePath, ["approval", "allowRules"], r);
+          } catch (e) {
+            log.warn({ err: (e as Error).message }, "allow_always persist failed (in-memory only)");
+          }
+        }
+        log.info({ toolName, added, persisted: Boolean(sourcePath) }, "allow_always rules saved");
+        try {
+          await client.sendMessage(targetChatId(approver), {
+            msgtype: "markdown",
+            markdown: { content: `📌 已保存永久放行规则：${added.map((r) => `\`${r}\``).join("、")}` },
+          });
+        } catch (e) {
+          log.warn({ err: (e as Error).message }, "allow_always notice send failed");
+        }
+      } else if (gen.length === 0) {
+        // 含 $()/反引号等动态构造, 生成不了可靠字面规则 — 本次一次性放行并告知。
+        try {
+          await client.sendMessage(targetChatId(approver), {
+            msgtype: "markdown",
+            markdown: { content: "📌 该命令含动态构造（$() 等），无法生成可靠规则，本次已一次性放行。" },
+          });
+        } catch { /* best-effort */ }
+      }
     }
     if (decision === "allow_window" && cfg.approval.windowMinutes > 0) {
       setAutoWindow(approver, cfg.approval.windowMinutes * 60_000, {

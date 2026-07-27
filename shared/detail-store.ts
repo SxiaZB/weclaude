@@ -13,6 +13,7 @@ export type ApprovalDecision =
   | "allow"
   | "allow_session"
   | "allow_window"
+  | "allow_always"
   | "deny"
   | "timeout"
   | "swept";

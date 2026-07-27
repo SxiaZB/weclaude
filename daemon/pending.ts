@@ -2,7 +2,7 @@
 // Used for both PreToolUse approvals and any other "send card → wait click" flows.
 import { randomUUID } from "node:crypto";
 
-export type Decision = "allow" | "allow_session" | "allow_window" | "deny";
+export type Decision = "allow" | "allow_session" | "allow_window" | "allow_always" | "deny";
 
 export interface PendingMeta {
   kind: "approval" | "generic";

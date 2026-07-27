@@ -58,6 +58,7 @@ const decisionBadge = (d?: ApprovalDecision): { label: string; cls: string } => 
   if (d === "timeout") return { label: "超时", cls: "warn" };
   if (d === "allow_window") return { label: "通过 · 窗口", cls: "allow" };
   if (d === "allow_session") return { label: "通过 · 会话", cls: "allow" };
+  if (d === "allow_always") return { label: "通过 · 已存规则", cls: "allow" };
   if (d === "swept") return { label: "通过 · 批量", cls: "allow" };
   if (d === "allow") return { label: "通过", cls: "allow" };
   return { label: String(d), cls: "pending" };

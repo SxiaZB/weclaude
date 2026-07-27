@@ -90,7 +90,7 @@ const main = async (): Promise<void> => {
   const http = startHttp({ cfg, ws, log, sourcePath });
   http.register(
     "POST /approve",
-    makeApproveHandler({ cfg, log: log.child({ mod: "approval" }), client: ws.client, getMirrorTarget, flushBeforeCard }),
+    makeApproveHandler({ cfg, log: log.child({ mod: "approval" }), client: ws.client, sourcePath, getMirrorTarget, flushBeforeCard }),
   );
   http.register("POST /message", makeMessageHandler(ws.client, log.child({ mod: "outbound" })));
   http.register("POST /card", makeCardHandler(ws.client, log.child({ mod: "outbound" })));

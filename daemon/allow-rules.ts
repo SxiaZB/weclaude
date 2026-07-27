@@ -125,3 +125,73 @@ export const ruleAllows = (
   }
   return undefined;
 };
+
+/**
+ * deny / ask 规则的匹配判定 — 与 allow 的量词相反:
+ * Bash 复合命令**任一段**命中即命中 (拒绝/追问要抓到藏在复合命令里的危险段,
+ * 而放行必须确保没有夹带)。含 $()/反引号不豁免匹配 (字面段仍参与判定)。
+ * 不做 NEVER_RULE_ALLOW 保护 — deny/ask 都是收紧方向, fail-closed 无害。
+ * 返回命中的规则原文, 未命中返回 undefined。
+ */
+export const ruleMatchesAny = (
+  rules: string[],
+  toolName: string,
+  toolInput: unknown,
+): string | undefined => {
+  if (rules.length === 0) return undefined;
+  const parsed = rules.map(parseRule).filter((r): r is ParsedRule => r !== undefined);
+
+  if (toolName === "Bash") {
+    const cmd = toolInput && typeof toolInput === "object"
+      ? (toolInput as Record<string, unknown>).command
+      : undefined;
+    if (typeof cmd !== "string" || !cmd.trim()) return undefined;
+    const bashRules = parsed.filter((r) => r.tool === "Bash");
+    const segments = cmd.split(SEGMENT_SPLIT).map((s) => s.trim()).filter(Boolean);
+    for (const seg of segments) {
+      for (const r of bashRules) {
+        if (r.spec === undefined) return "Bash";
+        if (bashSpecMatches(r.spec, seg)) return `Bash(${r.spec})`;
+      }
+    }
+    return undefined;
+  }
+
+  for (const r of parsed) {
+    if (r.spec !== undefined) continue;
+    if (r.tool === toolName) return r.tool;
+    if (r.tool.startsWith("mcp__") && toolName.startsWith(`${r.tool}__`)) return r.tool;
+  }
+  return undefined;
+};
+
+/**
+ * 「✅ 总是」按钮的规则生成: 由本次调用推导要写入 allowRules 的规则。
+ * - 非 Bash: 裸工具名 (mcp 工具即完整 mcp__server__tool);
+ * - Bash: 逐段取「命令 + 第二个 token」做前缀规则 `Bash(a b *)`;
+ *   第二个 token 是 flag (-开头) 或不存在时退化为单 token `Bash(a *)`;
+ *   含 $()/反引号无法生成可靠的字面前缀 → 返回 [] (调用方应保持一次性放行)。
+ * - 交互卡工具永不生成规则。
+ */
+export const alwaysAllowRulesFor = (toolName: string, toolInput: unknown): string[] => {
+  if (NEVER_RULE_ALLOW.has(toolName)) return [];
+  if (toolName !== "Bash") return [toolName];
+
+  const cmd = toolInput && typeof toolInput === "object"
+    ? (toolInput as Record<string, unknown>).command
+    : undefined;
+  if (typeof cmd !== "string" || !cmd.trim()) return [];
+  if (HAS_SUBSTITUTION.test(cmd)) return [];
+
+  const rules: string[] = [];
+  for (const rawSeg of cmd.split(SEGMENT_SPLIT)) {
+    const seg = stripEnvPrefix(norm(rawSeg));
+    if (!seg) return []; // 空段异常, 整体放弃生成
+    const toks = seg.split(" ");
+    const head = toks[0]!;
+    const second = toks[1];
+    const prefix = second && !second.startsWith("-") ? `${head} ${second}` : head;
+    rules.push(`Bash(${prefix} *)`);
+  }
+  return [...new Set(rules)];
+};
