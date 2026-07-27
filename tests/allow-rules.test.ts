@@ -1,6 +1,6 @@
 // 单元测试: daemon/allow-rules.ts — 运行: npx tsx tests/allow-rules.test.ts
 import assert from "node:assert";
-import { parseRule, ruleAllows } from "../daemon/allow-rules.js";
+import { alwaysAllowRulesFor, parseRule, ruleAllows, ruleMatchesAny } from "../daemon/allow-rules.js";
 
 let passed = 0;
 let failed = 0;
@@ -103,6 +103,60 @@ t("空规则/空命令不放行", () => {
   assert.equal(ruleAllows([], "Bash", bash("ls")), undefined);
   assert.equal(ruleAllows(["Bash(ls *)"], "Bash", bash("  ")), undefined);
   assert.equal(ruleAllows(["Bash(ls *)"], "Bash", {}), undefined);
+});
+
+// ── ruleMatchesAny (deny/ask 语义: 任一段命中) ──────────────────────────
+t("deny/ask: 复合命令任一段命中即命中", () => {
+  assert.equal(ruleMatchesAny(["Bash(rm *)"], "Bash", bash("cd /tmp && rm -rf x")), "Bash(rm *)");
+  assert.equal(ruleMatchesAny(["Bash(rm *)"], "Bash", bash("cd /tmp && ls")), undefined);
+});
+t("deny/ask: 含 $() 的段仍按字面参与匹配", () => {
+  assert.equal(ruleMatchesAny(["Bash(rm *)"], "Bash", bash("rm -rf $(pwd)/x")), "Bash(rm *)");
+});
+t("deny/ask: 非 Bash 工具与 mcp server 级匹配", () => {
+  assert.equal(ruleMatchesAny(["Write"], "Write", {}), "Write");
+  assert.equal(ruleMatchesAny(["mcp__wecom-mcp"], "mcp__wecom-mcp__send_message", {}), "mcp__wecom-mcp");
+});
+t("deny/ask: 对交互卡工具无硬保护(收紧方向 fail-closed)", () => {
+  assert.equal(ruleMatchesAny(["AskUserQuestion"], "AskUserQuestion", {}), "AskUserQuestion");
+});
+
+// ── alwaysAllowRulesFor (「✅总是」规则生成) ─────────────────────────────
+t("总是: Bash 取命令+子命令做前缀规则", () => {
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("git log --oneline -5")), ["Bash(git log *)"]);
+});
+t("总是: 第二个 token 是 flag 时退化为单命令", () => {
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("ls -la /tmp")), ["Bash(ls *)"]);
+});
+t("总是: 路径型第二 token 保留(精确到脚本)", () => {
+  assert.deepEqual(
+    alwaysAllowRulesFor("Bash", bash("python3 .claude/skills/x/run.py --a b")),
+    ["Bash(python3 .claude/skills/x/run.py *)"],
+  );
+});
+t("总是: 复合命令逐段生成并去重", () => {
+  assert.deepEqual(
+    alwaysAllowRulesFor("Bash", bash("cd /a && python3 x.py | head -3")),
+    ["Bash(cd /a *)", "Bash(python3 x.py *)", "Bash(head *)"],
+  );
+});
+t("总是: 段首环境变量前缀剥掉后生成", () => {
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("timeout=60 python3 x.py")), ["Bash(python3 x.py *)"]);
+});
+t("总是: 含 $()/反引号不生成(返回空)", () => {
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("echo $(whoami)")), []);
+});
+t("总是: 非 Bash 工具生成裸工具名", () => {
+  assert.deepEqual(alwaysAllowRulesFor("Write", {}), ["Write"]);
+  assert.deepEqual(alwaysAllowRulesFor("mcp__jira__get_issue", {}), ["mcp__jira__get_issue"]);
+});
+t("总是: 交互卡工具不生成", () => {
+  assert.deepEqual(alwaysAllowRulesFor("AskUserQuestion", {}), []);
+});
+t("总是: 生成的规则能匹配原命令(闭环)", () => {
+  const cmd = 'date "+%Y%m%d"; cd /a && timeout=60 python3 .claude/skills/x/run.py --b';
+  const rules = alwaysAllowRulesFor("Bash", bash(cmd));
+  assert.ok(ruleAllows(rules, "Bash", bash(cmd)), `generated rules should allow original: ${rules.join(", ")}`);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
