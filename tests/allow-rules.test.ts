@@ -147,6 +147,18 @@ t("总是: 段首环境变量前缀剥掉后生成", () => {
 t("总是: 含 $()/反引号不生成(返回空)", () => {
   assert.deepEqual(alwaysAllowRulesFor("Bash", bash("echo $(whoami)")), []);
 });
+t("总是: 引号内的管道符被误切时不生成垃圾规则(实战回归)", () => {
+  assert.deepEqual(
+    alwaysAllowRulesFor("Bash", bash('grep -h -iE "proxy|7890|1087" ~/.zshrc | head -8')),
+    [],
+  );
+});
+t("总是: 引号配对的正常管道命令不受影响", () => {
+  assert.deepEqual(
+    alwaysAllowRulesFor("Bash", bash('grep "ERROR" app.log | head -3')),
+    ["Bash(grep *)", "Bash(head *)"],
+  );
+});
 t("总是: 非 Bash 工具生成裸工具名", () => {
   assert.deepEqual(alwaysAllowRulesFor("Write", {}), ["Write"]);
   assert.deepEqual(alwaysAllowRulesFor("mcp__jira__get_issue", {}), ["mcp__jira__get_issue"]);

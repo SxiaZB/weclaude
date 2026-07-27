@@ -187,10 +187,21 @@ export const alwaysAllowRulesFor = (toolName: string, toolInput: unknown): strin
   for (const rawSeg of cmd.split(SEGMENT_SPLIT)) {
     const seg = stripEnvPrefix(norm(rawSeg));
     if (!seg) return []; // 空段异常, 整体放弃生成
+    // 分段器不感知引号 — 引号内的 |/&&/; 会被误切, 切出来的段引号必然不配对
+    // (如 `grep "a|b" f` 切成 `grep "a` 与 `b" f`)。任一段引号不平衡说明切进了
+    // 字符串内部, 整体放弃生成 (本次一次性放行), 不写垃圾规则。
+    for (const q of ['"', "'"]) {
+      if ((seg.split(q).length - 1) % 2 !== 0) return [];
+    }
     const toks = seg.split(" ");
     const head = toks[0]!;
+    // 段首必须长得像命令 (字母数字/路径字符); 括号引号等异形首 token 一律放弃。
+    const TOKEN_RE = /^[A-Za-z0-9_.~/+-]+$/;
+    if (!TOKEN_RE.test(head)) return [];
+    // 第二个 token 只有长得像子命令/路径时才纳入前缀 (flag、引号值等退化为单命令)。
     const second = toks[1];
-    const prefix = second && !second.startsWith("-") ? `${head} ${second}` : head;
+    const useSecond = second && !second.startsWith("-") && TOKEN_RE.test(second);
+    const prefix = useSecond ? `${head} ${second}` : head;
     rules.push(`Bash(${prefix} *)`);
   }
   return [...new Set(rules)];
