@@ -20,7 +20,7 @@ import {
   clearAutoWindow,
   getWindowMeta,
 } from "./session-cache.js";
-import { alwaysAllowRulesFor, ruleAllows, ruleMatchesAny } from "./allow-rules.js";
+import { alwaysAllowRulesFor, ruleAllows, ruleMatchesAny } from "../shared/allow-rules.js";
 import { appendUnique } from "../shared/config-writer.js";
 import { redact } from "./redact.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";

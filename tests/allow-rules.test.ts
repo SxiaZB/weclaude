@@ -1,6 +1,7 @@
-// 单元测试: daemon/allow-rules.ts — 运行: npx tsx tests/allow-rules.test.ts
+// 单元测试: shared/allow-rules.ts + shared/claude-permissions.ts — 运行: npx tsx tests/allow-rules.test.ts
 import assert from "node:assert";
-import { alwaysAllowRulesFor, parseRule, ruleAllows, ruleMatchesAny } from "../daemon/allow-rules.js";
+import { alwaysAllowRulesFor, parseRule, ruleAllows, ruleMatchesAny } from "../shared/allow-rules.js";
+import { mapClaudePermissions } from "../shared/claude-permissions.js";
 
 let passed = 0;
 let failed = 0;
@@ -157,6 +158,36 @@ t("总是: 生成的规则能匹配原命令(闭环)", () => {
   const cmd = 'date "+%Y%m%d"; cd /a && timeout=60 python3 .claude/skills/x/run.py --b';
   const rules = alwaysAllowRulesFor("Bash", bash(cmd));
   assert.ok(ruleAllows(rules, "Bash", bash(cmd)), `generated rules should allow original: ${rules.join(", ")}`);
+});
+
+// ── mapClaudePermissions (Claude settings.json 导入映射) ────────────────
+t("导入: 三层各自映射且保序去重", () => {
+  const m = mapClaudePermissions({
+    allow: ["Read", "Bash(git log *)", "mcp__jira", "Read"],
+    ask: ["Bash(rm *)", "Bash(sudo *)"],
+    deny: ["Bash(dd *)"],
+  });
+  assert.deepEqual(m.allow, ["Read", "Bash(git log *)", "mcp__jira"]);
+  assert.deepEqual(m.ask, ["Bash(rm *)", "Bash(sudo *)"]);
+  assert.deepEqual(m.deny, ["Bash(dd *)"]);
+  assert.deepEqual(m.skipped, []);
+});
+t("导入: 引擎不支持的 specifier 跳过并汇报", () => {
+  const m = mapClaudePermissions({ allow: ["WebFetch(domain:github.com)", "Read(/etc/*)", "Glob"] });
+  assert.deepEqual(m.allow, ["Glob"]);
+  assert.deepEqual(m.skipped, ["WebFetch(domain:github.com)", "Read(/etc/*)"]);
+});
+t("导入: allow 侧交互卡工具跳过, ask/deny 侧不受限", () => {
+  const m = mapClaudePermissions({ allow: ["AskUserQuestion"], ask: ["AskUserQuestion"] });
+  assert.deepEqual(m.allow, []);
+  assert.deepEqual(m.ask, ["AskUserQuestion"]);
+  assert.deepEqual(m.skipped, ["AskUserQuestion"]);
+});
+t("导入: 非法/空/非数组输入安全兜底", () => {
+  const m = mapClaudePermissions({ allow: "Read" as unknown, ask: [42, "", "  "] as unknown, deny: undefined });
+  assert.deepEqual(m.allow, []);
+  assert.deepEqual(m.ask, []);
+  assert.deepEqual(m.deny, []);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
