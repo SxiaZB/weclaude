@@ -72,15 +72,21 @@
     "fallbackOnError": "ask"     // never "deny" — never break workflow
   },
 
-  // ── claude-internal wrapper sync ──────────────────────────────────
-  // `weclaude sync` writes hooks/MCP/permissions into target settings.json.
+  // ── claude / codebuddy wrapper sync ───────────────────────────────
+  // `weclaude sync` writes hooks/MCP/permissions into every target settings.json
+  // listed below. Multi-CLI setups (claude + codebuddy 同时装) 列多项即可。
+  // kind: "claude" (含 claude-internal 等 fork) | "codebuddy"
+  //   • claude-internal 通过 settingsPath: "~/.claude-internal/settings.json" 表达
   "sync": {
     "targets": [
       {
-        "kind": "claude-internal",
+        "kind": "claude",
         "settingsPath": "~/.claude/settings.json",
         "scope": "user"          // user | project | local
       }
+      // 多 CLI 并存示例 (取消注释即可):
+      // ,{ "kind": "codebuddy", "settingsPath": "~/.codebuddy/settings.json", "scope": "user" }
+      // ,{ "kind": "claude", "settingsPath": "~/.claude-internal/settings.json", "scope": "user" }
     ]
   },
 

@@ -12,7 +12,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { input, password, select, confirm } from "@inquirer/prompts";
+import { input, password, select, confirm, checkbox } from "@inquirer/prompts";
 import { patchJsonc } from "../shared/config-writer.js";
 import { expandHome } from "../shared/paths.js";
 
@@ -37,14 +37,16 @@ const step = (n: number, title: string): void =>
   log(`\n${c.cyan(`[${n}/3]`)} ${c.bold(title)}`);
 
 // ── Agent kind → settings.json path ──────────────────────────────────
-type AgentKind = "claude" | "claude-internal" | "codebuddy" | "custom";
+// sync.targets 可多选: 每个 agent 一个 target, 全部注入 hook/MCP/env。
+// wrc.defaultCli / wrc.claudeBin 是单值, 由第一个选中项决定 (daemon 一次只能 tail
+// 一个 projectsDir)。两者解耦: 多 CLI 都能收到 hook 注入, 但同时只有一个 active。
+type AgentKind = "claude" | "claude-internal" | "codebuddy";
 type WrcMode = "headless" | "mirror";
-const settingsPathFor = (kind: AgentKind, custom?: string): string => {
+const settingsPathFor = (kind: AgentKind): string => {
   switch (kind) {
     case "claude": return "~/.claude/settings.json";
     case "claude-internal": return "~/.claude-internal/settings.json";
     case "codebuddy": return "~/.codebuddy/settings.json";
-    case "custom": return custom ?? "";
   }
 };
 const claudeBinFor = (kind: AgentKind): string => {
@@ -52,10 +54,12 @@ const claudeBinFor = (kind: AgentKind): string => {
   if (kind === "codebuddy") return "codebuddy";
   return "claude";
 };
-// Backend name to pin into wrc.defaultCli. "custom" defaults to claude —
-// user can edit config.jsonc afterwards if their custom bin is a fork.
-const backendNameFor = (kind: AgentKind): "claude" | "claude-internal" | "codebuddy" =>
-  kind === "claude-internal" || kind === "codebuddy" ? kind : "claude";
+// sync.targets[].kind: "claude-internal" 是 claude 家族的特例,
+// collapse 为 "claude" (settingsPath 已表达 internal 语义)。
+const syncKindFor = (kind: AgentKind): "claude" | "codebuddy" =>
+  kind === "codebuddy" ? "codebuddy" : "claude";
+// wrc.defaultCli: daemon active backend。与 sync.targets 多值独立。
+const backendNameFor = (kind: AgentKind): "claude" | "claude-internal" | "codebuddy" => kind;
 
 // ── HTTP helpers (talk to local daemon) ──────────────────────────────
 const DAEMON = "http://127.0.0.1:17890";
@@ -154,20 +158,16 @@ const main = async (): Promise<void> => {
   step(1, "采集配置");
   const botId = await input({ message: "智能机器人 botId:", required: true });
   const secret = await password({ message: "机器人 secret:", mask: "•" });
-  const agentKind = (await select({
-    message: "选择 Claude agent：",
+  const agentKinds = (await checkbox({
+    message: "选择 Claude agent (空格多选, 至少一个 — hook/MCP/env 会注入到每个选中项):",
     choices: [
-      { name: "claude (Anthropic 官方)", value: "claude" },
+      { name: "claude (Anthropic 官方)", value: "claude", checked: true },
       { name: "claude-internal (Tencent 内部)", value: "claude-internal" },
       { name: "codebuddy (Tencent CodeBuddy)", value: "codebuddy" },
-      { name: "自定义路径", value: "custom" },
     ],
-    default: "claude",
-  })) as AgentKind;
-  const customSettings =
-    agentKind === "custom"
-      ? await input({ message: "settings.json 绝对路径:", required: true })
-      : "";
+    required: true,
+    loop: false,
+  })) as AgentKind[];
   const wrcMode = (await select({
     message: "选择 wrc 模式：",
     choices: [
@@ -187,8 +187,20 @@ const main = async (): Promise<void> => {
     default: true,
   });
 
-  const settings = settingsPathFor(agentKind, customSettings);
-  const claudeBin = claudeBinFor(agentKind);
+  const targets = agentKinds.map((k) => ({
+    kind: syncKindFor(k),
+    settingsPath: settingsPathFor(k),
+    scope: "user" as const,
+  }));
+  // 第一个选中项决定 daemon active backend (wrc.defaultCli / claudeBin)。
+  // 多个 CLI 都能收到 hook 注入, 但 daemon 同时只 tail 一个 projectsDir。
+  // checkbox required:true 保证非空, 但 TS 不感知, 这里 narrow 一下。
+  const [primary] = agentKinds;
+  if (!primary) {
+    log(c.red("  ✗ 未选择任何 agent"));
+    process.exit(1);
+  }
+  const claudeBin = claudeBinFor(primary);
 
   // ── Step 1b: write configs ─────────────────────────────────────
   log(c.dim(`  写入 ${CONFIG} ...`));
@@ -197,12 +209,12 @@ const main = async (): Promise<void> => {
     { path: ["defaultChat"], value: "" },
     { path: ["wrc", "mode"], value: wrcMode },
     { path: ["wrc", "claudeBin"], value: claudeBin },
-    { path: ["wrc", "defaultCli"], value: backendNameFor(agentKind) },
+    { path: ["wrc", "defaultCli"], value: backendNameFor(primary) },
     { path: ["wrc", "cwd"], value: "~/.weclaude/workspace" },
     { path: ["wrc", "allowFrom"], value: [] },
     { path: ["approval", "enabled"], value: enableHook },
     { path: ["approval", "matcher"], value: ".*" },
-    { path: ["sync", "targets"], value: [{ kind: agentKind, settingsPath: settings, scope: "user" }] },
+    { path: ["sync", "targets"], value: targets },
   ]);
   log(c.dim(`  写入 ${SECRETS} ...`));
   patchJsonc(SECRETS, [

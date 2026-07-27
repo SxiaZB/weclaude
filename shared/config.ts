@@ -172,10 +172,16 @@ const Approval = z.object({
   blockAutoPlanMode: z.boolean().default(true),
 });
 
+// sync.targets[].kind 的合法值。claude-internal / custom 等旧值自动 collapse
+// 为 "claude" (preprocess) — settingsPath 已经表达了具体 fork, kind 只表达家族。
+const SYNC_KIND_LEGACY_TO_CLAUDE = new Set(["claude-internal", "custom"]);
+const normalizeSyncKind = (v: unknown): unknown =>
+  typeof v === "string" && SYNC_KIND_LEGACY_TO_CLAUDE.has(v) ? "claude" : v;
+
 const SyncTarget = z.object({
-  // 仅作为 sync 日志里的标签使用; 真正决定写入位置的是 settingsPath。
-  // 留成自由字符串以兼容 claude / claude-internal / custom 等任何 fork。
-  kind: z.string().default("claude"),
+  // CLI 家族标签: "claude" (含 claude-internal 等 fork) 或 "codebuddy"。
+  // 仅用于 sync 日志; 真正决定写入位置的是 settingsPath。
+  kind: z.preprocess(normalizeSyncKind, z.enum(["claude", "codebuddy"])).default("claude"),
   settingsPath: z.string(),
   scope: z.enum(["user", "project", "local"]).default("user"),
 });
