@@ -20,6 +20,7 @@ import {
   clearAutoWindow,
   getWindowMeta,
 } from "./session-cache.js";
+import { ruleAllows } from "./allow-rules.js";
 import { redact } from "./redact.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";
 import type { Handler } from "./http.js";
@@ -1041,6 +1042,16 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
     // Matcher: only intercept matching tools — others pass.
     if (!new RegExp(cfg.approval.matcher).test(toolName)) {
       json(res, 200, { decision: "allow", reason: "matcher_skip" } satisfies ApproveResp);
+      return;
+    }
+
+    // Claude-Code 风格 allowRules: matcher 拦下的工具里再挖细粒度豁免 (Bash 可
+    // 按命令前缀区分)。交互卡工具 (AskUserQuestion 等) 在 ruleAllows 内部硬保护,
+    // 规则写了也不会被放行。
+    const ruleHit = ruleAllows(cfg.approval.allowRules, toolName, toolInput);
+    if (ruleHit) {
+      log.info({ toolName, sessionId, rule: ruleHit }, "allow-rule skip");
+      json(res, 200, { decision: "allow", reason: `allow_rule:${ruleHit}` } satisfies ApproveResp);
       return;
     }
 
