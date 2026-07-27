@@ -21,7 +21,7 @@ import {
   clearAutoWindow,
   getWindowMeta,
 } from "./session-cache.js";
-import { alwaysAllowRulesFor, ruleAllows, ruleMatchesAny } from "./allow-rules.js";
+import { alwaysAllowRulesFor, ruleAllows, ruleMatchesAny } from "../shared/allow-rules.js";
 import { appendUnique } from "../shared/config-writer.js";
 import { redact } from "./redact.js";
 import { dangerOf, dangerModeSkips, dangerSkips, type DangerHit } from "./danger.js";

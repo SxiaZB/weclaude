@@ -14,7 +14,8 @@ import { dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { input, password, select, confirm, checkbox } from "@inquirer/prompts";
 import { parse as parseJsonc } from "jsonc-parser";
-import { patchJsonc } from "../shared/config-writer.js";
+import { appendUnique, patchJsonc } from "../shared/config-writer.js";
+import { mapClaudePermissions, readClaudePermissions } from "../shared/claude-permissions.js";
 import { expandHome } from "../shared/paths.js";
 import { resolvePublicHost } from "../shared/lan-ip.js";
 import { loadOrCreateSvrToken } from "../shared/svr-token.js";
@@ -219,6 +220,39 @@ const waitDaemonReady = async (timeoutMs: number): Promise<void> => {
   throw new Error("daemon did not become ready in time");
 };
 
+// ── Claude permissions 一次性导入 ─────────────────────────────────────
+// 把 Claude Code settings.json 的 permissions.allow/ask/deny 映射进 approval
+// 三层规则(语法同源, 不兼容条目跳过)。只做一次性同步, 之后由 weclaude 自管 —
+// 审批卡「✅总是」按钮会继续生长 allowRules。可随时用
+// `weclaude-init --import-claude-permissions [settings.json 路径]` 重新同步(增量去重)。
+const importClaudePerms = async (settingsPath: string, interactive: boolean): Promise<void> => {
+  const perms = readClaudePermissions(settingsPath);
+  if (!perms) {
+    log(c.dim(`  未读到 ${settingsPath} 的 permissions，跳过导入（保持 weclaude 自己的规则配置）`));
+    return;
+  }
+  const m = mapClaudePermissions(perms);
+  const total = m.allow.length + m.ask.length + m.deny.length;
+  if (total === 0) {
+    log(c.dim("  Claude permissions 为空或全部不兼容，跳过导入"));
+    return;
+  }
+  log(`  检测到 Claude Code 权限规则: allow ${m.allow.length} / ask ${m.ask.length} / deny ${m.deny.length}`
+    + (m.skipped.length ? c.dim(`（${m.skipped.length} 条引擎不支持将跳过）`) : ""));
+  if (interactive) {
+    const ok = await confirm({
+      message: "导入到企微审批规则？(allow→免审直行, ask→强制发卡, deny→直接拒绝；导入后由 weclaude 自管)",
+      default: true,
+    });
+    if (!ok) return;
+  }
+  for (const r of m.allow) appendUnique(CONFIG, ["approval", "allowRules"], r);
+  for (const r of m.ask) appendUnique(CONFIG, ["approval", "askRules"], r);
+  for (const r of m.deny) appendUnique(CONFIG, ["approval", "denyRules"], r);
+  log(c.green(`  ✓ 已导入 ${total} 条规则到 ${CONFIG}`));
+  if (m.skipped.length) log(c.dim(`  跳过: ${m.skipped.join(", ")}`));
+};
+
 // ── Main flow ────────────────────────────────────────────────────────
 const main = async (): Promise<void> => {
   log(c.bold("\nwezard · 新用户引导\n"));
@@ -337,6 +371,12 @@ const main = async (): Promise<void> => {
     { path: ["daemon", "detailRemoteToken"], value: svrToken },
   ]);
 
+  // ── Step 1c: 一次性导入 Claude permissions → approval 规则 ───────
+  // 多后端场景只读主后端 (agentKinds 的第一项) 的 settings.json: 导入是交互式的,
+  // 逐个后端问一遍等于把引导流程拖成 N 轮; 其余后端的规则可事后用
+  // `wezard-init --import-claude-permissions <path>` 增量补进来 (内部去重)。
+  if (enableHook) await importClaudePerms(settingsPathFor(primary), true);
+
   ensureBuild();
   if (enableHook) runSync();
   // marketplace 插件只存在于 claude 家族; codebuddy 的 hook 由 sync 直接
@@ -408,7 +448,15 @@ const pollClaim = async (timeoutMs: number): Promise<string | undefined> => {
   return undefined;
 };
 
-main().catch((e) => {
+// 独立入口: `weclaude-init --import-claude-permissions [settings.json 路径]`
+// 只跑权限导入(增量去重), 不走完整引导。改完记得重启 daemon 生效。
+const importFlagIdx = process.argv.indexOf("--import-claude-permissions");
+const entry = importFlagIdx >= 0
+  ? importClaudePerms(process.argv[importFlagIdx + 1] ?? "~/.claude/settings.json", false)
+      .then(() => log(c.dim("  提示: 重启 daemon 生效 (launchctl kickstart / systemctl restart)")))
+  : main();
+
+entry.catch((e) => {
   // eslint-disable-next-line no-console
   console.error(c.red(`\n[wezard-init] ${(e as Error).message}`));
   process.exit(1);

@@ -202,7 +202,7 @@ const Approval = z.object({
   // 不过 hook)。默认 true。设 false 恢复原行为(允许模型自动进 plan mode)。
   blockAutoPlanMode: z.boolean().default(true),
   danger: Danger.default({}),
-  // Claude-Code 风格的放行规则 (语法子集见 daemon/allow-rules.ts): 命中的调用
+  // Claude-Code 风格的放行规则 (语法子集见 shared/allow-rules.ts): 命中的调用
   // 跳过发卡直接 allow。例:
   //   "Bash(git log *)"  "Bash(python3 .claude/skills/*)"  "mcp__server__tool"
   // matcher 决定哪些工具进入审批, allowRules 在其中再挖细粒度豁免 (对 Bash 可
