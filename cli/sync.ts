@@ -14,6 +14,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = pathResolve(here, "..", "..");
 
 const MCP_ENTRY = `${PLUGIN_ROOT}/dist/mcp/server.js`;
+const HOOK_SCRIPT = `${PLUGIN_ROOT}/hooks/pre-tool-use.sh`;
 const LOCK_FILE = expandHome("~/.weclaude/sync.lock.json");
 const MARKER = "weclaude";
 
@@ -62,6 +63,25 @@ const stripHooks = (settings: Record<string, unknown>): void => {
   const list = (hooks.PreToolUse as HookEntry[] | undefined) ?? [];
   hooks.PreToolUse = list.filter((e) => e._managedBy !== MARKER);
   if ((hooks.PreToolUse as HookEntry[]).length === 0) delete hooks.PreToolUse;
+};
+
+// CodeBuddy 不走 Claude Code 的 plugin marketplace (weclaude 插件不会装上),
+// settings.json 是唯一注册点; Claude 家族由 plugin 的 hooks/hooks.json 提供,
+// 不在此写入 (否则双重触发 → 重复卡片)。
+const upsertHook = (settings: Record<string, unknown>, timeoutSec: number): void => {
+  const hooks = ((settings.hooks as Record<string, unknown>) ??= {});
+  const list = ((hooks.PreToolUse as HookEntry[]) ??= []);
+  list.push({
+    matcher: ".*",
+    hooks: [{
+      type: "command",
+      command: HOOK_SCRIPT,
+      // 严格大于 daemon 的 longPollSec (= envVals.hookTimeoutSec) + 一点余量,
+      // 与 hooks.json 的 timeout 语义对齐 — 否则 curl 先死, 用户点击写进死 socket。
+      timeout: timeoutSec + 10,
+    }],
+    _managedBy: MARKER,
+  });
 };
 
 // ── MCP upsert ────────────────────────────────────────────────────────
@@ -120,7 +140,13 @@ const targetKey = (path: string): string => expandHome(path);
 
 interface SyncOpts { remove?: boolean }
 
-const syncOne = (settingsPath: string, opts: SyncOpts, lock: Lock, env: EnvVals): void => {
+const syncOne = (
+  settingsPath: string,
+  kind: "claude" | "codebuddy",
+  opts: SyncOpts,
+  lock: Lock,
+  env: EnvVals,
+): void => {
   const abs = expandHome(settingsPath);
   const settings = readJson(abs);
 
@@ -135,7 +161,13 @@ const syncOne = (settingsPath: string, opts: SyncOpts, lock: Lock, env: EnvVals)
   } else {
     upsertMcp(settings);
     const wroteEnv = upsertEnv(settings, env);
-    lock.targets[targetKey(settingsPath)] = { wroteHooks: false, wroteMcp: true, wroteEnv };
+    // CodeBuddy 无 plugin 路径, settings.json 注册 hook; Claude 家族由 plugin 提供。
+    let wroteHooks = false;
+    if (kind === "codebuddy") {
+      upsertHook(settings, env.hookTimeoutSec);
+      wroteHooks = true;
+    }
+    lock.targets[targetKey(settingsPath)] = { wroteHooks, wroteMcp: true, wroteEnv };
   }
   writeJson(abs, settings);
 };
@@ -165,7 +197,7 @@ const main = (): void => {
     // eslint-disable-next-line no-console
     console.log(`[weclaude-sync] ${action} ${t.kind} → ${t.settingsPath}`);
     if (dryRun) continue;
-    syncOne(t.settingsPath, { remove }, lock, envVals);
+    syncOne(t.settingsPath, t.kind, { remove }, lock, envVals);
   }
   if (!dryRun) writeLock(lock);
   // eslint-disable-next-line no-console

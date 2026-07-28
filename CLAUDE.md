@@ -57,8 +57,8 @@ Three processes, all coordinating via 127.0.0.1:17890 and `~/.weclaude/`:
 - `shared/config-writer.ts` is the only sanctioned way to mutate the on-disk jsonc — it preserves comments via `jsonc-parser` edits. `cli/init.ts` and `daemon/claim.ts` use it.
 
 **Hook + sync**:
-- `hooks/hooks.json` is registered automatically by Claude Code when the plugin is installed (uses `${CLAUDE_PLUGIN_ROOT}`).
-- For non-plugin installs (`claude-internal` wrapper), `cli/sync.ts` writes the MCP server entry + `WECLAUDE_DAEMON_BASE` env into target `settings.json`s listed in `config.sync.targets`. **It deliberately strips legacy hook entries** — registering both the plugin's `hooks.json` AND a settings.json hook fires the hook twice per tool call (= duplicate cards). `~/.weclaude/sync.lock.json` tracks what was written so `--remove` is reversible.
+- `hooks/hooks.json` is registered automatically by Claude Code when the plugin is installed (uses `${CLAUDE_PLUGIN_ROOT:-${CODEBUDDY_PLUGIN_ROOT}}` so the same file works under CodeBuddy's plugin loader if ever published there).
+- For non-plugin installs (`claude-internal` wrapper), `cli/sync.ts` writes the MCP server entry + `WECLAUDE_DAEMON_BASE` env into target `settings.json`s listed in `config.sync.targets`. **It deliberately strips legacy hook entries** for `kind:"claude"` targets — registering both the plugin's `hooks.json` AND a settings.json hook fires the hook twice per tool call (= duplicate cards). For `kind:"codebuddy"` targets, since the weclaude plugin is not published to CodeBuddy's marketplace, sync **writes the hook directly into `~/.codebuddy/settings.json`** with an absolute path to `hooks/pre-tool-use.sh` — this is the only registration path for CodeBuddy. `~/.weclaude/sync.lock.json` tracks what was written so `--remove` is reversible.
 
 **MCP server** (`mcp/server.ts`): stdio transport, completely stateless w.r.t. WeCom. Every tool just `POST`s to the daemon. Add a tool here AND a route handler in `daemon/`.
 
