@@ -131,7 +131,16 @@ const summarizeUnknown = (i: Record<string, unknown>, cwd: string): string => {
   return lines.join("\n");
 };
 
-const QUOTE_MAX = 600;
+// 卡片 quote 体上限 — 由 approval.cardQuoteMaxChars 注入 (渲染函数调用点太多,
+// 模块级注入一次比层层穿参干净)。发送失败时缩到 SAFE_QUOTE_MAX 重试, 见 flushBatch。
+let QUOTE_MAX = 600;
+export const setCardQuoteMax = (n: number): void => { QUOTE_MAX = n; };
+const SAFE_QUOTE_MAX = 600;
+const shrinkQuote = (c: TemplateCard): TemplateCard => {
+  const q = (c as { quote_area?: { type: number; quote_text?: string } }).quote_area;
+  if (!q?.quote_text || q.quote_text.length <= SAFE_QUOTE_MAX) return c;
+  return { ...c, quote_area: { ...q, quote_text: TRUNC(q.quote_text, SAFE_QUOTE_MAX) } } as TemplateCard;
+};
 const join = (...parts: string[]): string => parts.filter(Boolean).join("\n");
 
 // Render tool input as a multi-line "code-block / quote" body.
@@ -1414,6 +1423,7 @@ const resolveApprover = (
 };
 
 export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarget, flushBeforeCard }: ApprovalDeps): Handler => {
+  setCardQuoteMax(cfg.approval.cardQuoteMaxChars);
   const detailUrlFor = (id: string): string =>
     buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
 
@@ -1454,10 +1464,15 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
       try { await flushBeforeCard?.(batch.sessionId, { toolName: batch.toolName, toolInput: batch.members[0]!.originalToolInput }); } catch (e) {
         log.warn({ batchId: batch.batchId, err: (e as Error).message }, "flushBatch flushBeforeCard failed; sending card anyway");
       }
-      await client.sendMessage(targetChatId(batch.approver), {
-        msgtype: "template_card",
-        template_card: card,
-      });
+      const sendCard = (c: TemplateCard): Promise<unknown> =>
+        client.sendMessage(targetChatId(batch.approver), { msgtype: "template_card", template_card: c });
+      try {
+        await sendCard(card);
+      } catch (e) {
+        // quote 体可能超平台未公开的长度上限 — 缩到安全值重试一次, 保住审批流。
+        log.warn({ batchId: batch.batchId, err: (e as Error).message }, "card send failed — retrying with shrunk quote");
+        await sendCard(shrinkQuote(card));
+      }
       log.info(
         { batchId: batch.batchId, count: batch.members.length, multi: isMulti, approver: batch.approver, tool: batch.toolName },
         "batch flushed",

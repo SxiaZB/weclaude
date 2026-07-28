@@ -94,17 +94,57 @@ const stripQuotedHeredocs = (cmd: string): string | undefined => {
   }
   return out.join("\n");
 };
-// 反斜杠转义的 ; 和 | 不是 shell 分隔符 (grep "a\|b" 的正则交替、find 的 \; ),
-// 不能当段边界切 — 否则 grep 交替模式永远匹配不上 Bash(grep *) 类规则。
-const SEGMENT_SPLIT = /\r?\n|&&|\|\||(?<!\\)[;|]/;
+// 兜底用的纯文本切分 (deny/ask 扫描在引号感知失败时用它, fail-closed 多扫不漏扫)
+const RAW_SPLIT = /\r?\n|&&|\|\||(?<!\\)[;|]/;
+
+// 引号感知分段: 只有引号外的 \n ; | || && 才是段分隔符。
+// rg 'a|b|c'、ontology ask "多行长文"、python3 -c "代码" 里的分隔符都是数据,
+// 纯文本 split 会把它们切成碎段导致永远匹配不上规则 (实战最大误卡来源)。
+// 语义: 单引号内无转义; 双引号内 \x 转义; 引号外 \x 转义 (覆盖 \| \; )。
+// 未闭合引号 / 孤立 & (后台执行) → 返回 undefined, 调用方走保守路径。
+const splitSegments = (cmd: string): string[] | undefined => {
+  const segs: string[] = [];
+  let cur = "";
+  let quote: '"' | "'" | undefined;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]!;
+    if (quote === "'") {
+      cur += ch;
+      if (ch === "'") quote = undefined;
+      continue;
+    }
+    if (quote === '"') {
+      cur += ch;
+      if (ch === "\\" && i + 1 < cmd.length) { cur += cmd[++i]; continue; }
+      if (ch === '"') quote = undefined;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < cmd.length) { cur += ch + cmd[++i]; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    if (ch === "\n" || ch === ";") { segs.push(cur); cur = ""; continue; }
+    if (ch === "|") {
+      if (cmd[i + 1] === "|") i++;
+      segs.push(cur); cur = ""; continue;
+    }
+    if (ch === "&") {
+      if (cmd[i + 1] === "&") { i++; segs.push(cur); cur = ""; continue; }
+      return undefined; // 孤立 & 后台执行, 保守处理
+    }
+    if (ch === "\r") continue;
+    cur += ch;
+  }
+  if (quote !== undefined) return undefined; // 引号未闭合
+  segs.push(cur);
+  return segs.map((s) => s.trim());
+};
 
 const bashCommandAllowed = (bashSpecs: Array<string | undefined>, command: string): string[] | undefined => {
   const stripped = stripQuotedHeredocs(command);
   if (stripped === undefined) return undefined;
   // 剥离后再查命令替换: 带引号 heredoc 正文里的 $() 是惰性数据, 不该连坐
   if (HAS_SUBSTITUTION.test(stripped)) return undefined;
-  const segments = stripped.split(SEGMENT_SPLIT).map((s) => s.trim());
-  if (segments.length === 0) return undefined;
+  const segments = splitSegments(stripped);
+  if (segments === undefined || segments.length === 0) return undefined;
   const hits: string[] = [];
   for (const seg of segments) {
     if (!seg) return undefined; // 空段 (如 "a && && b") 视为异常, 交回发卡
@@ -180,9 +220,9 @@ export const ruleMatchesAny = (
       : undefined;
     if (typeof cmd !== "string" || !cmd.trim()) return undefined;
     const bashRules = parsed.filter((r) => r.tool === "Bash");
-    // deny/ask 方向: heredoc 剥不掉就按原文扫段 (fail-closed, 多扫不漏扫)
+    // deny/ask 方向: heredoc 剥不掉按原文、引号感知失败退回纯文本切 (fail-closed)
     const base = stripQuotedHeredocs(cmd) ?? cmd;
-    const segments = base.split(SEGMENT_SPLIT).map((s) => s.trim()).filter(Boolean);
+    const segments = (splitSegments(base) ?? base.split(RAW_SPLIT)).map((s) => s.trim()).filter(Boolean);
     for (const seg of segments) {
       for (const r of bashRules) {
         if (r.spec === undefined) return "Bash";
@@ -204,7 +244,7 @@ export const ruleMatchesAny = (
 // 执行, 永不自动生成 — 必须带上子命令/脚本路径 (如 `Bash(python3 /path/x.py *)`)。
 const INTERPRETER_HEADS = new Set([
   "python", "python2", "python3", "node", "deno", "bun", "ruby", "perl", "php",
-  "bash", "sh", "zsh", "fish", "eval", "exec", "xargs",
+  "bash", "sh", "zsh", "fish", "eval", "exec", "xargs", "awk",
   "npx", "bunx", "uvx", "uv", "tsx",
 ]);
 
@@ -239,16 +279,12 @@ export const alwaysAllowRulesFor = (
     .filter((r): r is ParsedRule => r !== undefined && r.tool === "Bash")
     .map((r) => r.spec);
 
+  const segments = splitSegments(cmd);
+  if (segments === undefined) return []; // 引号未闭合/孤立 &, 不生成
   const rules: string[] = [];
-  for (const rawSeg of cmd.split(SEGMENT_SPLIT)) {
+  for (const rawSeg of segments) {
     const seg = stripEnvPrefix(norm(rawSeg));
     if (!seg) return []; // 空段异常, 整体放弃生成
-    // 分段器不感知引号 — 引号内的 |/&&/; 会被误切, 切出来的段引号必然不配对
-    // (如 `grep "a|b" f` 切成 `grep "a` 与 `b" f`)。任一段引号不平衡说明切进了
-    // 字符串内部, 整体放弃生成 (本次一次性放行), 不写垃圾规则。
-    for (const q of ['"', "'"]) {
-      if ((seg.split(q).length - 1) % 2 !== 0) return [];
-    }
     // 已被现有规则覆盖的段不再生成 (避免 `Bash(cd service *)` 这类冗余堆积)
     if (existingBashSpecs.some((s) => s === undefined || bashSpecMatches(s, seg))) continue;
     const toks = seg.split(" ");
