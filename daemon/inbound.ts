@@ -262,20 +262,34 @@ const renderSessionsList = (sessions: SessionInfo[], currentSid: string): string
 // agent here can actually collaborate with (shared chat = shared address space).
 const isPeersCommand = (text: string): boolean => /^\/(?:peers?|agents?)$/iu.test(text.trim());
 
+const uniq = (xs: string[]): string[] => [...new Set(xs)];
+const dirOf = (p: PeerInfo): string => p.cwd.replace(/^.*\//, "") || p.cwd;
+const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+// A field with the same value on every row (project dir, CLI backend) is noise
+// repeated N times — hoist those into the header and annotate rows only where
+// they actually differ. Rows are blank-line separated so a wrapped summary can't
+// visually merge into the next peer.
 const renderPeers = (peers: PeerInfo[]): string => {
   if (peers.length === 0) return "[weclaude] 本聊天还没有会话。发消息或 `/new` 建一个。";
-  const mixed = new Set(peers.map((p) => p.cli)).size > 1;
-  const lines = peers.map((p) => {
-    const name = p.tag ? `\`#${p.tag}\`` : "默认";
+  const dirs = uniq(peers.map(dirOf));
+  const clis = uniq(peers.map((p) => p.cli));
+  const shared = [dirs.length === 1 ? dirs[0] : "", clis.length === 1 ? clis[0] : ""].filter(Boolean);
+  const rows = peers.flatMap((p) => {
+    const name = p.tag ? `#${p.tag}` : "默认";
     const state = !p.paneAlive ? "⚫️ 已关闭" : p.busy ? "🔴 忙" : "🟢 空闲";
-    const dir = p.cwd.replace(/^.*\//, "") || p.cwd;
-    const cli = mixed ? ` _(${p.cli})_` : "";
+    const varies = [dirs.length > 1 ? dirOf(p) : "", clis.length > 1 ? p.cli : ""].filter(Boolean);
     const me = p.self ? " ⬅️ 本会话" : "";
-    return [`${p.label} ${name} · ${dir}${cli} · ${state}${me}`, `　${p.summary.slice(0, 90)}`].join("\n");
+    return [
+      `**${p.label} ${name}** ${state}${varies.length ? ` · ${varies.join(" · ")}` : ""}${me}`,
+      `　${clip(p.summary, 64)}`,
+      "",
+    ];
   });
   return [
-    "[weclaude] 本聊天的会话：",
-    ...lines,
+    `[weclaude] 本聊天的会话 · ${peers.length} 个${shared.length ? ` · ${shared.join(" · ")}` : ""}`,
+    "",
+    ...rows,
     "> 协作：直接说「看下 #fix 的进展并推动它」，AI 会读它的终端并注入指令",
   ].join("\n");
 };

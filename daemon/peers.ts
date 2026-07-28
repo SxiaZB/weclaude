@@ -82,12 +82,17 @@ export const tailTurns = (jsonlPath: string, n = 3): Turn[] => {
   return turns.slice(-n);
 };
 
+// Transcript prose is arbitrary text: backticks / asterisks / pipes lifted out of
+// it render as chips and table cells inside a WeCom bubble, shredding the line
+// layout. A preview is plain text — flatten every markdown-active char.
+const stripMd = (s: string): string => s.replace(/[`*_~|]/g, "").replace(/\s+/g, " ").trim();
+
 /** One-line "what is this session doing" preview, for list rendering. */
 export const summarizeTail = (jsonlPath: string, n = 3, per = 80): string => {
   if (!existsSync(jsonlPath)) return "(新会话 · 暂无对话)";
   const turns = tailTurns(jsonlPath, n);
   if (turns.length === 0) return "(暂无对话)";
-  return turns.map((t) => `${t.role === "user" ? "你" : "AI"}: ${t.text.slice(0, per)}`).join(" | ");
+  return turns.map((t) => `${t.role === "user" ? "你" : "AI"}: ${stripMd(t.text).slice(0, per)}`).join(" · ");
 };
 
 /** The peer's most recent assistant message — the handoff payload when one
