@@ -1255,7 +1255,18 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     // 弹窗的 Always allow)。规则生成用未脱敏的原始 toolInput (display 可能被
     // redact 改写过, 拿它生成的前缀会匹配不上真实命令)。
     if (decision === "allow_always") {
-      const gen = alwaysAllowRulesFor(toolName, toolInput);
+      // 命中 askRules 的调用: allow 规则永远会被 ask 压过, 存了也是死规则 —
+      // 提示用户真实的生效路径, 而不是静默写入一条不生效的配置。
+      const askBlocked = ruleMatchesAny(cfg.approval.askRules, toolName, toolInput);
+      if (askBlocked) {
+        try {
+          await client.sendMessage(targetChatId(approver), {
+            msgtype: "markdown",
+            markdown: { content: `⚠️ 该命令命中强制审批规则 \`${askBlocked}\`（askRules 优先于放行规则），「总是」不会生效，本次已放行。如确要永久放行，需从 config.jsonc 的 askRules 移除该规则。` },
+          });
+        } catch { /* best-effort */ }
+      }
+      const gen = askBlocked ? [] : alwaysAllowRulesFor(toolName, toolInput, cfg.approval.allowRules);
       const added = gen.filter((r) => !cfg.approval.allowRules.includes(r));
       if (added.length > 0) {
         cfg.approval.allowRules.push(...added); // 同步热生效; 文件写入失败也不回滚
@@ -1275,7 +1286,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         } catch (e) {
           log.warn({ err: (e as Error).message }, "allow_always notice send failed");
         }
-      } else if (gen.length === 0) {
+      } else if (!askBlocked && gen.length === 0) {
         // 生成不了可靠字面规则 (含 $()/反引号动态构造, 或分隔符切进了引号内部) —
         // 本次一次性放行并告知。文案区分两种成因, 避免误导排查方向。
         const dynamic = /[`]|\$\(/.test(

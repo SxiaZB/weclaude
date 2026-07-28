@@ -66,13 +66,44 @@ const bashSpecMatches = (spec: string, segment: string): boolean => {
 // 含命令替换的整条命令直接不命中 — 规则匹配的是字面前缀, 而 $(…)/反引号的实际
 // 行为取决于运行时展开, 字面匹配给不出可信判断。
 const HAS_SUBSTITUTION = /[`]|\$\(/;
+
+// 带引号的 heredoc (<<'EOF') 正文是喂给 stdin 的纯数据 (shell 不做任何展开),
+// 不是要执行的命令 — 剥掉正文只留命令行参与分段/匹配, 否则 `cat > x <<'EOF'`
+// 这类高频写文件命令永远匹配不上规则。未加引号的 heredoc (<<EOF) 正文会被
+// shell 展开 ($() 会执行!), 不可安全剥离 → 返回 undefined, 调用方走保守路径。
+const stripQuotedHeredocs = (cmd: string): string | undefined => {
+  if (!cmd.includes("<<")) return cmd;
+  const lines = cmd.split(/\r?\n/);
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    const m = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/.exec(line);
+    out.push(line);
+    i++;
+    if (!m) continue;
+    if (!m[1]) return undefined; // 未加引号的 heredoc: 正文会被展开, 不可剥离
+    const marker = m[2]!;
+    let closed = false;
+    while (i < lines.length) {
+      const bodyLine = lines[i]!;
+      i++;
+      if (bodyLine.trim() === marker) { closed = true; break; }
+    }
+    if (!closed) return undefined; // 未闭合, 解析不确定
+  }
+  return out.join("\n");
+};
 // 反斜杠转义的 ; 和 | 不是 shell 分隔符 (grep "a\|b" 的正则交替、find 的 \; ),
 // 不能当段边界切 — 否则 grep 交替模式永远匹配不上 Bash(grep *) 类规则。
 const SEGMENT_SPLIT = /\r?\n|&&|\|\||(?<!\\)[;|]/;
 
 const bashCommandAllowed = (bashSpecs: Array<string | undefined>, command: string): string[] | undefined => {
-  if (HAS_SUBSTITUTION.test(command)) return undefined;
-  const segments = command.split(SEGMENT_SPLIT).map((s) => s.trim());
+  const stripped = stripQuotedHeredocs(command);
+  if (stripped === undefined) return undefined;
+  // 剥离后再查命令替换: 带引号 heredoc 正文里的 $() 是惰性数据, 不该连坐
+  if (HAS_SUBSTITUTION.test(stripped)) return undefined;
+  const segments = stripped.split(SEGMENT_SPLIT).map((s) => s.trim());
   if (segments.length === 0) return undefined;
   const hits: string[] = [];
   for (const seg of segments) {
@@ -149,7 +180,9 @@ export const ruleMatchesAny = (
       : undefined;
     if (typeof cmd !== "string" || !cmd.trim()) return undefined;
     const bashRules = parsed.filter((r) => r.tool === "Bash");
-    const segments = cmd.split(SEGMENT_SPLIT).map((s) => s.trim()).filter(Boolean);
+    // deny/ask 方向: heredoc 剥不掉就按原文扫段 (fail-closed, 多扫不漏扫)
+    const base = stripQuotedHeredocs(cmd) ?? cmd;
+    const segments = base.split(SEGMENT_SPLIT).map((s) => s.trim()).filter(Boolean);
     for (const seg of segments) {
       for (const r of bashRules) {
         if (r.spec === undefined) return "Bash";
@@ -167,23 +200,44 @@ export const ruleMatchesAny = (
   return undefined;
 };
 
+// 解释器/shell 头部: 单命令级前缀规则 (如 `Bash(python3 *)`) 等于放行任意代码
+// 执行, 永不自动生成 — 必须带上子命令/脚本路径 (如 `Bash(python3 /path/x.py *)`)。
+const INTERPRETER_HEADS = new Set([
+  "python", "python2", "python3", "node", "deno", "bun", "ruby", "perl", "php",
+  "bash", "sh", "zsh", "fish", "eval", "exec", "xargs",
+  "npx", "bunx", "uvx", "uv", "tsx",
+]);
+
 /**
  * 「✅ 总是」按钮的规则生成: 由本次调用推导要写入 allowRules 的规则。
  * - 非 Bash: 裸工具名 (mcp 工具即完整 mcp__server__tool);
  * - Bash: 逐段取「命令 + 第二个 token」做前缀规则 `Bash(a b *)`;
  *   第二个 token 是 flag (-开头) 或不存在时退化为单 token `Bash(a *)`;
- *   含 $()/反引号无法生成可靠的字面前缀 → 返回 [] (调用方应保持一次性放行)。
+ *   已被 existingRules 覆盖的段跳过 (不生成冗余规则);
+ *   解释器头部不允许退化为单命令规则 (防生成 `Bash(python3 *)` 级别的全放行);
+ *   含 $()/反引号、不可剥离的 heredoc → 返回 [] (调用方保持一次性放行)。
  * - 交互卡工具永不生成规则。
  */
-export const alwaysAllowRulesFor = (toolName: string, toolInput: unknown): string[] => {
+export const alwaysAllowRulesFor = (
+  toolName: string,
+  toolInput: unknown,
+  existingRules: string[] = [],
+): string[] => {
   if (NEVER_RULE_ALLOW.has(toolName)) return [];
   if (toolName !== "Bash") return [toolName];
 
-  const cmd = toolInput && typeof toolInput === "object"
+  const raw = toolInput && typeof toolInput === "object"
     ? (toolInput as Record<string, unknown>).command
     : undefined;
-  if (typeof cmd !== "string" || !cmd.trim()) return [];
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  const cmd = stripQuotedHeredocs(raw);
+  if (cmd === undefined) return [];
   if (HAS_SUBSTITUTION.test(cmd)) return [];
+
+  const existingBashSpecs = existingRules
+    .map(parseRule)
+    .filter((r): r is ParsedRule => r !== undefined && r.tool === "Bash")
+    .map((r) => r.spec);
 
   const rules: string[] = [];
   for (const rawSeg of cmd.split(SEGMENT_SPLIT)) {
@@ -195,6 +249,8 @@ export const alwaysAllowRulesFor = (toolName: string, toolInput: unknown): strin
     for (const q of ['"', "'"]) {
       if ((seg.split(q).length - 1) % 2 !== 0) return [];
     }
+    // 已被现有规则覆盖的段不再生成 (避免 `Bash(cd service *)` 这类冗余堆积)
+    if (existingBashSpecs.some((s) => s === undefined || bashSpecMatches(s, seg))) continue;
     const toks = seg.split(" ");
     const head = toks[0]!;
     // 段首必须长得像命令 (字母数字/路径字符); 括号引号等异形首 token 一律放弃。
@@ -203,6 +259,8 @@ export const alwaysAllowRulesFor = (toolName: string, toolInput: unknown): strin
     // 第二个 token 只有长得像子命令/路径时才纳入前缀 (flag、引号值等退化为单命令)。
     const second = toks[1];
     const useSecond = second && !second.startsWith("-") && TOKEN_RE.test(second);
+    // 解释器头部若拿不到子命令/路径, 生成出来就是任意代码执行级别的全放行 → 整体放弃。
+    if (!useSecond && INTERPRETER_HEADS.has(head.split("/").pop() ?? head)) return [];
     const prefix = useSecond ? `${head} ${second}` : head;
     rules.push(`Bash(${prefix} *)`);
   }
