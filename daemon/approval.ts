@@ -24,7 +24,7 @@ import { redact } from "./redact.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
-import { labelFor } from "./session-label.js";
+import { tagBadge, withTagHeader } from "./session-label.js";
 
 // ── Routing helpers ────────────────────────────────────────────────────
 const targetChatId = (principal: string): string => {
@@ -203,15 +203,7 @@ const detailJumpList = (url?: string): TemplateCard["jump_list"] | undefined =>
 // keyed on the tag STRING (not sessionId) so it matches the `emoji #tag`
 // prefix that outbound mirror bubbles carry — one visual per tag, regardless
 // of how many times `/clear` rotates the underlying sessionId.
-const tagStringOf = (target: string | undefined): string => {
-  if (!target) return "";
-  const h = target.indexOf("#");
-  return h >= 0 ? target.slice(h + 1) : "";
-};
-const emojiFor = (target: string | undefined): string => {
-  const tag = tagStringOf(target);
-  return tag ? `${labelFor(tag)} ` : "";
-};
+const emojiFor = tagBadge;
 const tagOf = (a: CardArgs): string => emojiFor(a.chatKey);
 
 const buildCard = (a: CardArgs): TemplateCard => {
@@ -548,12 +540,12 @@ const buildAskqMarkdown = (q: AskqQuestion, prefix = ""): string => {
   return [head, "", ...opts].join("\n");
 };
 
-const buildAskqCard = (reqId: string, q: AskqQuestion, transcriptTail: string): TemplateCard => {
+const buildAskqCard = (reqId: string, q: AskqQuestion, transcriptTail: string, approver?: string): TemplateCard => {
   const tail = oneLine(transcriptTail).trim();
   return {
     card_type: "vote_interaction",
     source: buildSource(tail),
-    main_title: { title: TRUNC(`🤔 ${q.header || "请选择"}`, ASKQ_TITLE_MAX) },
+    main_title: { title: TRUNC(`🤔 ${emojiFor(approver)}${q.header || "请选择"}`, ASKQ_TITLE_MAX) },
     task_id: reqId,
     checkbox: {
       question_key: "q",
@@ -582,6 +574,7 @@ const buildAskqResolvedCard = (
   q: AskqQuestion,
   outcome: AskqOutcome,
   transcriptTail: string,
+  approver?: string,
 ): TemplateCard => {
   const summary = outcome.kind === "cli"
     ? "🖥️ 已转 CLI 中处理"
@@ -594,7 +587,7 @@ const buildAskqResolvedCard = (
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: TRUNC(`🤔 ${q.header || "已回答"}`, ASKQ_TITLE_MAX) },
+    main_title: { title: TRUNC(`🤔 ${emojiFor(approver)}${q.header || "已回答"}`, ASKQ_TITLE_MAX) },
     sub_title_text: TRUNC(q.question, ASKQ_SUB_MAX),
     task_id: reqId,
     button_list: [{ text: TRUNC(summary, 30), style: 4, key: encodeAskqNoopKey(reqId) }],
@@ -666,6 +659,7 @@ const buildPlanResolvedCard = (
   action: PlanAction,
   cwd: string,
   transcriptTail: string,
+  approver?: string,
 ): TemplateCard => {
   const tail = oneLine(transcriptTail).trim();
   const dir = dirName(cwd);
@@ -673,7 +667,7 @@ const buildPlanResolvedCard = (
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: TRUNC(`📋 计划 · ${dir}/`, PLAN_TITLE_MAX + 12) },
+    main_title: { title: TRUNC(`📋 计划 · ${emojiFor(approver)}${dir}/`, PLAN_TITLE_MAX + 12) },
     task_id: reqId,
     button_list: [{ text: summary, style: 4, key: encodePlanNoopKey(reqId) }],
   };
@@ -705,6 +699,10 @@ const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flu
       toolInput: body.tool_input,
       cwd: body.cwd,
       sessionId: body.session_id,
+      // kind:"generic" keeps this out of the allow_window sweep; chatKey is
+      // carried purely so the click listener can re-render the resolved card
+      // with the same `#tag` emoji the live card showed.
+      chatKey: approver,
       transcriptTail: body.transcript_tail ?? "",
     },
     timeoutMs: longPollMs,
@@ -720,7 +718,7 @@ const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flu
     try {
       await client.sendMessage(target, {
         msgtype: "markdown",
-        markdown: { content: buildPlanMarkdown(plan) },
+        markdown: { content: withTagHeader(approver, buildPlanMarkdown(plan)) },
       });
     } catch (e) {
       log.warn({ err: (e as Error).message }, "plan markdown prelude send failed");
@@ -832,6 +830,7 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
         toolInput: { questions: [q] },
         cwd: body.cwd,
         sessionId: body.session_id,
+        chatKey: approver, // 同 plan: 只为 resolved 卡复原 `#tag` emoji, 不参与 sweep
         transcriptTail: body.transcript_tail ?? "",
       },
       timeoutMs: remainMs,
@@ -849,14 +848,14 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
       try {
         await client.sendMessage(target, {
           msgtype: "markdown",
-          markdown: { content: buildAskqMarkdown(q, prefix) },
+          markdown: { content: withTagHeader(approver, buildAskqMarkdown(q, prefix)) },
         });
       } catch (e) {
         log.warn({ err: (e as Error).message }, "askq markdown prelude send failed");
       }
       await client.sendMessage(target, {
         msgtype: "template_card",
-        template_card: buildAskqCard(reqId, q, body.transcript_tail ?? ""),
+        template_card: buildAskqCard(reqId, q, body.transcript_tail ?? "", approver),
       });
       log.info({ reqId, approver, idx: i, total }, "askq card sent");
     } catch (e) {
@@ -879,7 +878,7 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
       try {
         await client.sendMessage(target, {
           msgtype: "markdown",
-          markdown: { content: "⚠️ CLI 侧连接已断开，本轮问题卡已失效，请回到 CLI 处理。" },
+          markdown: { content: withTagHeader(approver, "⚠️ CLI 侧连接已断开，本轮问题卡已失效，请回到 CLI 处理。") },
         });
       } catch { /* best-effort */ }
       return { decision: "ask", reason: "askq_client_gone" };
@@ -907,7 +906,12 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
     try {
       await client.sendMessage(target, {
         msgtype: "markdown",
-        markdown: { content: total === 1 ? "✅ 已回传，Claude 处理中…" : `✅ ${total} 题已回传，Claude 处理中…` },
+        markdown: {
+          content: withTagHeader(
+            approver,
+            total === 1 ? "✅ 已回传，Claude 处理中…" : `✅ ${total} 题已回传，Claude 处理中…`,
+          ),
+        },
       });
     } catch (e) {
       log.warn({ err: (e as Error).message }, "askq ack send failed");
@@ -1240,7 +1244,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
           const summary = tools.length > 0 ? tools.join(" / ") : `${swept.length} 个`;
           await client.sendMessage(targetChatId(approver), {
             msgtype: "markdown",
-            markdown: { content: `⚡ 已批量自动放行其他 ${swept.length} 个并发请求：${summary}` },
+            markdown: { content: withTagHeader(approver, `⚡ 已批量自动放行其他 ${swept.length} 个并发请求：${summary}`) },
           });
         } catch (e) {
           log.warn({ err: (e as Error).message }, "sweep notice send failed");
@@ -1341,6 +1345,7 @@ export const installApprovalEventListener = (
                 q,
                 outcome,
                 meta?.transcriptTail ?? "",
+                meta?.chatKey,
               ),
             );
           } catch (e) {
@@ -1364,6 +1369,7 @@ export const installApprovalEventListener = (
               planClick.action,
               meta?.cwd ?? "",
               meta?.transcriptTail ?? "",
+              meta?.chatKey,
             ),
           );
         } catch (e) {

@@ -15,7 +15,7 @@ import { scanClaudeSessions, type SessionInfo } from "./session-scan.js";
 import { computeUsage, renderUsageReport } from "./usage.js";
 import { computeAuditReport } from "./audit.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
-import { labelFor } from "./session-label.js";
+import { tagOfKey, withTagHeader } from "./session-label.js";
 import {
   parseSubscribe,
   parseUnsubscribe,
@@ -58,10 +58,7 @@ const parseTag = (text: string): { tag: string; cleaned: string } => {
 };
 
 const sessionKey = (base: string, tag: string): string => (tag ? `${base}#${tag}` : base);
-const tagOf = (who: string): string => {
-  const h = who.indexOf("#");
-  return h >= 0 ? who.slice(h + 1) : "";
-};
+const tagOf = tagOfKey;
 
 // Auth principals: any-of test against allowFrom. Tiered — allowing a user
 // grants them access in any chat; allowing a group grants every member of
@@ -152,22 +149,28 @@ const renderHelp = (): string =>
     "",
     "▎会话",
     "`/new` 新开会话并绑定本聊天 (沿用当前会话的 CLI)",
-    "`/new codebuddy` 指定 CLI 新开 (claude / claude-internal / codebuddy)",
-    "`/new #tag` 在本聊天中新开一个带标签的并行会话",
+    "`/clear` 清空当前会话上下文 (有待切项目时自动升级为 /new)",
     "`/sessions` 列出 live 会话 · `/sessions <emoji|id>` 切换",
     "`/stop` 打断当前生成 (Esc)",
     "`/n` 向 CLI 输入回车 (Enter)",
+    "",
+    "▎切换 CLI 后端",
+    "`/new codebuddy` 用指定 CLI 新开 (claude / claude-internal / codebuddy)",
+    "不写则沿用本会话当前的 CLI;新开 `#tag` 会话则继承本聊天的 CLI。",
+    "切换后 `/clear`、`/stop`、`--resume` 自愈都仍绑在该 CLI 上。",
     "",
     "▎多会话路由",
     "同一聊天可同时运行多个 claude:消息中任意位置带 `#tag`(如 `#docs 帮我改 README`)",
     "即路由到该标签会话;不带 tag = 默认会话。tagged 会话的回复以 `emoji #tag` 前缀标注。",
     "`/clear #tag`、`/pwd #tag`、`/stop #tag` 等命令同理按 tag 路由。",
+    "`#tag` 与 CLI 名可同时写:`/new codebuddy #docs` = 用 codebuddy 开 docs 会话。",
     "",
     "▎信息 (免授权)",
     "`/id` 查看会话/权限 id",
     "`/pwd` 当前项目路径",
     "`/usage` 真实订阅额度 %",
     "`/cost` token/成本估算",
+    "`/audit` 本会话 token/成本明细 (含 subagent) · `/audit <tag>` 指定标签会话",
     "`/help` 本帮助",
     "`/skill-b` 广播接口用法 (贴给 Claude)",
     "",
@@ -457,8 +460,10 @@ export const installInboundRouter = (
     who: string,
     text: string,
   ): Promise<boolean> => {
+    // 订阅/广播回执同样按会话 tag 标注 —— `#docs /subs` 的回执必须落在 `#docs`
+    // 的视觉通道里, 否则同一聊天并行会话时分不清是谁的回执。
     const reply = async (t: string): Promise<void> => {
-      try { await client.replyStream(frame, msg.msgid, t, true); } catch { /* ignore */ }
+      try { await client.replyStream(frame, msg.msgid, withTagHeader(who, t), true); } catch { /* ignore */ }
     };
     const sub = parseSubscribe(text);
     if (sub) {
@@ -518,11 +523,7 @@ export const installInboundRouter = (
   // stays visually disambiguated. Untagged (default) session passes through
   // unchanged. Emoji is derived from the tag string (not sessionId) so it
   // stays stable across /clear cycles.
-  const withTagPrefix = (who: string, text: string): string => {
-    const tag = tagOf(who);
-    if (!tag) return text;
-    return `${labelFor(tag)} \`#${tag}\`\n\n${text}`;
-  };
+  const withTagPrefix = withTagHeader;
   const replyText = async (frame: WsFrame<BaseMessage>, msg: BaseMessage, who: string, text: string): Promise<void> => {
     try { await client.replyStream(frame, msg.msgid, withTagPrefix(who, text), true); } catch { /* ignore */ }
   };
@@ -755,7 +756,7 @@ export const installInboundRouter = (
       await bridge.dispatch({ principal: who, text, images, frame, streamId: msg.msgid });
     } catch (e) {
       log.error({ err: (e as Error).message }, "bridge dispatch failed");
-      try { await client.replyStream(frame, msg.msgid, `[weclaude] error: ${(e as Error).message}`, true); } catch { /* ignore */ }
+      try { await client.replyStream(frame, msg.msgid, withTagHeader(who, `[weclaude] error: ${(e as Error).message}`), true); } catch { /* ignore */ }
     }
   };
 

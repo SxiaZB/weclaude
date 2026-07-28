@@ -5,6 +5,7 @@ import type { WSClient } from "@wecom/aibot-node-sdk";
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import { patchJsonc } from "../shared/config-writer.js";
+import { withTagHeader } from "./session-label.js";
 
 const stripPrefix = (s: string): string => {
   const i = s.indexOf(":");
@@ -113,9 +114,11 @@ export const publish = async (
   let failed = 0;
   for (const s of subs) {
     try {
+      // 订阅者 key 可能带 `#tag` (订阅是按会话 key 记的) —— 广播落到该会话的
+      // 视觉通道里, 与该会话的其它气泡一致。
       await client.sendMessage(stripPrefix(s), {
         msgtype: "markdown",
-        markdown: { content },
+        markdown: { content: withTagHeader(s, content) },
       });
       sent++;
     } catch (e) {

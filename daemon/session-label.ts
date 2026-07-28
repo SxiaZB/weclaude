@@ -27,3 +27,32 @@ export const labelFor = (sessionId: string): string => {
   if (!sessionId) return "❔";
   return ANIMALS[hash(sessionId) % ANIMALS.length] ?? "❔";
 };
+
+// ── Target-key tagging ──────────────────────────────────────────────────
+// Daemon-internal target keys are `user:xxx[#tag]` / `chat:xxx[#tag]`. Every
+// user-visible artifact bound to a TAGGED session must carry the same visual
+// so a chat hosting parallel sessions stays disambiguated:
+//   • markdown bubbles → `emoji \`#tag\`` header line  (withTagHeader)
+//   • card titles      → `emoji ` badge                 (tagBadge)
+// Untagged (default session) passes through unchanged — single-session users
+// see no extra glyphs. Emoji is keyed on the TAG STRING, not the sessionId,
+// so it survives `/clear` rotations.
+
+/** `#tag` suffix of a target key, "" when untagged. */
+export const tagOfKey = (target: string | undefined): string => {
+  if (!target) return "";
+  const h = target.indexOf("#");
+  return h >= 0 ? target.slice(h + 1) : "";
+};
+
+/** Trailing-space emoji badge for card titles; "" for untagged targets. */
+export const tagBadge = (target: string | undefined): string => {
+  const tag = tagOfKey(target);
+  return tag ? `${labelFor(tag)} ` : "";
+};
+
+/** Prefix markdown content with the `emoji \`#tag\`` header; identity when untagged. */
+export const withTagHeader = (target: string | undefined, content: string): string => {
+  const tag = tagOfKey(target);
+  return tag ? `${labelFor(tag)} \`#${tag}\`\n\n${content}` : content;
+};

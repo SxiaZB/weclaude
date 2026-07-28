@@ -316,7 +316,49 @@ tagged session 的每条回复自带 `emoji #tag` 前缀（emoji 由 tag 名 has
 
 ---
 
+## 多 CLI 后端（`claude` / `claude-internal` / `codebuddy`）
+
+daemon 同时挂载所有已安装的 CLI，不是二选一：你可以一个 tmux 窗口跑 `claude`、另一个跑 `codebuddy`，各自绑不同的 IM 聊天。**会话身份就是它的 jsonl 路径**，daemon 由路径反推是哪个 CLI 写的，`--resume` 用哪个二进制、jsonl 用哪套 schema 解析、project-dir 怎么编码，全部由此派生。
+
+```
+/new                 沿用「当前会话」的 CLI 新开
+/new codebuddy       换到 codebuddy 新开
+/new claude-internal 换到 claude-internal 新开
+```
+
+默认后端由 `wrc.defaultCli` 决定（缺省 `claude`），二进制路径可用 `wrc.cliBackends.<name>.bin` 覆盖。
+
+**和 `#tag` 完全正交**，两者可以任意组合、顺序不限：
+
+```
+/new codebuddy #docs    用 codebuddy 起一个 docs 标签会话
+/new #docs codebuddy    等价写法
+#docs 帮我改 README      → 路由到那个 codebuddy 会话
+/clear #docs            → 只清它，且仍留在 codebuddy 上
+```
+
+切换 CLI 后 tag 路由的所有行为都保持不变：
+
+- `/clear #tag` rotate 出的新 jsonl 仍落在该 CLI 的 projects 目录，watcher 按该后端的 dialect 迁移绑定；
+- pane 挂了自愈 `--resume` 用的是**该会话所属**的二进制，不会串到 `defaultCli`；
+- 首次 `/new #tag` 没有自己的历史记录时，**继承本聊天基础会话的 CLI**（与 cwd 的聊天级继承规则一致），不会悄悄退回默认后端；
+- `/sessions` 列表在混用多个 CLI 时，每行自动标注 `(codebuddy)` 之类的来源。
+
+---
+
 ## 常用命令
+
+IM 里发 `/help` 可随时拉出完整命令表；每次 `/new`、`/clear` 之后，回执会随机附一条功能提示，用来慢慢摊开命令面。
+
+```
+/new · /clear · /stop · /n          会话控制
+/sessions [emoji|id]                 列出 / 切换 live 会话
+/new <cli> [#tag]                    切换 CLI 后端 / 开并行会话
+/id · /pwd · /usage · /cost · /audit  信息查询（免授权）
+/help                                全部命令
+```
+
+本机 shell：
 
 ```bash
 weclaude status              # 看 daemon + WS 健康

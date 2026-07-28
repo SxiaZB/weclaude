@@ -32,7 +32,8 @@ import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl } from "./detail.js";
 import type { TurnUsage } from "./detail.js";
-import { labelFor } from "./session-label.js";
+import { labelFor, tagOfKey, withTagHeader } from "./session-label.js";
+import { randomTip } from "./tips.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -323,10 +324,7 @@ const stripPrincipalPrefix = (s: string): string => {
 };
 
 // Extract the `#tag` suffix from a target key, "" if untagged.
-const tagOfTarget = (s: string): string => {
-  const h = s.indexOf("#");
-  return h >= 0 ? s.slice(h + 1) : "";
-};
+const tagOfTarget = tagOfKey;
 
 // Drop the `#tag` suffix — collapses tagged session keys to the chat-scoped
 // base principal (`user:xxx#foo` → `user:xxx`). Used to share cwd state
@@ -339,11 +337,7 @@ const basePrincipalOf = (s: string): string => {
 // Prefix outbound content with `<emoji> #tag` header (blank line separator)
 // when the target carries a `#tag` suffix. Untagged targets pass through
 // unchanged — default session keeps its plain-bubble UX.
-const withSessionTag = (target: string, content: string): string => {
-  const tag = tagOfTarget(target);
-  if (!tag) return content;
-  return `${labelFor(tag)} \`#${tag}\`\n\n${content}`;
-};
+const withSessionTag = withTagHeader;
 
 // Claude Code wraps slash-command invocations into the user message as
 //   <command-message>name</command-message>
@@ -2810,6 +2804,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       lines.push(`下次切换: \`${pending}\` (使用 /new 或 /clear 生效)`);
     }
     lines.push("> 切换其他项目: 在对话中告诉 AI 调用 `cd` MCP 工具");
+    // Session-boundary footer — `/new` and `/clear` are the only two callers,
+    // so the tip lands exactly once per fresh context, never mid-conversation.
+    lines.push(randomTip());
     return lines.join("\n");
   };
 
@@ -2868,8 +2865,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       expandedDefaultCwd;
     // Inherit the outgoing session's CLI when the caller didn't name one: a
     // `/new` (or a /clear upgraded to /new) on a codebuddy-bound chat must stay
-    // on codebuddy rather than silently reverting to `defaultCli`.
-    const boundPath = prev?.jsonlPath ?? rec?.jsonlPath;
+    // on codebuddy rather than silently reverting to `defaultCli`. Inheritance
+    // is chat-scoped like cwd — a FIRST `/new #tag` has no record of its own,
+    // so it falls back to the base session's binding instead of `defaultCli`
+    // (otherwise a tagged sibling silently forks onto a different CLI).
+    const base = basePrincipalOf(target);
+    const baseBound = base === target ? undefined : byTarget.get(base)?.jsonlPath ?? deps.store.get(base)?.jsonlPath;
+    const boundPath = prev?.jsonlPath ?? rec?.jsonlPath ?? baseBound;
     const effCli = cli ?? (boundPath ? backendForPath(expandHome(boundPath)).name : undefined);
     if (prev?.tmuxPane) {
       // Best-effort kill; ignore errors (pane may already be dead).
@@ -2898,7 +2900,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // Clear the chat's pendingCwd on the BASE record too — the queued switch
     // has just been consumed by this respawn. Without this, a subsequent /new
     // #other would re-apply the same cd and diverge from user intent.
-    const base = basePrincipalOf(target);
     if (base !== target) {
       const baseA = byTarget.get(base);
       if (baseA?.pendingCwd) {
