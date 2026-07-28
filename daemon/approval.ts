@@ -1427,6 +1427,30 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
   const detailUrlFor = (id: string): string =>
     buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
 
+  // 手机端卡片 quote 区实测只渲染前 2~3 行且无展开入口 — 命令超过这个字数时,
+  // 发卡前先推一条完整命令的 markdown 前置消息 (普通气泡可展开, 无渲染截断)。
+  // 用 display(已脱敏)副本, token 类不外泄。仅单成员卡触发 (批量卡逐成员推会刷屏)。
+  const PRELUDE_TRIGGER_CHARS = 200;
+  const PRELUDE_CHUNK_CHARS = 1800;
+  const sendCommandPrelude = async (batch: ActiveBatch): Promise<void> => {
+    const cap = cfg.approval.fullCommandPreludeChars;
+    if (cap <= 0 || batch.members.length !== 1) return;
+    if (batch.toolName !== "Bash" && batch.toolName !== "Shell") return;
+    const ti = batch.members[0]!.toolInput as Record<string, unknown> | null;
+    const cmd = ti && typeof ti.command === "string" ? ti.command : "";
+    if (cmd.length <= PRELUDE_TRIGGER_CHARS) return;
+    const text = cmd.length > cap ? `${cmd.slice(0, cap)}\n…（已截断，完整命令共 ${cmd.length} 字）` : cmd;
+    const chunks: string[] = [];
+    for (let i = 0; i < text.length; i += PRELUDE_CHUNK_CHARS) chunks.push(text.slice(i, i + PRELUDE_CHUNK_CHARS));
+    const target = targetChatId(batch.approver);
+    for (let i = 0; i < chunks.length; i++) {
+      const head = i === 0
+        ? `🔐 待审批完整命令（${cmd.length} 字${chunks.length > 1 ? `，${i + 1}/${chunks.length}` : ""}）：\n`
+        : `（${i + 1}/${chunks.length}）\n`;
+      await client.sendMessage(target, { msgtype: "markdown", markdown: { content: head + chunks[i]! } });
+    }
+  };
+
   // Flush 一个 batch: 单成员 → 普通卡 (与未启用聚合一致); 多成员 → 批量卡。
   // 发送失败时调用 failPending 让每位成员的 handler 走 fallbackOnError 路径,
   // 与单卡路径上 sendMessage 抛错时的语义一致。
@@ -1463,6 +1487,10 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
       // 成员的 sessionId 走(同 sessionId 才会被合到一起, 任取一个都对)。
       try { await flushBeforeCard?.(batch.sessionId, { toolName: batch.toolName, toolInput: batch.members[0]!.originalToolInput }); } catch (e) {
         log.warn({ batchId: batch.batchId, err: (e as Error).message }, "flushBatch flushBeforeCard failed; sending card anyway");
+      }
+      // 前置完整命令消息 (best-effort, 失败不阻断发卡)
+      try { await sendCommandPrelude(batch); } catch (e) {
+        log.warn({ batchId: batch.batchId, err: (e as Error).message }, "command prelude send failed");
       }
       const sendCard = (c: TemplateCard): Promise<unknown> =>
         client.sendMessage(targetChatId(batch.approver), { msgtype: "template_card", template_card: c });
