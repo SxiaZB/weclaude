@@ -11,11 +11,12 @@
 // pasted input, so it's not a useful mirror target). Linux-only (reads /proc);
 // returns [] elsewhere, degrading gracefully.
 import { spawn } from "node:child_process";
-import { readdirSync, readFileSync, existsSync, statSync, readlinkSync, openSync, readSync, closeSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync, statSync, readlinkSync } from "node:fs";
 import { join, basename } from "node:path";
 import { activeBackends, backendForPath, projectDirsFor, type CliBackendName } from "../shared/cli-backends.js";
 import { expandHome } from "../shared/paths.js";
 import { labelFor } from "./session-label.js";
+import { summarizeTail } from "./peers.js";
 
 export interface SessionInfo {
   sessionId: string;
@@ -188,61 +189,6 @@ const inferByCwd = (cwd: string, taken: Set<string>): { sessionId: string; jsonl
   return null;
 };
 
-// Extract the last ~3 user/assistant text turns from a transcript as a one-line
-// "what is this session doing" preview. Reads only the file tail (bounded), so
-// huge multi-MB transcripts don't get slurped fully into memory.
-const TAIL_BYTES = 64 * 1024;
-const summarize = (jsonlPath: string): string => {
-  if (!existsSync(jsonlPath)) return "(新会话 · 暂无对话)";
-  let fd: number | undefined;
-  try {
-    const size = statSync(jsonlPath).size;
-    const start = Math.max(0, size - TAIL_BYTES);
-    const len = Math.min(size, TAIL_BYTES);
-    const buf = Buffer.allocUnsafe(len);
-    fd = openSync(jsonlPath, "r");
-    const read = readSync(fd, buf, 0, len, start);
-    const lines = buf.subarray(0, read).toString("utf8").split("\n").filter((l) => l.trim());
-    const turns: string[] = [];
-    for (const line of lines) {
-      let row: Record<string, unknown>;
-      try {
-        row = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      const msg = (row.message ?? {}) as Record<string, unknown>;
-      const role = (msg.role ?? row.role) as string | undefined;
-      if (role !== "user" && role !== "assistant") continue;
-      if (row.isMeta) continue;
-      const c = msg.content ?? row.content;
-      let text = "";
-      if (typeof c === "string") text = c;
-      else if (Array.isArray(c))
-        text = c
-          .filter((b): b is { type: string; text?: string } => !!b && (b as { type?: string }).type === "text")
-          .map((b) => b.text || "")
-          .join(" ");
-      text = text
-        .replace(/<(system-reminder|command-[^>]*|local-command-[^>]*)>[\s\S]*?<\/\1>/g, "")
-        .replace(/\s+/g, " ")
-        .trim();
-      if (text) turns.push(`${role === "user" ? "你" : "AI"}: ${text.slice(0, 80)}`);
-    }
-    return turns.slice(-3).join(" | ") || "(暂无对话)";
-  } catch {
-    return "(无法读取对话)";
-  } finally {
-    if (fd !== undefined) {
-      try {
-        closeSync(fd);
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-};
-
 // Build pane_pid → {paneId, session}. We map the *pane's* root pid; the claude
 // worker is a descendant, so we walk its ppid chain up to find a matching pane.
 const tmuxPaneIndex = async (): Promise<Map<number, PaneOwner>> => {
@@ -317,7 +263,7 @@ export const scanClaudeSessions = async (): Promise<SessionInfo[]> => {
       tmuxSession: owner.session,
       tmuxPane: owner.paneId,
       lastActivity,
-      summary: summarize(jsonlPath),
+      summary: summarizeTail(jsonlPath),
       cli: backendForPath(jsonlPath).name,
     });
   };

@@ -32,8 +32,9 @@ import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl } from "./detail.js";
 import type { TurnUsage } from "./detail.js";
-import { labelFor, tagOfKey, withTagHeader } from "./session-label.js";
+import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "./session-label.js";
 import { randomTip } from "./tips.js";
+import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, type PeerInfo } from "./peers.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -327,12 +328,8 @@ const stripPrincipalPrefix = (s: string): string => {
 const tagOfTarget = tagOfKey;
 
 // Drop the `#tag` suffix — collapses tagged session keys to the chat-scoped
-// base principal (`user:xxx#foo` → `user:xxx`). Used to share cwd state
-// across all sessions that live in the same WeCom chat.
-const basePrincipalOf = (s: string): string => {
-  const h = s.indexOf("#");
-  return h >= 0 ? s.slice(0, h) : s;
-};
+// base principal. Shared with the peer/graph layer via session-label.
+const basePrincipalOf = baseOfKey;
 
 // Prefix outbound content with `<emoji> #tag` header (blank line separator)
 // when the target carries a `#tag` suffix. Untagged targets pass through
@@ -988,11 +985,6 @@ const capturePaneTail = async (target: string, rows = 12): Promise<string> => {
   return r.ok ? r.stdout : "";
 };
 
-// Strip ANSI SGR + CSI + OSC sequences so a slash-command stdout is safely
-// embeddable in a WeCom bubble. We don't try to preserve color — text only.
-const stripAnsi = (s: string): string =>
-  s.replace(/\x1B\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1B\][^\x07]*\x07/g, "");
-
 // Trim slash-command stdout to the useful section. TUI panels prepend a run
 // of leading whitespace / bar-chart glyph rows before the human-readable
 // title; we anchor at the first title line and drop everything above. The
@@ -1395,7 +1387,17 @@ export interface MirrorBridge {
   /** Detach + respawn a target's pane in `cfg.wrc.cwd` or its pendingCwd
    *  override. Used by /new to give the user a fresh claude in the bound
    *  project. Returns the new attachment result. */
-  newSession: (target: string, windowName?: string, cli?: CliBackendName) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
+  newSession: (target: string, windowName?: string, cli?: CliBackendName, opts?: { model?: string; cwd?: string }) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
+  /** Sibling sessions of `target`'s chat (default + every `#tag`), each with
+   *  liveness / busy / last-activity so an agent can see who else is working. */
+  peers: (target: string) => Promise<PeerInfo[]>;
+  /** Live tmux pane tail of `target` — what that agent's terminal shows right
+   *  now, including in-flight tool calls the transcript hasn't recorded yet. */
+  peekPane: (target: string, rows?: number) => Promise<{ ok: boolean; reason?: string; pane?: string; busy?: boolean }>;
+  /** Mid-turn check for one target. False for cold/dead panes (nothing running). */
+  isBusy: (target: string) => Promise<boolean>;
+  /** Latest assistant message of `target` — the handoff payload between agents. */
+  lastText: (target: string) => string;
 }
 
 interface ToolEntry {
@@ -2847,6 +2849,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     target: string,
     windowName?: string,
     cli?: CliBackendName,
+    opts?: { model?: string; cwd?: string },
   ): Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }> => {
     const prev = byTarget.get(target);
     // Resolution precedence (all chat-scoped except the running-cwd fallback):
@@ -2857,7 +2860,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // an already-spawned tagged pane on every base-cwd change.
     const chat = chatCwdFallback(target);
     const rec = !prev ? deps.store.get(target) : undefined;
+    // An explicit per-node cwd (graph spec) outranks every chat-scoped fallback:
+    // the point of declaring it is that this node lives in a different repo.
     const eff =
+      (opts?.cwd?.trim() ? expandHome(opts.cwd.trim()) : "") ||
       chat.pending ||
       (prev?.runningCwd?.trim()) ||
       (rec?.cwd?.trim()) ||
@@ -2884,6 +2890,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       windowName: windowName ?? target,
       cwdOverride: eff,
       cli: effCli,
+      model: opts?.model,
     });
     if (!r.ok) return { ok: false, reason: r.reason };
     const att = attach({
@@ -2995,8 +3002,86 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return { ok: false, reason: "no mirror binding for target — send a message in the WeCom chat first", runningCwd: "", pendingCwd: "" };
   };
 
+  // ── Peer graph (sibling sessions of one chat) ────────────────────────
+  // A chat's sessions are exactly the keys sharing its base principal: the
+  // untagged default plus every `#tag`. Live attachments are the truth; the
+  // persisted store fills in cold bindings so a peer nobody has talked to since
+  // the last reload is still discoverable (and revivable) rather than invisible.
+  const chatTargets = (target: string): string[] => {
+    const base = basePrincipalOf(target);
+    const keys = new Set([...byTarget.keys(), ...Object.keys(deps.store.all())]);
+    return Array.from(keys).filter((k) => basePrincipalOf(k) === base).sort();
+  };
+
+  const paneOf = (target: string): string =>
+    byTarget.get(target)?.tmuxPane || deps.store.get(target)?.tmuxPane || "";
+  const jsonlOf = (target: string): string =>
+    expandHome(byTarget.get(target)?.jsonlPath || deps.store.get(target)?.jsonlPath || "");
+
+  // Busy ≡ the pane is showing an interrupt hint. A dead or unbound pane is
+  // reported idle, not busy: "nothing is running there" is the truthful answer
+  // and it keeps a graph step from blocking forever on a session that vanished.
+  const paneBusy = async (pane: string): Promise<boolean> =>
+    !!pane && (await tmuxPaneAlive(pane)) && paneIsBusy(await capturePaneTail(pane, 12));
+
+  const isBusy = (target: string): Promise<boolean> => paneBusy(paneOf(target));
+
+  const lastText = (target: string): string => {
+    const p = jsonlOf(target);
+    return p ? lastAssistantText(p) : "";
+  };
+
+  const peers = async (target: string): Promise<PeerInfo[]> => {
+    const list = await Promise.all(
+      chatTargets(target).map(async (t): Promise<PeerInfo> => {
+        const a = byTarget.get(t);
+        const rec = deps.store.get(t);
+        const jsonlPath = jsonlOf(t);
+        const pane = paneOf(t);
+        const paneAlive = pane ? await tmuxPaneAlive(pane) : false;
+        const tag = tagOfTarget(t);
+        let lastActivity = 0;
+        try { if (jsonlPath) lastActivity = statSync(jsonlPath).mtimeMs; } catch { /* not written yet */ }
+        return {
+          target: t,
+          tag,
+          label: tag ? labelFor(tag) : "▫️",
+          sessionId: a?.sessionId || rec?.sessionId || "",
+          jsonlPath,
+          cwd: a?.runningCwd || rec?.cwd || expandedDefaultCwd,
+          cli: jsonlPath ? backendForPath(jsonlPath).name : (activeBackends()[0]?.name ?? "claude"),
+          tmuxPane: pane,
+          attached: !!a,
+          paneAlive,
+          busy: paneAlive ? paneIsBusy(await capturePaneTail(pane, 12)) : false,
+          lastActivity,
+          summary: jsonlPath ? summarizeTail(jsonlPath) : "(未绑定会话)",
+          self: t === target,
+        };
+      }),
+    );
+    return list.sort((x, y) => y.lastActivity - x.lastActivity);
+  };
+
+  // Capture a few extra rows then compact away the TUI's blank padding, so
+  // `rows` counts lines the user actually cares about.
+  const peekPane = async (
+    target: string,
+    rows = 24,
+  ): Promise<{ ok: boolean; reason?: string; pane?: string; busy?: boolean }> => {
+    const pane = paneOf(target);
+    if (!pane) return { ok: false, reason: "no tmux pane bound for target" };
+    if (!(await tmuxPaneAlive(pane))) return { ok: false, reason: "tmux pane no longer alive — the session needs /new or a respawn" };
+    const raw = await capturePaneTail(pane, Math.max(8, rows) + 12);
+    return { ok: true, pane: compactPane(raw, rows), busy: paneIsBusy(raw) };
+  };
+
   return {
     attach,
+    peers,
+    peekPane,
+    isBusy,
+    lastText,
     status: () => {
       const list = Array.from(bySessionId.values()).map((a) => ({
         sessionId: a.sessionId,
@@ -3132,7 +3217,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       }
     },
     injectText: async (target, text) => {
-      const a = byTarget.get(target);
+      // Lazy restore, same as dispatch: a peer session that hasn't been talked
+      // to in this process lifetime (or any session after a reload) has an empty
+      // in-memory slot but a perfectly good persisted binding. Without this, an
+      // agent driving a cold sibling gets "not attached" for a live pane.
+      const a = byTarget.get(target) ?? (await restoreFromStore(target));
       if (!a) return { ok: false, reason: "no mirror attached for target" };
       if (!text.trim()) return { ok: false, reason: "empty text" };
       // Pre-record so the tail's user-line emission is suppressed by the

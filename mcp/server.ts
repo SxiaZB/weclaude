@@ -340,5 +340,161 @@ server.registerTool(
   },
 );
 
+// ── Peer collaboration (agent ↔ agent inside one WeCom chat) ───────────────
+// One WeCom chat can host several concurrent agent sessions, each addressed by
+// a `#tag` (`#fix`, `#docs`, …) and each free to run a different CLI / model /
+// project. They are peers: siblings that can watch and drive each other. This
+// process can only see ITSELF, so every question about a sibling goes to the
+// daemon, which owns all the attachments.
+//
+// `selfRef` is how the daemon figures out which session is asking: sessionId
+// from env (frozen at MCP spawn — goes stale after a `/clear`) plus TMUX_PANE
+// (stable for the pane's lifetime), so one of the two always resolves.
+const selfRef = (): { sessionId?: string; tmuxPane?: string } => {
+  const sessionId =
+    process.env.CODEBUDDY_SESSION_ID ??
+    process.env.CLAUDE_CODE_SESSION_ID ??
+    process.env.CLAUDE_SESSION_ID;
+  const tmuxPane = process.env.TMUX_PANE?.trim();
+  return { ...(sessionId ? { sessionId } : {}), ...(tmuxPane ? { tmuxPane } : {}) };
+};
+
+const daemonPost = async (path: string, body: Record<string, unknown>): Promise<{ j: Record<string, unknown>; status: number }> => {
+  const resp = await fetch(`${DAEMON_BASE}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...selfRef(), ...body }),
+  });
+  return { j: (await resp.json().catch(() => ({}))) as Record<string, unknown>, status: resp.status };
+};
+
+const unwrap = (name: string, { j, status }: { j: Record<string, unknown>; status: number }) =>
+  j.ok ? ok(j) : fail(`${name} failed: ${(j.reason as string) ?? `http ${status}`}`);
+
+server.registerTool(
+  "list_peers",
+  {
+    title: "List sibling agent sessions in this chat",
+    description:
+      "List the OTHER agent sessions running in the SAME WeCom chat as this one. A chat hosts one default session plus any number of `#tag` sessions (e.g. `#fix`, `#review`), each with its own tmux pane, CLI, model and working directory. Returns for each peer: its tag, emoji label, cwd, CLI, whether its pane is alive, whether it is mid-turn (`busy`), when it last did anything, and a one-line summary of its recent conversation. `self: true` marks your own session. Call this FIRST whenever the user refers to another agent or tag — '#fix 进展如何', '还有谁在跑', '让 #docs 也看看' — then use peek_peer / send_peer / wait_peer to actually collaborate.",
+    inputSchema: {},
+  },
+  async () => unwrap("list_peers", await daemonPost("/peers/list", {})),
+);
+
+server.registerTool(
+  "peek_peer",
+  {
+    title: "See what a sibling agent is doing right now",
+    description:
+      "Observe another agent in this chat WITHOUT interrupting it: returns the live tail of its terminal (tmux pane — shows in-flight tool calls and prompts that its transcript hasn't recorded yet), whether it is currently mid-turn (`busy`), and its most recent complete reply (`lastText`). Use this to answer '查看 #fix 的进展' or to decide whether a peer needs a nudge. Read-only and safe to poll.",
+    inputSchema: {
+      tag: z.string().describe("The peer's tag WITHOUT '#', e.g. 'fix'. Empty string = the chat's default (untagged) session."),
+      rows: z.number().optional().describe("How many non-blank terminal lines to return (8-120, default 24)."),
+    },
+  },
+  async ({ tag, rows }) => unwrap("peek_peer", await daemonPost("/peers/peek", { tag, ...(rows ? { rows } : {}) })),
+);
+
+server.registerTool(
+  "send_peer",
+  {
+    title: "Send a message into a sibling agent's session",
+    description:
+      "Type a message into another agent's session in this chat, exactly as if the user had sent it there — the peer picks it up as a new turn. This is how you DRIVE a peer: unblock it, answer its question, hand it work, or tell it to keep going. Typical loop for '推动 #fix 直到结束': peek_peer → send_peer with the nudge → wait_peer until it goes idle → peek_peer again, repeat until its reply says it is done. If the peer's session doesn't exist yet, create it first (run_agent_graph declares nodes, or ask the user to `/new #tag`). Refuses to target your own session.",
+    inputSchema: {
+      tag: z.string().describe("The peer's tag WITHOUT '#', e.g. 'fix'. Empty string = the chat's default (untagged) session."),
+      text: z.string().describe("Message to inject. Plain prompt text; slash commands like '/clear' also work."),
+    },
+  },
+  async ({ tag, text }) => unwrap("send_peer", await daemonPost("/peers/send", { tag, text })),
+);
+
+server.registerTool(
+  "wait_peer",
+  {
+    title: "Wait until a sibling agent finishes its turn",
+    description:
+      "Block until the named peer stops working (its terminal no longer shows an interrupt hint), then return its latest reply. Use it after send_peer so you act on a finished answer instead of a half-written one. Returns `idle: false` with a reason if the timeout hits first — the peer is simply still working, so you can peek and wait again. Cheap: the daemon polls the pane, it does not consume tokens.",
+    inputSchema: {
+      tag: z.string().describe("The peer's tag WITHOUT '#'. Empty string = the chat's default session."),
+      timeoutSec: z.number().optional().describe("Max seconds to wait (10-7200, default 900)."),
+    },
+  },
+  async ({ tag, timeoutSec }) => unwrap("wait_peer", await daemonPost("/peers/wait", { tag, ...(timeoutSec ? { timeoutSec } : {}) })),
+);
+
+server.registerTool(
+  "run_agent_graph",
+  {
+    title: "Run a loop graph over several tagged agents",
+    description:
+      "Declare a multi-agent loop inside this chat and let the daemon drive it. `nodes` are the participating `#tag` sessions (each may pick its own cli / model / cwd; missing sessions are spawned, existing ones are reused with their context intact). `steps` is the ordered pipeline — each step sends a prompt to one node, waits for it to finish, captures its reply, and feeds it forward. The step list is walked `rounds` times, which is what makes it a LOOP: `fix → review → fix → review …` until `until` appears in a reply or the rounds run out. Prompt templates may reference earlier output: `{{last}}` = the previous step's reply, `{{<tag>}}` = that node's latest reply, `{{round}}` = round number. Returns a runId immediately and narrates progress into the chat; poll with graph_status, cancel with stop_graph. Use this when the user asks for several agents to work together / review each other / iterate to a conclusion. For a one-off nudge to a single peer, prefer send_peer + wait_peer.",
+    inputSchema: {
+      nodes: z
+        .array(
+          z.object({
+            tag: z.string().describe("Session tag without '#', e.g. 'fix'."),
+            cli: z.enum(["claude", "claude-internal", "codebuddy"]).optional().describe("CLI backend for this node. Omit to inherit the chat's."),
+            model: z.string().optional().describe("Model slug passed as --model when the node has to be spawned, e.g. 'opus' / 'haiku'. Ignored for an already-running session."),
+            cwd: z.string().optional().describe("Absolute project path for this node. Omit to inherit the chat's."),
+          }),
+        )
+        .describe("Participating sessions. Every step's `to` must name one of these tags."),
+      steps: z
+        .array(
+          z.object({
+            to: z.string().describe("Tag of the node this step drives."),
+            prompt: z.string().describe("Prompt template. Supports {{last}}, {{<tag>}}, {{round}}."),
+          }),
+        )
+        .describe("Ordered pipeline, replayed once per round."),
+      rounds: z.number().optional().describe("How many times to walk the step list (1-50, default 1). >1 makes it a genuine loop."),
+      until: z.string().optional().describe("Case-insensitive substring; when a node's reply contains it the run stops early and reports 'converged'. E.g. 'LGTM' or 'DONE'."),
+      idleTimeoutSec: z.number().optional().describe("Per-step ceiling on waiting for a node to finish (30-7200, default 900). A timeout is reported but the graph keeps walking."),
+    },
+  },
+  async ({ nodes, steps, rounds, until, idleTimeoutSec }) =>
+    unwrap(
+      "run_agent_graph",
+      await daemonPost("/graph/run", {
+        nodes,
+        steps,
+        ...(rounds ? { rounds } : {}),
+        ...(until ? { until } : {}),
+        ...(idleTimeoutSec ? { idleTimeoutSec } : {}),
+      }),
+    ),
+);
+
+server.registerTool(
+  "graph_status",
+  {
+    title: "Inspect running / finished agent graphs",
+    description:
+      "Report progress of loop graphs started by run_agent_graph: per-step round, target tag, status (running / done / timeout / error) and each node's captured reply. Omit runId to list every graph belonging to this chat. Note graphs live in daemon memory — a daemon reload clears them (the panes survive).",
+    inputSchema: {
+      runId: z.string().optional().describe("Run id from run_agent_graph. Omit to list all runs for this chat."),
+    },
+  },
+  async ({ runId }) => {
+    const qs = runId ? `?runId=${encodeURIComponent(runId)}` : "";
+    const resp = await fetch(`${DAEMON_BASE}/graph/status${qs}`);
+    const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+    return j.ok ? ok(j) : fail(`graph_status failed: ${j.reason ?? `http ${resp.status}`}`);
+  },
+);
+
+server.registerTool(
+  "stop_graph",
+  {
+    title: "Cancel a running agent graph",
+    description:
+      "Stop a loop graph after its current step. Does NOT interrupt the agent that is mid-turn — it finishes, then no further steps are dispatched. Use when the user says to abort the loop.",
+    inputSchema: { runId: z.string().describe("Run id from run_agent_graph.") },
+  },
+  async ({ runId }) => unwrap("stop_graph", await daemonPost("/graph/stop", { runId })),
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

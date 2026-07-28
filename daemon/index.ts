@@ -24,6 +24,18 @@ import { makeWedocBridge } from "./wedoc.js";
 import { installResponseTracker } from "./last-response.js";
 import { scanClaudeSessions } from "./session-scan.js";
 import { startScheduler, publish as publishTopic } from "./topics.js";
+import { baseOfKey, keyOf } from "./session-label.js";
+import {
+  startGraph,
+  stopRun,
+  getRun,
+  listRuns,
+  validateSpec,
+  waitForIdle,
+  type GraphSpec,
+  type GraphNodeSpec,
+  type GraphStepSpec,
+} from "./graph.js";
 
 // pino's file transport is async; without flush, log.fatal before process.exit
 // vanishes. Mirror anything fatal to stderr too so launchd's stderr.log captures it.
@@ -338,6 +350,151 @@ const main = async (): Promise<void> => {
       const r = m.setPendingCwd(target, cwd);
       json(res, r.ok ? 200 : 400, { ...r, target });
     });
+    // ── Peer collaboration + loop graph ────────────────────────────────
+    // These routes let the Claude inside one pane act on its SIBLINGS: the
+    // other `#tag` sessions of the same WeCom chat. An MCP tool can only see
+    // its own process, so the daemon — which owns every attachment — is the
+    // only place that can answer "what is #fix doing" or "inject this into
+    // #review". Callers identify themselves the same way /mirror/cwd does:
+    // explicit target → sessionId → tmuxPane (stable across /clear) →
+    // defaultChat.
+    const resolveSelf = (b: Partial<{ target: string; sessionId: string; tmuxPane: string }>): string => {
+      const explicit = (b.target ?? "").trim();
+      if (explicit) return explicit;
+      const bySid = b.sessionId?.trim() ? m.targetForSession(b.sessionId.trim()) : undefined;
+      if (bySid) return bySid;
+      const byPane = b.tmuxPane?.trim() ? m.targetForPane(b.tmuxPane.trim()) : undefined;
+      if (byPane) return byPane;
+      return (cfg.defaultChat ?? "").trim();
+    };
+    // Peer addressed by tag. Empty tag = the chat's default (untagged) session,
+    // which is a legitimate collaboration target ("report back to the main one").
+    const peerTarget = (self: string, tag: string): string =>
+      keyOf(baseOfKey(self), (tag ?? "").trim().replace(/^#/, ""));
+
+    interface PeerBody { target?: string; sessionId?: string; tmuxPane?: string; tag?: string }
+    const readPeerBody = async (req: import("node:http").IncomingMessage): Promise<{ self: string; body: PeerBody }> => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as PeerBody;
+      return { self: resolveSelf(body), body };
+    };
+
+    http.register("POST /peers/list", async (req, res) => {
+      const { self } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session (pass target/sessionId/tmuxPane)" }); return; }
+      const peers = await m.peers(self);
+      json(res, 200, { ok: true, self, base: baseOfKey(self), peers });
+    });
+
+    http.register("POST /peers/peek", async (req, res) => {
+      const { self, body } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const target = peerTarget(self, body.tag ?? "");
+      const rows = Math.min(Math.max(Number((body as { rows?: number }).rows ?? 24) || 24, 8), 120);
+      const peek = await m.peekPane(target, rows);
+      // The pane may be gone (closed window) while the transcript survives —
+      // still answer with the last reply so the caller learns something.
+      json(res, 200, {
+        ok: true,
+        target,
+        pane: peek.pane ?? "",
+        paneError: peek.ok ? undefined : peek.reason,
+        busy: peek.busy ?? false,
+        lastText: m.lastText(target),
+      });
+    });
+
+    http.register("POST /peers/send", async (req, res) => {
+      const { self, body } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const text = ((body as { text?: string }).text ?? "").toString();
+      if (!text.trim()) { json(res, 400, { ok: false, reason: "text required" }); return; }
+      const target = peerTarget(self, body.tag ?? "");
+      // Injecting into your own pane would type into the box you're generating
+      // from — Claude Code queues it and the caller deadlocks waiting for itself.
+      if (target === self) { json(res, 400, { ok: false, reason: "refusing to inject into the calling session itself" }); return; }
+      const r = await m.injectText(target, text);
+      json(res, r.ok ? 200 : 502, { ...r, target });
+    });
+
+    http.register("POST /peers/wait", async (req, res) => {
+      const { self, body } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const target = peerTarget(self, body.tag ?? "");
+      if (target === self) { json(res, 400, { ok: false, reason: "refusing to wait on the calling session itself" }); return; }
+      const timeoutMs = Math.min(Math.max(Number((body as { timeoutSec?: number }).timeoutSec ?? 900) || 900, 10), 7200) * 1000;
+      const r = await waitForIdle(target, m.isBusy, timeoutMs, () => false);
+      json(res, 200, { ok: true, target, idle: r.idle, reason: r.reason, lastText: m.lastText(target) });
+    });
+
+    // POST /graph/run — declare a loop graph over this chat's tagged sessions
+    // and start walking it. Fire-and-forget: returns a runId immediately, then
+    // narrates progress into the chat while it advances.
+    http.register("POST /graph/run", async (req, res) => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as Partial<{
+        target: string; sessionId: string; tmuxPane: string;
+        nodes: GraphNodeSpec[]; steps: GraphStepSpec[];
+        rounds: number; until: string; idleTimeoutSec: number;
+      }>;
+      const self = resolveSelf(body);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const spec: GraphSpec = {
+        base: baseOfKey(self),
+        nodes: Array.isArray(body.nodes) ? body.nodes : [],
+        steps: Array.isArray(body.steps) ? body.steps : [],
+        rounds: body.rounds,
+        until: body.until,
+        idleTimeoutSec: body.idleTimeoutSec,
+      };
+      const bad = validateSpec(spec);
+      if (bad) { json(res, 400, { ok: false, reason: bad }); return; }
+      const graphLog = log.child({ mod: "graph", base: spec.base });
+      const run = startGraph(spec, {
+        // Reuse a live tagged pane; only spawn when the node doesn't exist yet
+        // (or its pane died). Re-spawning a healthy node would throw away the
+        // context that makes a multi-round loop worth running.
+        ensureNode: async (target, node) => {
+          const existing = (await m.peers(target)).find((p) => p.target === target);
+          if (existing?.paneAlive) return { ok: true };
+          const r = await m.newSession(target, node.tag, node.cli, { model: node.model, cwd: node.cwd });
+          return { ok: r.ok, reason: r.reason };
+        },
+        send: (target, text) => m.injectText(target, text),
+        isBusy: m.isBusy,
+        lastText: async (target) => m.lastText(target),
+        notify: (base, markdown) => {
+          const chatId = base.replace(/^(user|chat|group):/, "");
+          void ws.client
+            .sendMessage(chatId, { msgtype: "markdown", markdown: { content: markdown } })
+            .catch((e: unknown) => graphLog.warn({ err: (e as Error).message }, "graph notify failed"));
+        },
+        log: graphLog,
+      });
+      json(res, 200, { ok: true, runId: run.runId, base: run.base, nodes: spec.nodes.length, steps: spec.steps.length, rounds: spec.rounds ?? 1 });
+    });
+
+    http.register("GET /graph/status", (req, res) => {
+      const u = new URL(req.url ?? "", "http://x");
+      const runId = (u.searchParams.get("runId") ?? "").trim();
+      if (runId) {
+        const run = getRun(runId);
+        json(res, run ? 200 : 404, run ? { ok: true, run } : { ok: false, reason: `unknown runId ${runId}` });
+        return;
+      }
+      const base = (u.searchParams.get("target") ?? "").trim();
+      json(res, 200, { ok: true, runs: listRuns(base ? baseOfKey(base) : undefined) });
+    });
+
+    http.register("POST /graph/stop", async (req, res) => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as Partial<{ runId: string }>;
+      const runId = (body.runId ?? "").trim();
+      if (!runId) { json(res, 400, { ok: false, reason: "runId required" }); return; }
+      const stopped = stopRun(runId);
+      json(res, stopped ? 200 : 404, stopped ? { ok: true, runId } : { ok: false, reason: `run ${runId} not found or already finished` });
+    });
+
     http.register("GET /mirror/cwd", async (req, res) => {
       const u = new URL(req.url ?? "", "http://x");
       let target = (u.searchParams.get("target") ?? "").trim();

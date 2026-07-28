@@ -126,6 +126,10 @@ export interface SpawnArgs {
   /** Which CLI to launch. Undefined → `wrc.defaultCli`. A respawn should pass
    *  the backend that owns `resumeSessionId`, else the resume finds no session. */
   cli?: CliBackendName;
+  /** Model slug for `--model`. Lets sibling `#tag` sessions in one chat run on
+   *  different models (a graph node can pick opus for design, haiku for lint).
+   *  Undefined → the CLI's own default. */
+  model?: string;
 }
 
 export interface SpawnResult {
@@ -196,7 +200,7 @@ export const trustWorkspace = (claudeBin: string, cwd: string, log: Logger): voi
   }
 };
 
-export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, cwdOverride, cli }: SpawnArgs): Promise<SpawnResult> => {
+export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, cwdOverride, cli, model }: SpawnArgs): Promise<SpawnResult> => {
   const backend = backendFor(cfg, cli);
   const cwd = expandHome((cwdOverride ?? "").trim() || cfg.wrc.cwd);
   const projectDir = join(expandHome(backend.projectsDir), backend.encodeProjectDir(cwd));
@@ -261,6 +265,7 @@ export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, c
     "DISABLE_AUTOUPDATER=1",
     backend.bin,
     ...(resumeSessionId ? ["--resume", sessionId] : ["--session-id", sessionId]),
+    ...(model?.trim() ? ["--model", model.trim()] : []),
     ...cfg.wrc.extraArgs,
   ].map((a, i) => (i === 0 ? a : shQuote(a))).join(" ");
   const sent = await runTmux(["send-keys", "-t", tmuxPane, cmd, "Enter"]);

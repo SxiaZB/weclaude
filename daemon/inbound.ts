@@ -7,6 +7,7 @@ import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import type { Bridge } from "./cc-bridge.js";
 import type { MirrorBridge } from "./mirror-bridge.js";
+import type { PeerInfo } from "./peers.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
 import type { CliBackendName } from "../shared/cli-backends.js";
 import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim } from "./claim.js";
@@ -165,6 +166,13 @@ const renderHelp = (): string =>
     "`/clear #tag`、`/pwd #tag`、`/stop #tag` 等命令同理按 tag 路由。",
     "`#tag` 与 CLI 名可同时写:`/new codebuddy #docs` = 用 codebuddy 开 docs 会话。",
     "",
+    "▎多会话协作",
+    "`/peers` 列出本聊天的所有会话及忙闲状态",
+    "同一聊天内的会话互为 peer,可以互相观察和驱动。直接说人话即可:",
+    "「看下 `#fix` 的进展,推动它直到结束」— AI 会读它的终端、注入指令、等它跑完。",
+    "「让 `#fix` 和 `#review` 互相迭代到 review 说 LGTM」— AI 会建一个 loop graph,",
+    "把多个带 tag 的会话(可各用不同 CLI / 模型)串成流水线并循环驱动。",
+    "",
     "▎信息 (免授权)",
     "`/id` 查看会话/权限 id",
     "`/pwd` 当前项目路径",
@@ -237,6 +245,29 @@ const renderSessionsList = (sessions: SessionInfo[], currentSid: string): string
     "[weclaude] 正在运行的会话：",
     ...lines,
     "> 切换：`/sessions <emoji 或 id>`，如 `/sessions 🐼`",
+  ].join("\n");
+};
+
+// /peers — roster of the sessions living in THIS chat (default + every `#tag`).
+// Distinct from /sessions, which sweeps the whole host: peers are the ones an
+// agent here can actually collaborate with (shared chat = shared address space).
+const isPeersCommand = (text: string): boolean => /^\/(?:peers?|agents?)$/iu.test(text.trim());
+
+const renderPeers = (peers: PeerInfo[]): string => {
+  if (peers.length === 0) return "[weclaude] 本聊天还没有会话。发消息或 `/new` 建一个。";
+  const mixed = new Set(peers.map((p) => p.cli)).size > 1;
+  const lines = peers.map((p) => {
+    const name = p.tag ? `\`#${p.tag}\`` : "默认";
+    const state = !p.paneAlive ? "⚫️ 已关闭" : p.busy ? "🔴 忙" : "🟢 空闲";
+    const dir = p.cwd.replace(/^.*\//, "") || p.cwd;
+    const cli = mixed ? ` _(${p.cli})_` : "";
+    const me = p.self ? " ⬅️ 本会话" : "";
+    return [`${p.label} ${name} · ${dir}${cli} · ${state}${me}`, `　${p.summary.slice(0, 90)}`].join("\n");
+  });
+  return [
+    "[weclaude] 本聊天的会话：",
+    ...lines,
+    "> 协作：直接说「看下 #fix 的进展并推动它」，AI 会读它的终端并注入指令",
   ].join("\n");
 };
 
@@ -693,6 +724,22 @@ export const installInboundRouter = (
         const r = await bridge.submitPane(who);
         await replyText(frame, msg, who, r.ok ? "✅ Enter sent" : `[weclaude] /n failed: ${r.reason ?? "unknown"}`);
       }
+      return { stop: true };
+    }
+    // /peers — this chat's own session roster (default + `#tag` siblings), with
+    // live busy state. Read-only, mirror-mode only.
+    if (isPeersCommand(text)) {
+      if (!("peers" in bridge)) {
+        await replyText(frame, msg, who, "[weclaude] /peers only available in mirror mode");
+        return { stop: true };
+      }
+      let body: string;
+      try {
+        body = renderPeers(await bridge.peers(who));
+      } catch (e) {
+        body = `[weclaude] /peers failed: ${(e as Error).message}`;
+      }
+      await replyText(frame, msg, who, body);
       return { stop: true };
     }
     // /sessions [arg] — list live Claude sessions, or switch the mirror to one.

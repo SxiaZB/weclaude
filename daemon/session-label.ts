@@ -45,6 +45,17 @@ export const tagOfKey = (target: string | undefined): string => {
   return h >= 0 ? target.slice(h + 1) : "";
 };
 
+/** Drop the `#tag` suffix — collapses a tagged session key to the chat-scoped
+ *  base principal (`user:xxx#foo` → `user:xxx`). Everything shared across a
+ *  chat's sessions (cwd, peer discovery, graph runs) keys off this. */
+export const baseOfKey = (target: string): string => {
+  const h = target.indexOf("#");
+  return h >= 0 ? target.slice(0, h) : target;
+};
+
+/** Compose a session key from a base principal and a tag ("" → default session). */
+export const keyOf = (base: string, tag: string): string => (tag ? `${base}#${tag}` : base);
+
 /** Trailing-space emoji badge for card titles; "" for untagged targets. */
 export const tagBadge = (target: string | undefined): string => {
   const tag = tagOfKey(target);
