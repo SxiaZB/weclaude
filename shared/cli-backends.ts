@@ -11,6 +11,9 @@
 // TranscriptLine shape that mirror-bridge's renderLine consumes. Claude backends
 // are identity; codebuddy does the schema adapter work.
 
+import { join } from "node:path";
+import { expandHome } from "./paths.js";
+
 export type CliBackendName = "claude" | "claude-internal" | "codebuddy";
 
 // Normalized transcript line — structurally compatible with mirror-bridge's
@@ -95,10 +98,11 @@ const encodeClaude = (absCwd: string): string => absCwd.replace(/[/.]/g, "-");
 const encodeCodebuddy = (absCwd: string): string =>
   absCwd.replace(/^[/]+/, "").replace(/[/.]/g, "-");
 
-// Module-level encoder, bound once at daemon boot via bindCliBackend(). Defaults
-// to Claude's dialect so the daemon works out-of-the-box for claude / claude-
-// internal. mirror-bridge + spawn-tmux import this instead of defining their
-// own, so a backend switch (claude → codebuddy) flips every call site at once.
+// Module-level encoder, bound at daemon boot via bindCliBackends(). Defaults to
+// Claude's dialect so the daemon works out-of-the-box. This is the PRIMARY
+// backend's encoder — correct for *write* paths (where a new session's jsonl
+// will land). Read paths must go through projectDirsFor/backendForPath instead,
+// which consider every active backend.
 let _encodeProjectDir: (absCwd: string) => string = encodeClaude;
 export const encodeProjectDir = (absCwd: string): string => _encodeProjectDir(absCwd);
 
@@ -300,4 +304,111 @@ export const bindCliBackend = (cfg: CliBackendsConfig): CliBackend => {
   const backend = resolveCliBackend(cfg);
   _encodeProjectDir = backend.encodeProjectDir;
   return backend;
+};
+
+// ── Multi-backend registry ──────────────────────────────────────────────
+//
+// The daemon mirrors sessions from EVERY installed CLI at once, not just the
+// primary one: a user can have `claude` in one tmux pane and `codebuddy` in
+// another, each bound to a different WeCom chat. Since a session's identity on
+// disk *is* its transcript path, the path is the discriminant — `backendForPath`
+// recovers which CLI wrote a jsonl, and every downstream decision (which binary
+// to `--resume` with, which jsonl schema to normalize, which project-dir
+// encoding to compare panes against) derives from that instead of a global.
+//
+// `primaryBackend()` remains the tie-breaker for *write* paths — spawning a new
+// session has no path to derive from, so it uses `defaultCli`.
+
+const backendWithBin = (name: CliBackendName, cfg: CliBackendsConfig): CliBackend => {
+  const base = CLI_BACKEND_DEFAULTS[name];
+  const explicit = cfg.cliBackends?.[name]?.bin;
+  return explicit ? { ...base, bin: explicit } : base;
+};
+
+let _backends: readonly CliBackend[] = [CLI_BACKEND_DEFAULTS.claude];
+let _primary: CliBackend = CLI_BACKEND_DEFAULTS.claude;
+
+/** Active backends, primary first. Read-only snapshot of the last bind. */
+export const activeBackends = (): readonly CliBackend[] => _backends;
+/** Backend used when there is no path to derive one from (new-session spawns). */
+export const primaryBackend = (): CliBackend => _primary;
+
+/**
+ * Resolve the primary backend and register every other known backend alongside
+ * it. Zero-config: install codebuddy and its sessions become mirrorable without
+ * touching config.jsonc.
+ *
+ * Deliberately does NOT probe for each root's existence. That probe ran once at
+ * boot, so a CLI first used *after* the daemon started stayed invisible until a
+ * reload — and it bought nothing: a nonexistent root never prefix-matches in
+ * backendForPath, and every read path (rankedJsonlsForCwd, findJsonlBySid,
+ * session-scan's roots) already tolerates a missing directory.
+ */
+export const bindCliBackends = (
+  cfg: CliBackendsConfig & { projectsDirOverride?: string },
+): { primary: CliBackend; backends: readonly CliBackend[] } => {
+  const resolved = resolveCliBackend(cfg);
+  // An explicit `mirror.projectsDir` retargets the PRIMARY backend only — it is
+  // the pre-multi-CLI escape hatch for a nonstandard transcript root, and has no
+  // meaning for the other backends.
+  const override = (cfg.projectsDirOverride ?? "").trim();
+  const primary: CliBackend =
+    override && override !== resolved.projectsDir ? { ...resolved, projectsDir: override } : resolved;
+
+  const secondaries = (Object.keys(CLI_BACKEND_DEFAULTS) as CliBackendName[])
+    .filter((n) => n !== primary.name)
+    .map((n) => backendWithBin(n, cfg));
+
+  _primary = primary;
+  _backends = [primary, ...secondaries];
+  _encodeProjectDir = primary.encodeProjectDir;
+  return { primary, backends: _backends };
+};
+
+/**
+ * Register a backend as active at runtime, returning the already-known
+ * descriptor if there is one. `bindCliBackends` only admits secondaries whose
+ * transcript root already exists — a CLI that is installed but has never run
+ * has none, so the FIRST session spawned with it would be invisible to
+ * `backendForPath` (mirrored with the primary's jsonl dialect, resumed with the
+ * primary's binary). Spawning with an explicit `cli` calls this so the registry
+ * learns the backend before its transcript appears on disk.
+ */
+export const activateBackend = (backend: CliBackend): CliBackend => {
+  const known = _backends.find((b) => b.name === backend.name);
+  if (known) return known;
+  _backends = [..._backends, backend];
+  return backend;
+};
+
+/**
+ * Recover the backend that owns an absolute transcript path, by longest
+ * projectsDir prefix match. Falls back to primary for paths outside every known
+ * root (custom `mirror.projectsDir`, or a jsonl handed in by `/wrc` from a
+ * location we don't manage) — treating an unknown transcript as the primary
+ * dialect is what the single-backend code already did.
+ */
+export const backendForPath = (absPath: string): CliBackend =>
+  _backends
+    .map((b) => ({ b, root: expandHome(b.projectsDir) }))
+    .filter(({ root }) => absPath === root || absPath.startsWith(`${root}/`))
+    .sort((x, y) => y.root.length - x.root.length)[0]?.b ?? _primary;
+
+/**
+ * Every candidate `<projectsDir>/<encoded(cwd)>` across active backends, primary
+ * first. Callers filter by existence and rank by mtime — a cwd can legitimately
+ * have transcripts under two backends at once (same project, both CLIs used).
+ */
+export const projectDirsFor = (absCwd: string): Array<{ backend: CliBackend; dir: string }> =>
+  _backends.map((b) => ({ backend: b, dir: join(expandHome(b.projectsDir), b.encodeProjectDir(absCwd)) }));
+
+/**
+ * The project dir `cwd` would encode to *under the same backend that owns
+ * `refPath`*. Used for "is this pane still in the project dir its transcript
+ * lives in?" checks — comparing against the primary encoding would report a
+ * spurious drift for every non-primary session.
+ */
+export const projectDirFor = (refPath: string, absCwd: string): string => {
+  const b = backendForPath(refPath);
+  return join(expandHome(b.projectsDir), b.encodeProjectDir(absCwd));
 };

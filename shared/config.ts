@@ -33,11 +33,12 @@ const Daemon = z.object({
 });
 
 const Mirror = z.object({
-  // Where Claude Code writes per-project transcripts. Forks like `claude-internal`
-  // use a parallel dir (e.g. `~/.claude-internal/projects`). The mirror tails
-  // `<projectsDir>/<encoded(wrc.cwd)>/<sid>.jsonl`. Empty → auto-derive from
-  // `wrc.claudeBin` basename (handled by the Wrc transform below): `claude` →
-  // `~/.claude/projects`, `claude-internal` → `~/.claude-internal/projects`.
+  // Transcript root for the DEFAULT backend only — an escape hatch for a
+  // nonstandard location. Empty → auto-derived from `defaultCli` (`claude` →
+  // `~/.claude/projects`, `claude-internal` → `~/.claude-internal/projects`,
+  // `codebuddy` → `~/.codebuddy/projects`). Other installed backends always use
+  // their own built-in roots; the mirror probes all of them, so setting this
+  // does not narrow which CLIs can be mirrored.
   projectsDir: z.string().default(""),
   // Pin a specific Claude session to mirror. Empty → auto-pick latest .jsonl
   // under `<projectsDir>/<encoded(wrc.cwd)>/` by mtime.
@@ -102,8 +103,11 @@ const Wrc = z.object({
   // — resolveCliBackend picks it up when cliBackends.<name>.bin is unset. Kept
   // on the schema so existing configs keep parsing without migration.
   claudeBin: z.string().default("claude"),
-  // Active CLI backend. Drives projectsDir auto-derive, encodeProjectDir, and
-  // (Phase 3) transcript-line normalization + slash-tag dialect. Optional —
+  // DEFAULT CLI backend — the one used when there is no transcript to derive a
+  // backend from (new-session spawns, headless mode). It is NOT exclusive: the
+  // daemon mirrors sessions from every installed CLI concurrently, resolving
+  // each attachment's binary + jsonl dialect from its own transcript path
+  // (shared/cli-backends.ts bindCliBackends / backendForPath). Optional —
   // when unset, resolveCliBackend infers from claudeBin basename (so legacy
   // `claudeBin: "claude-internal"` configs still resolve correctly without
   // needing to also set defaultCli). The Wrc transform below pins the inferred

@@ -19,7 +19,15 @@ import type { WSClient, WsFrame, WsFrameHeaders, EventMessageWith, TemplateCard,
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
-import { encodeProjectDir, resolveCliBackend, type NormalizedTranscriptLine } from "../shared/cli-backends.js";
+import {
+  activeBackends,
+  backendForPath,
+  type CliBackend,
+  type CliBackendName,
+  projectDirFor,
+  projectDirsFor,
+  type NormalizedTranscriptLine,
+} from "../shared/cli-backends.js";
 import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl } from "./detail.js";
@@ -47,10 +55,11 @@ const augmentedPath = (orig: string | undefined): string => {
     .join(":");
 };
 
-// Project-dir encoding is backend-specific (Claude: leading `-`, CodeBuddy:
-// none). Imported from shared/cli-backends — bound once at daemon boot via
-// bindCliBackend(). The encodeProjectDir re-export below is the bound function.
-// (Old local definition removed in Phase 3 — was: absCwd.replace(/[/.]/g, "-").)
+// Backend resolution is per-transcript, not global: `backendForPath` recovers
+// which CLI wrote a jsonl from its projects root, so claude / claude-internal /
+// codebuddy sessions can be mirrored side by side. `projectDirFor` re-encodes a
+// cwd under that same backend's dialect (Claude: leading `-`, CodeBuddy: none)
+// so pane-drift comparisons stay apples-to-apples.
 
 // Pull the bound session's actual project cwd from its transcript head. Each
 // jsonl line carries a `cwd` field; the encoded directory name is lossy (both
@@ -84,39 +93,57 @@ interface ResolvedSession {
   jsonlPath: string;
 }
 
-// Newest-mtime *.jsonl in the encoded project dir for `cwd`. A `/clear` (or a
-// native `/new`) rotation always leaves a fresh jsonl here, so this is how the
-// mirror re-finds the live session after a rotation it didn't itself record —
-// used by resolveSession's auto-pick and by restoreFromStore's heal path.
-const latestJsonlForCwd = (cfg: Config, cwd: string): ResolvedSession | undefined => {
-  const projectDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(expandHome(cwd)));
-  if (!existsSync(projectDir)) return undefined;
-  const top = readdirSync(projectDir)
-    .filter((n) => n.endsWith(".jsonl"))
-    .map((n) => ({ name: n, mtime: statSync(join(projectDir, n)).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime)[0];
-  if (!top) return undefined;
-  return { sessionId: top.name.replace(/\.jsonl$/, ""), jsonlPath: join(projectDir, top.name) };
+// Every *.jsonl under `cwd`'s project dir, ranked newest-mtime first. A cwd can
+// hold transcripts from more than one CLI (same project opened in claude and in
+// codebuddy), so the default is the union across all active backends — that is
+// what lets a fresh session be discovered regardless of which binary wrote it.
+//
+// `only` narrows to a single backend. Every path that RE-BINDS an existing
+// attachment must pass it: healing a claude chat onto the codebuddy transcript
+// that merely happens to be newer in the same directory would hand the chat to
+// a session it can neither resume (`claude --resume` wouldn't find the sid) nor
+// parse (wrong jsonl dialect). Only genuine discovery searches the union.
+const rankedJsonlsForCwd = (
+  cwd: string,
+  only?: CliBackend,
+): Array<{ sessionId: string; jsonlPath: string; mtime: number }> =>
+  projectDirsFor(expandHome(cwd))
+    .filter(({ backend }) => !only || backend.name === only.name)
+    .flatMap(({ dir }) => {
+      let names: string[];
+      try { names = readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { return []; }
+      return names.flatMap((n) => {
+        const p = join(dir, n);
+        try { return [{ sessionId: n.replace(/\.jsonl$/, ""), jsonlPath: p, mtime: statSync(p).mtimeMs }]; }
+        catch { return []; }
+      });
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+
+// Newest-mtime *.jsonl in the project dir(s) for `cwd`. A `/clear` (or a native
+// `/new`) rotation always leaves a fresh jsonl here, so this is how the mirror
+// re-finds the live session after a rotation it didn't itself record — used by
+// resolveSession's auto-pick and by restoreFromStore's heal path.
+const latestJsonlForCwd = (cwd: string, only?: CliBackend): ResolvedSession | undefined => {
+  const top = rankedJsonlsForCwd(cwd, only)[0];
+  return top ? { sessionId: top.sessionId, jsonlPath: top.jsonlPath } : undefined;
 };
 
-// Locate a transcript by sessionId across every sibling project dir under the
-// projects root. Claude Code's EnterWorktree/ExitWorktree relocate the SAME-sid
+// Locate a transcript by sessionId across every sibling project dir of every
+// active backend. Claude Code's EnterWorktree/ExitWorktree relocate the SAME-sid
 // jsonl between <cwd> and <cwd>/.claude/worktrees/<name> — each cwd encodes to
 // its own project dir, so the path moves but the sid doesn't. It's a rename
 // (byte prefix preserved), so a tail can follow it with a continuous offset.
 // Newest-mtime wins if a stale sibling lingers.
-const findJsonlBySid = (projectsRoot: string, sid: string): string | undefined => {
+const findJsonlBySid = (sid: string, only?: CliBackend): string | undefined => {
   const sidFile = `${sid}.jsonl`;
-  try {
-    return readdirSync(projectsRoot)
-      .flatMap((d) => {
-        const p = join(projectsRoot, d, sidFile);
-        try { return [{ p, m: statSync(p).mtimeMs }]; } catch { return []; }
-      })
-      .sort((a, b) => b.m - a.m)[0]?.p;
-  } catch {
-    return undefined;
-  }
+  return (only ? [only] : activeBackends())
+    .flatMap((b) => {
+      const root = expandHome(b.projectsDir);
+      try { return readdirSync(root).map((d) => join(root, d, sidFile)); } catch { return []; }
+    })
+    .flatMap((p) => { try { return [{ p, m: statSync(p).mtimeMs }]; } catch { return []; } })
+    .sort((a, b) => b.m - a.m)[0]?.p;
 };
 
 // True if `path` holds at least one real (non-meta, non-sidechain) user line —
@@ -161,40 +188,37 @@ const findInjectOffset = (path: string, fp: string): number | undefined => {
   } catch { return undefined; }
 };
 
-// Newest-mtime *.jsonl WITH user content in cwd's encoded project dir. The
-// content gate skips an empty just-touched file so we bind the real session.
-// Reliable for worktree dirs (one session lives there); restore + the drift
-// follower only consult it on cross-dir moves, where that assumption holds.
-const liveSessionForCwd = (projectsDir: string, cwd: string): ResolvedSession | undefined => {
-  const dir = join(projectsDir, encodeProjectDir(expandHome(cwd)));
-  let names: string[];
-  try { names = readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { return undefined; }
-  const ranked = names
-    .flatMap((n) => { const p = join(dir, n); try { return [{ p, sid: n.replace(/\.jsonl$/, ""), m: statSync(p).mtimeMs }]; } catch { return []; } })
-    .sort((a, b) => b.m - a.m);
-  for (const c of ranked) if (jsonlHasUserLine(c.p)) return { sessionId: c.sid, jsonlPath: c.p };
+// Newest-mtime *.jsonl WITH user content in cwd's project dir(s), across all
+// active backends. The content gate skips an empty just-touched file so we bind
+// the real session. Reliable for worktree dirs (one session lives there);
+// restore + the drift follower only consult it on cross-dir moves, where that
+// assumption holds.
+const liveSessionForCwd = (cwd: string, only?: CliBackend): ResolvedSession | undefined => {
+  for (const c of rankedJsonlsForCwd(cwd, only)) {
+    if (jsonlHasUserLine(c.jsonlPath)) return { sessionId: c.sessionId, jsonlPath: c.jsonlPath };
+  }
   return undefined;
 };
 
 const resolveSession = (cfg: Config, log: Logger): ResolvedSession | undefined => {
   const cwd = expandHome(cfg.wrc.cwd);
-  const projectDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(cwd));
-  if (!existsSync(projectDir)) {
-    log.error({ projectDir }, "mirror: project dir not found (no claude session ever ran in cwd?)");
+  const dirs = projectDirsFor(cwd).map(({ dir }) => dir).filter((d) => existsSync(d));
+  if (dirs.length === 0) {
+    log.error({ probed: projectDirsFor(cwd).map(({ dir }) => dir) }, "mirror: project dir not found (no CLI session ever ran in cwd?)");
     return undefined;
   }
   const pinned = cfg.wrc.mirror.sessionId.trim();
   if (pinned) {
-    const p = join(projectDir, `${pinned}.jsonl`);
-    if (!existsSync(p)) {
-      log.error({ p }, "mirror: pinned sessionId jsonl missing");
+    const p = dirs.map((d) => join(d, `${pinned}.jsonl`)).find((x) => existsSync(x));
+    if (!p) {
+      log.error({ pinned, dirs }, "mirror: pinned sessionId jsonl missing");
       return undefined;
     }
     return { sessionId: pinned, jsonlPath: p };
   }
-  const top = latestJsonlForCwd(cfg, cwd);
+  const top = latestJsonlForCwd(cwd);
   if (!top) {
-    log.error({ projectDir }, "mirror: no .jsonl in project dir");
+    log.error({ dirs }, "mirror: no .jsonl in project dir");
     return undefined;
   }
   return top;
@@ -747,7 +771,8 @@ export const startMirrorTail = (deps: TailDeps): TailHandle => {
   // offset. Because the move is a rename (byte prefix preserved), the offset
   // stays continuous across enter→work→exit: no re-dump, no missed lines, and
   // switching back to the original path just resumes on the same offset.
-  const projectsRoot = dirname(dirname(deps.jsonlPath));
+  // The sid search is scoped to the backend owning this transcript — a sid from
+  // another CLI is never ours, however recently it was written.
   const candidates: string[] = [deps.jsonlPath];
 
   // Newest-mtime candidate that currently exists (the move can briefly leave a
@@ -762,7 +787,7 @@ export const startMirrorTail = (deps: TailDeps): TailHandle => {
   const resolveLive = (): string | undefined => {
     const known = existing();
     if (known) return known;
-    const found = findJsonlBySid(projectsRoot, deps.sessionId);
+    const found = findJsonlBySid(deps.sessionId, backendForPath(deps.jsonlPath));
     if (found && !candidates.includes(found)) candidates.push(found);
     return existing();
   };
@@ -864,6 +889,10 @@ interface InjectArgs {
   cfg: Config;
   log: Logger;
   sessionId: string;
+  /** Bound transcript path. Identifies which CLI owns the session, so the
+   *  spawn-mode inject resumes it with THAT binary — resuming a codebuddy
+   *  session with `claude` (or vice versa) just errors "session not found". */
+  jsonlPath: string;
   /** tmux pane (e.g. `%5`) auto-discovered from caller's $TMUX_PANE at attach time. Empty → spawn-mode inject (writes to jsonl only, not the live TTY). */
   tmuxTarget?: string;
   /** Set when this inject runs immediately after a `claude --resume` respawn:
@@ -1199,7 +1228,8 @@ const injectViaTmux = async (target: string, text: string, images: string[], log
 };
 
 const injectViaSpawn = (args: InjectArgs): Promise<{ ok: boolean; reason?: string }> => {
-  const { text, images = [], cfg, log, sessionId } = args;
+  const { text, images = [], cfg, log, sessionId, jsonlPath } = args;
+  const bin = backendForPath(jsonlPath).bin;
   // Spawn-mode (no live TTY) can't do clipboard+C-v — fall back to `@<path>`,
   // which Claude parses at submit time and inlines as image content blocks
   // without a model-decided Read tool turn.
@@ -1215,9 +1245,9 @@ const injectViaSpawn = (args: InjectArgs): Promise<{ ok: boolean; reason?: strin
     "--verbose",
     ...cfg.wrc.extraArgs,
   ];
-  log.info({ sessionId, claudeBin: cfg.wrc.claudeBin, len: text.length }, "mirror inject");
+  log.info({ sessionId, bin, len: text.length }, "mirror inject");
   return new Promise((resolve) => {
-    const proc = spawn(cfg.wrc.claudeBin, cliArgs, {
+    const proc = spawn(bin, cliArgs, {
       cwd: expandHome(cfg.wrc.cwd),
       env: { ...process.env, PATH: augmentedPath(process.env.PATH) },
       stdio: ["ignore", "ignore", "pipe"],
@@ -1233,12 +1263,12 @@ const injectViaSpawn = (args: InjectArgs): Promise<{ ok: boolean; reason?: strin
     proc.on("close", (code) => {
       if (spawnError) {
         log.error({ err: spawnError.message }, "mirror spawn error");
-        resolve({ ok: false, reason: `spawn ${cfg.wrc.claudeBin}: ${spawnError.message}` });
+        resolve({ ok: false, reason: `spawn ${bin}: ${spawnError.message}` });
         return;
       }
       if (code !== 0) {
         log.error({ code, stderrTail: stderrTail.slice(-400) }, "mirror inject non-zero");
-        resolve({ ok: false, reason: `claude exited ${code}: ${stderrTail.slice(-300)}` });
+        resolve({ ok: false, reason: `${bin} exited ${code}: ${stderrTail.slice(-300)}` });
         return;
       }
       resolve({ ok: true });
@@ -1371,7 +1401,7 @@ export interface MirrorBridge {
   /** Detach + respawn a target's pane in `cfg.wrc.cwd` or its pendingCwd
    *  override. Used by /new to give the user a fresh claude in the bound
    *  project. Returns the new attachment result. */
-  newSession: (target: string, windowName?: string) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
+  newSession: (target: string, windowName?: string, cli?: CliBackendName) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
 }
 
 interface ToolEntry {
@@ -2269,7 +2299,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       detailUrlFor,
       sessionId,
       target,
-      normalizeLine: resolveCliBackend(cfg.wrc).normalizeTranscriptLine,
+      // Dialect comes from the transcript's own root, not defaultCli — that is
+      // what lets a claude session and a codebuddy session be mirrored at once.
+      normalizeLine: backendForPath(jsonlPath).normalizeTranscriptLine,
     });
     bySessionId.set(sessionId, a);
     byTarget.set(target, a);
@@ -2322,8 +2354,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // tail then follows it natively. Must precede the latestJsonlForCwd heal,
       // which would otherwise grab whatever session is newest in the original
       // cwd's dir (usually a *different* chat) and cross-wire the mirror.
-      const projectsRoot = expandHome(cfg.wrc.mirror.projectsDir);
-      const relocated = findJsonlBySid(projectsRoot, rec.sessionId);
+      const owner = backendForPath(expandHome(rec.jsonlPath));
+      const relocated = findJsonlBySid(rec.sessionId, owner);
       if (relocated) {
         log.info({ principal, sessionId: rec.sessionId, from: rec.jsonlPath, to: relocated }, "mirror restore: sid relocated (worktree), re-homed");
         rec.jsonlPath = relocated;
@@ -2336,7 +2368,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // project dir; heal onto it instead of dropping the binding, else the
         // chat silently loses all further responses. Fail-closed drop only when
         // the project dir is truly empty.
-        const healed = latestJsonlForCwd(cfg, rec.cwd || cfg.wrc.cwd);
+        const healed = latestJsonlForCwd(rec.cwd || cfg.wrc.cwd, owner);
         if (!healed) {
           log.warn({ principal, jsonlPath: rec.jsonlPath }, "mirror restore: jsonl missing and no sibling, dropping entry");
           deps.store.drop(principal);
@@ -2371,10 +2403,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const cwdRes = await tmuxRun(["display-message", "-p", "-t", livePane, "#{pane_current_path}"]);
       const paneCwd = cwdRes.stdout.trim();
       if (paneCwd) {
-        const projectsRoot = expandHome(cfg.wrc.mirror.projectsDir);
-        const paneDir = join(projectsRoot, encodeProjectDir(expandHome(paneCwd)));
+        // Encode under the backend that owns the bound transcript — comparing
+        // with the primary dialect would report a phantom drift for every
+        // session belonging to a non-primary CLI.
+        const paneDir = projectDirFor(jsonlAbs, expandHome(paneCwd));
         if (paneDir !== dirname(jsonlAbs)) {
-          const live = liveSessionForCwd(projectsRoot, paneCwd);
+          const live = liveSessionForCwd(paneCwd, backendForPath(jsonlAbs));
           if (live && live.sessionId !== rec.sessionId) {
             log.info({ principal, from: rec.sessionId, to: live.sessionId, paneCwd }, "mirror restore: pane in worktree, re-homed to live session");
             rec.sessionId = live.sessionId;
@@ -2555,7 +2589,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       sessionId: newSessionId,
       target: a.target,
       startOffset,
-      normalizeLine: resolveCliBackend(cfg.wrc).normalizeTranscriptLine,
+      // A migration can cross backends (rare, but the new jsonl is resolved by
+      // path, not by CLI) — re-derive the dialect from the destination.
+      normalizeLine: backendForPath(newJsonlPath).normalizeTranscriptLine,
     });
     deps.store.set(a.target, {
       sessionId: newSessionId,
@@ -2672,7 +2708,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       if (stopped) return;
       const paneCwd = r.code === 0 ? r.stdout.trim() : "";
       if (!paneCwd) { a.migrationWatcher = undefined; return; } // pane gone → dead-pane path owns it
-      const paneDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(expandHome(paneCwd)));
+      const paneDir = projectDirFor(boundPath, expandHome(paneCwd));
       if (paneDir !== dir) { reschedule(); return; }            // pane drifted → followPaneDrift owns it
       let names: string[] = [];
       try { names = readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { /* */ }
@@ -2718,8 +2754,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // different project dir whose live session has a different sid, migrate onto
   // it. Tail from EOF (undefined startOffset): the worktree session already
   // carries full history we don't want to re-dump to WeCom.
-  const projectsRootDir = expandHome(cfg.wrc.mirror.projectsDir);
-
   let paneDriftTicking = false;
   const followPaneDrift = async (): Promise<void> => {
     if (paneDriftTicking) return; // skip overlapping ticks (tmux call is async)
@@ -2739,9 +2773,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         if (a.liveStream && !a.liveStream.closed) continue;  // mid typewriter — don't yank the tail
         const cwd = paneCwd.get(a.tmuxPane);
         if (!cwd) continue;                                   // pane gone
-        const paneDir = join(projectsRootDir, encodeProjectDir(expandHome(cwd)));
+        const paneDir = projectDirFor(a.jsonlPath, expandHome(cwd));
         if (paneDir === dirname(a.jsonlPath)) continue;       // same project dir — no drift
-        const live = liveSessionForCwd(projectsRootDir, cwd);
+        const live = liveSessionForCwd(cwd, backendForPath(a.jsonlPath));
         if (!live || live.sessionId === a.sessionId) continue; // empty dir, or same-sid rename (tail follows it)
         a.runningCwd = expandHome(cwd);                        // migrateAttachment persists this to store
         log.info({ target: a.target, pane: a.tmuxPane, fromDir: dirname(a.jsonlPath), toDir: paneDir, oldSid: a.sessionId, newSid: live.sessionId }, "mirror: pane drifted (worktree), following live session");
@@ -2815,6 +2849,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const newSession = async (
     target: string,
     windowName?: string,
+    cli?: CliBackendName,
   ): Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }> => {
     const prev = byTarget.get(target);
     // Resolution precedence (all chat-scoped except the running-cwd fallback):
@@ -2831,6 +2866,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       (rec?.cwd?.trim()) ||
       chat.running ||
       expandedDefaultCwd;
+    // Inherit the outgoing session's CLI when the caller didn't name one: a
+    // `/new` (or a /clear upgraded to /new) on a codebuddy-bound chat must stay
+    // on codebuddy rather than silently reverting to `defaultCli`.
+    const boundPath = prev?.jsonlPath ?? rec?.jsonlPath;
+    const effCli = cli ?? (boundPath ? backendForPath(expandHome(boundPath)).name : undefined);
     if (prev?.tmuxPane) {
       // Best-effort kill; ignore errors (pane may already be dead).
       void tmuxRun(["kill-pane", "-t", prev.tmuxPane]);
@@ -2841,6 +2881,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       log: log.child({ sub: "new-session", target }),
       windowName: windowName ?? target,
       cwdOverride: eff,
+      cli: effCli,
     });
     if (!r.ok) return { ok: false, reason: r.reason };
     const att = attach({
@@ -3104,7 +3145,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // Same resume-fork hazard as dispatch: snapshot before spawn, re-bind
         // onto the forked jsonl once it appears (EOF offset — fork is seeded).
         const resumeBaseline = listJsonls(dirname(a.jsonlPath));
-        const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn-init", sessionId: sid }), resumeSessionId: sid, windowName: tagOfTarget(target) || target, cwdOverride: a.runningCwd });
+        const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn-init", sessionId: sid }), resumeSessionId: sid, windowName: tagOfTarget(target) || target, cwdOverride: a.runningCwd, cli: backendForPath(a.jsonlPath).name });
         if (!r.ok || !r.tmuxPane) return { ok: false, reason: `respawn failed: ${r.reason ?? "unknown"}` };
         a.tmuxPane = r.tmuxPane;
         a.tmuxSession = r.tmuxSession ?? a.tmuxSession;
@@ -3116,7 +3157,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // is still warming up so the verifier in injectViaTmux needs the slack.
       return await inject({
         text, images: [], cfg, log: log.child({ principal: target, sessionId: sid, sub: "init-demo" }),
-        sessionId: sid, tmuxTarget: a.tmuxPane, freshSpawn: true,
+        sessionId: sid, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane, freshSpawn: true,
       });
     },
     interruptPane: async (target) => {
@@ -3276,7 +3317,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           const resumeBaseline = !armMigration ? listJsonls(dirname(a.jsonlPath)) : undefined;
           // Respawn in the binding's runningCwd (pendingCwd doesn't apply to a
           // mid-turn reincarnation — only /new and /clear-with-pending swap cwd).
-          const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn", sessionId: sid }), resumeSessionId: sid, windowName: tagOfTarget(a.target) || a.target, cwdOverride: a.runningCwd });
+          const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn", sessionId: sid }), resumeSessionId: sid, windowName: tagOfTarget(a.target) || a.target, cwdOverride: a.runningCwd, cli: backendForPath(a.jsonlPath).name });
           if (r.ok && r.tmuxPane && r.tmuxSession) {
             a.tmuxPane = r.tmuxPane;
             a.tmuxSession = r.tmuxSession;
@@ -3312,7 +3353,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         rememberInject(text);
         const r = await inject({
           text, images, cfg, log: log.child({ principal, sessionId: sid }),
-          sessionId: sid, tmuxTarget: a.tmuxPane, freshSpawn,
+          sessionId: sid, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane, freshSpawn,
         });
         if (!r.ok) {
           if (s) {

@@ -38,8 +38,9 @@ const step = (n: number, title: string): void =>
 
 // ── Agent kind → settings.json path ──────────────────────────────────
 // sync.targets 可多选: 每个 agent 一个 target, 全部注入 hook/MCP/env。
-// wrc.defaultCli / wrc.claudeBin 是单值, 由第一个选中项决定 (daemon 一次只能 tail
-// 一个 projectsDir)。两者解耦: 多 CLI 都能收到 hook 注入, 但同时只有一个 active。
+// wrc.defaultCli 是单值, 由第一个选中项决定 —— 它只决定「新会话默认用哪个 CLI 起」。
+// daemon 会同时 tail 所有已安装 CLI 的 projectsDir (backend 由 transcript 路径反推),
+// 所以 claude 和 codebuddy 的会话可以并存、各自镜像到不同的 WeCom 会话。
 type AgentKind = "claude" | "claude-internal" | "codebuddy";
 type WrcMode = "headless" | "mirror";
 const settingsPathFor = (kind: AgentKind): string => {
@@ -192,8 +193,8 @@ const main = async (): Promise<void> => {
     settingsPath: settingsPathFor(k),
     scope: "user" as const,
   }));
-  // 第一个选中项决定 daemon active backend (wrc.defaultCli / claudeBin)。
-  // 多个 CLI 都能收到 hook 注入, 但 daemon 同时只 tail 一个 projectsDir。
+  // 第一个选中项决定 wrc.defaultCli —— 新会话 (/new, sessions/new) 的默认 CLI。
+  // 其余已安装的 CLI 依然会被 daemon 镜像, 无需额外配置。
   // checkbox required:true 保证非空, 但 TS 不感知, 这里 narrow 一下。
   const [primary] = agentKinds;
   if (!primary) {

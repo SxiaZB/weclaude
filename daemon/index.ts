@@ -1,7 +1,7 @@
 // Daemon entry. Resident process — exits only on signal or fatal WS auth failure.
 import { loadConfig } from "../shared/config.js";
 import { makeLogger } from "../shared/log.js";
-import { bindCliBackend } from "../shared/cli-backends.js";
+import { bindCliBackends, type CliBackendName } from "../shared/cli-backends.js";
 import { startWs } from "./ws.js";
 import { startHttp, json } from "./http.js";
 import { installInboundRouter } from "./inbound.js";
@@ -42,11 +42,13 @@ const main = async (): Promise<void> => {
   });
   log.info({ sourcePath, pid: process.pid }, "daemon start");
 
-  // Bind the active CLI backend's dialect (project-dir encoding) into
-  // module-level state in mirror-bridge + spawn-tmux. Must run BEFORE any
-  // mirror attach / tmux spawn. Returns the resolved backend for logging.
-  const backend = bindCliBackend(cfg.wrc);
-  log.info({ backend: backend.name, bin: backend.bin }, "cli backend bound");
+  // Bind the CLI backend registry. `primary` (= defaultCli) drives new-session
+  // spawns; `backends` is every installed CLI whose transcript root exists, so
+  // sessions from all of them can be mirrored concurrently — each attachment
+  // derives its dialect from its own jsonl path. Must run BEFORE any mirror
+  // attach / tmux spawn.
+  const { primary, backends } = bindCliBackends({ ...cfg.wrc, projectsDirOverride: cfg.wrc.mirror.projectsDir });
+  log.info({ primary: primary.name, bin: primary.bin, backends: backends.map((b) => b.name) }, "cli backends bound");
 
   // Restore auto-approve windows persisted across daemon restarts —
   // otherwise a `weclaude reload` silently drops the user's "10min" choice.
@@ -238,6 +240,7 @@ const main = async (): Promise<void> => {
           ok: true,
           current: currentSid,
           sessions: sessions.map((s) => ({ ...s, current: s.sessionId === currentSid })),
+          backends: backends.map((b) => b.name),
         });
       } catch (e) {
         json(res, 500, { ok: false, reason: (e as Error).message });
@@ -276,7 +279,7 @@ const main = async (): Promise<void> => {
     // spawn+attach path as /mirror/spawn, just with an explicit cwdOverride.
     http.register("POST /sessions/new", async (req, res) => {
       const { readBody } = await import("./http.js");
-      const body = (await readBody(req)) as Partial<{ cwd: string; target: string }>;
+      const body = (await readBody(req)) as Partial<{ cwd: string; target: string; cli: CliBackendName }>;
       const cwd = (body.cwd ?? "").toString().trim();
       if (!cwd) {
         json(res, 400, { ok: false, reason: "cwd required" });
@@ -288,11 +291,11 @@ const main = async (): Promise<void> => {
         return;
       }
       const spawnLog = log.child({ mod: "mirror", sub: "sessions-new", target });
-      const r = await spawnTmuxClaude({ cfg, log: spawnLog, windowName: target, cwdOverride: cwd });
+      const r = await spawnTmuxClaude({ cfg, log: spawnLog, windowName: target, cwdOverride: cwd, cli: body.cli });
       if (!r.ok) { json(res, 500, { ok: false, reason: r.reason }); return; }
       const att = m.attach({ sessionId: r.sessionId!, jsonlPath: r.jsonlPath!, target, tmuxPane: r.tmuxPane, tmuxSession: r.tmuxSession, cwd: r.cwd });
       json(res, att.ok ? 200 : 500, att.ok
-        ? { ok: true, sessionId: r.sessionId, target, cwd: r.cwd, tmuxSession: r.tmuxSession, tmuxPane: r.tmuxPane }
+        ? { ok: true, sessionId: r.sessionId, target, cwd: r.cwd, cli: r.cli, tmuxSession: r.tmuxSession, tmuxPane: r.tmuxPane }
         : { ok: false, reason: att.reason });
     });
     // Frame-less inject — used by `weclaude init` to fire a demo prompt right

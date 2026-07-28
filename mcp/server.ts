@@ -323,13 +323,17 @@ server.registerTool(
       "Spawn a brand-new Claude Code session in a fresh tmux pane rooted at the given project path, then switch the WeCom mirror to it. Call this when the user asks to start a new session somewhere — e.g. '在 /path/to/proj 下新建一个 claude session', '帮我在 xxx 目录起个新会话'. The directory is created if it doesn't exist.",
     inputSchema: {
       cwd: z.string().describe("Absolute project path to start the new session in, e.g. /Users/foo/projects/bar. Created if missing."),
+      cli: z
+        .enum(["claude", "claude-internal", "codebuddy"])
+        .optional()
+        .describe("Which CLI to launch. Omit unless the user names one (e.g. '用 codebuddy 起一个'); the daemon's default backend is used otherwise. Multiple backends can run side by side."),
     },
   },
-  async ({ cwd }) => {
+  async ({ cwd, cli }) => {
     const resp = await fetch(`${DAEMON_BASE}/sessions/new`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ cwd }),
+      body: JSON.stringify({ cwd, cli }),
     });
     const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
     return j.ok ? ok(j) : fail(`new_claude_session failed: ${j.reason ?? `http ${resp.status}`}`);

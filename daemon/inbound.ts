@@ -8,6 +8,7 @@ import type { Config } from "../shared/config.js";
 import type { Bridge } from "./cc-bridge.js";
 import type { MirrorBridge } from "./mirror-bridge.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
+import type { CliBackendName } from "../shared/cli-backends.js";
 import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim } from "./claim.js";
 import { getLastResponse } from "./last-response.js";
 import { scanClaudeSessions, type SessionInfo } from "./session-scan.js";
@@ -129,7 +130,13 @@ const resolveAuditMirror = (
   }
   return mirrors.find((m) => m.target === who || m.target === chatWho);
 };
-const isNewCommand = (text: string): boolean => text.trim() === "/new";
+// `/new` optionally names which CLI to launch (`/new codebuddy`). Bare `/new`
+// keeps whatever CLI the chat's current session runs — see newSession's inherit
+// rule — so naming one is only needed to *switch* backends.
+const NEW_RE = /^\/new(?:\s+(claude-internal|claude|codebuddy))?$/i;
+const isNewCommand = (text: string): boolean => NEW_RE.test(text.trim());
+const cliOfNewCommand = (text: string): CliBackendName | undefined =>
+  NEW_RE.exec(text.trim())?.[1]?.toLowerCase() as CliBackendName | undefined;
 const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 const isEnterCommand = (text: string): boolean => text.trim() === "/n";
@@ -144,7 +151,8 @@ const renderHelp = (): string =>
     "*weclaude 命令*",
     "",
     "▎会话",
-    "`/new` 新开 claude 会话并绑定本聊天",
+    "`/new` 新开会话并绑定本聊天 (沿用当前会话的 CLI)",
+    "`/new codebuddy` 指定 CLI 新开 (claude / claude-internal / codebuddy)",
     "`/new #tag` 在本聊天中新开一个带标签的并行会话",
     "`/sessions` 列出 live 会话 · `/sessions <emoji|id>` 切换",
     "`/stop` 打断当前生成 (Esc)",
@@ -213,10 +221,14 @@ const parseSessionsCommand = (text: string): { arg: string } | undefined => {
 // session currently mirrored to this chat's target (if any) is flagged.
 const renderSessionsList = (sessions: SessionInfo[], currentSid: string): string => {
   if (sessions.length === 0) return "[weclaude] 未发现正在运行的 Claude 会话";
+  // Only annotate the CLI when the list actually spans more than one — with a
+  // single backend the tag is pure noise on every row.
+  const mixed = new Set(sessions.map((s) => s.cli)).size > 1;
   const lines = sessions.map((s) => {
     const here = s.sessionId === currentSid ? " ⬅️ 当前" : "";
     const dir = s.cwd.replace(/^.*\//, "") || s.cwd || "?";
-    return `${s.label || "▫️"} \`${s.sessionId.slice(0, 8)}\` ${dir}${here}`;
+    const cli = mixed ? ` _(${s.cli})_` : "";
+    return `${s.label || "▫️"} \`${s.sessionId.slice(0, 8)}\` ${dir}${cli}${here}`;
   });
   return [
     "[weclaude] 正在运行的会话：",
@@ -429,10 +441,10 @@ export const installInboundRouter = (
   // the user-facing one-line ack. When `who` carries a `#tag` suffix, use
   // the raw tag as the tmux window name so the pane shows readably in the
   // status bar (e.g. `#docs` → window `docs`, not the principal slug).
-  const autoSpawnAndAttach = async (who: string): Promise<string> => {
+  const autoSpawnAndAttach = async (who: string, cli?: CliBackendName): Promise<string> => {
     if (!("newSession" in bridge)) return "[weclaude] /new only available in mirror mode";
     const tag = tagOf(who);
-    const r = await bridge.newSession(who, tag || who);
+    const r = await bridge.newSession(who, tag || who, cli);
     if (!r.ok) return `[weclaude] /new failed: ${r.reason ?? "unknown"}`;
     return `✅ 新会话已建立 \`${r.sessionId}\``;
   };
@@ -650,7 +662,7 @@ export const installInboundRouter = (
     // very first message from a fresh user. When routed with a `#tag`, the
     // tag becomes both the mirror-store key and the tmux window name.
     if (isNewCommand(text)) {
-      const reply = await autoSpawnAndAttach(who);
+      const reply = await autoSpawnAndAttach(who, cliOfNewCommand(text));
       await replyText(frame, msg, who, reply);
       return { stop: true };
     }

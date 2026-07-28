@@ -31,7 +31,7 @@ import { basename, dirname, join } from "node:path";
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import { expandHome } from "../shared/paths.js";
-import { encodeProjectDir } from "../shared/cli-backends.js";
+import { activateBackend, CLI_BACKEND_DEFAULTS, primaryBackend, type CliBackend, type CliBackendName } from "../shared/cli-backends.js";
 
 const NODE_BIN_DIR = dirname(process.execPath);
 const augmentedPath = (orig: string | undefined): string => {
@@ -43,8 +43,21 @@ const augmentedPath = (orig: string | undefined): string => {
     .join(":");
 };
 
-// Project-dir encoding imported from shared/cli-backends — backend-specific
-// (Claude: leading `-`, CodeBuddy: none), bound once at daemon boot.
+// A spawn has no transcript to derive a backend from, so the caller picks one
+// (`cli`) and we fall back to the primary (`wrc.defaultCli`). Everything the
+// pane needs — binary, transcript root, project-dir encoding, trust-marker file
+// — comes from that single descriptor, which is what lets one daemon host
+// claude and codebuddy panes at the same time.
+const backendFor = (cfg: Config, cli?: CliBackendName): CliBackend => {
+  const primary = primaryBackend();
+  if (!cli || cli === primary.name) return primary;
+  const base = CLI_BACKEND_DEFAULTS[cli];
+  const override = cfg.wrc.cliBackends?.[cli]?.bin;
+  // Activate before spawning: this CLI's transcript root may not exist yet, in
+  // which case the boot-time probe skipped it and backendForPath would misread
+  // the jsonl we are about to create as the primary's dialect.
+  return activateBackend(override ? { ...base, bin: override } : base);
+};
 
 interface ExecResult {
   ok: boolean;
@@ -110,6 +123,9 @@ export interface SpawnArgs {
    *  Mirror mode persists this in mirror-attachments.json so /new respawns
    *  in the user-bound project, not the global default. */
   cwdOverride?: string;
+  /** Which CLI to launch. Undefined → `wrc.defaultCli`. A respawn should pass
+   *  the backend that owns `resumeSessionId`, else the resume finds no session. */
+  cli?: CliBackendName;
 }
 
 export interface SpawnResult {
@@ -122,6 +138,8 @@ export interface SpawnResult {
   /** Effective cwd the pane was launched in. Mirrors `cwdOverride ?? cfg.wrc.cwd`
    *  after expandHome, so callers can persist it without re-resolving. */
   cwd?: string;
+  /** Backend actually launched. */
+  cli?: CliBackendName;
 }
 
 // Pre-write the "trust this folder" + onboarding markers for `cwd` into
@@ -178,9 +196,10 @@ export const trustWorkspace = (claudeBin: string, cwd: string, log: Logger): voi
   }
 };
 
-export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, cwdOverride }: SpawnArgs): Promise<SpawnResult> => {
+export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, cwdOverride, cli }: SpawnArgs): Promise<SpawnResult> => {
+  const backend = backendFor(cfg, cli);
   const cwd = expandHome((cwdOverride ?? "").trim() || cfg.wrc.cwd);
-  const projectDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(cwd));
+  const projectDir = join(expandHome(backend.projectsDir), backend.encodeProjectDir(cwd));
   const sessionId = resumeSessionId ?? randomUUID();
   const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
   const tmuxName = cfg.wrc.tmuxPrefix; // shared session for all chats
@@ -206,7 +225,7 @@ export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, c
   // this folder?" / onboarding prompts — those prompts swallow paste-buffer
   // injects and the approval card never fires. Best-effort: log + continue
   // on failure (worst case the user clicks through the prompts manually).
-  trustWorkspace(cfg.wrc.claudeBin, cwd, log);
+  trustWorkspace(backend.bin, cwd, log);
 
   // Reuse the shared session if alive; otherwise create it. Either way, end
   // up with a fresh window whose pane id we capture via `-P -F '#{pane_id}'`.
@@ -234,13 +253,13 @@ export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, c
   if (!tmuxPane) {
     return { ok: false, reason: "tmux returned no pane id" };
   }
-  log.info({ tmuxName, winName, tmuxPane, cwd, sessionId, reused: has.code === 0 }, "spawn-tmux: pane created");
+  log.info({ tmuxName, winName, tmuxPane, cwd, sessionId, cli: backend.name, reused: has.code === 0 }, "spawn-tmux: pane created");
 
   // DISABLE_AUTOUPDATER=1 防止新 pane 启动时弹出 "An update is available" 询问 ——
   // 该交互会吞掉首条 paste-buffer 注入，导致仅落字符不进入 claude 输入框。
   const cmd = [
     "DISABLE_AUTOUPDATER=1",
-    cfg.wrc.claudeBin,
+    backend.bin,
     ...(resumeSessionId ? ["--resume", sessionId] : ["--session-id", sessionId]),
     ...cfg.wrc.extraArgs,
   ].map((a, i) => (i === 0 ? a : shQuote(a))).join(" ");
@@ -257,6 +276,6 @@ export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, c
   // a missing jsonl and starts emitting once claude writes the first line.
   await sleep(TUI_SETTLE_MS);
 
-  log.info({ tmuxName, tmuxPane, sessionId, jsonlPath, cwd }, "spawn-tmux: ready");
-  return { ok: true, sessionId, jsonlPath, tmuxPane, tmuxSession: tmuxName, cwd };
+  log.info({ tmuxName, tmuxPane, sessionId, jsonlPath, cwd, cli: backend.name }, "spawn-tmux: ready");
+  return { ok: true, sessionId, jsonlPath, tmuxPane, tmuxSession: tmuxName, cwd, cli: backend.name };
 };

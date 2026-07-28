@@ -12,8 +12,9 @@
 // returns [] elsewhere, degrading gracefully.
 import { spawn } from "node:child_process";
 import { readdirSync, readFileSync, existsSync, statSync, readlinkSync, openSync, readSync, closeSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
+import { join, basename } from "node:path";
+import { activeBackends, backendForPath, projectDirsFor, type CliBackendName } from "../shared/cli-backends.js";
+import { expandHome } from "../shared/paths.js";
 import { labelFor } from "./session-label.js";
 
 export interface SessionInfo {
@@ -30,6 +31,9 @@ export interface SessionInfo {
   lastActivity: number;
   /** One-line "what is this session doing" preview from the transcript tail. */
   summary: string;
+  /** Which CLI owns this session, derived from the transcript's projects root.
+   *  Lets a caller (and the UI) tell a claude pane from a codebuddy one. */
+  cli: CliBackendName;
 }
 
 interface PaneOwner {
@@ -102,20 +106,22 @@ const sessionIdFromCmd = (cmd: string): string => {
   return m?.[1] ?? "";
 };
 
-const looksLikeClaude = (cmd: string): boolean => /claude/i.test(cmd);
+// A process belongs to an agent CLI if its cmdline mentions any active
+// backend's binary name. Derived from the registry rather than hardcoded, so a
+// custom `cliBackends.<name>.bin` is recognized too — without this, codebuddy
+// panes were invisible to the scan and could never be listed or switched to.
+const looksLikeAgentCli = (cmd: string): boolean =>
+  activeBackends().some((b) => cmd.toLowerCase().includes(basename(b.bin).toLowerCase()));
 
-// Project roots claude writes transcripts under, internal build first.
-const PROJECT_ROOT_INTERNAL = join(homedir(), ".claude-internal", "projects");
-const PROJECT_ROOT_DEFAULT = join(homedir(), ".claude", "projects");
-const PROJECT_ROOT_CODEBUDDY = join(homedir(), ".codebuddy", "projects");
-const PROJECT_ROOTS = [PROJECT_ROOT_INTERNAL, PROJECT_ROOT_DEFAULT, PROJECT_ROOT_CODEBUDDY];
+// Transcript roots of every active backend, in registry order (primary first).
+const projectRoots = (): string[] => activeBackends().map((b) => expandHome(b.projectsDir));
 
 // Locate `<sessionId>.jsonl` (UUID is globally unique, so we don't have to
 // reverse the cwd→dir encoding). Skips subagent transcripts (they live under a
 // `<sid>/subagents/` subdir, never directly under a project dir).
 const findJsonl = (sessionId: string): string => {
   const name = `${sessionId}.jsonl`;
-  for (const root of PROJECT_ROOTS) {
+  for (const root of projectRoots()) {
     if (!existsSync(root)) continue;
     let subs: import("node:fs").Dirent[];
     try {
@@ -132,25 +138,19 @@ const findJsonl = (sessionId: string): string => {
   return "";
 };
 
-// cwd→projectDir encoding is backend-specific:
-//   Claude Code / claude-internal: `/` `.` `_` → `-`   (leading `-` kept)
-//   CodeBuddy:                     strip leading `/`, then `/` `.` → `-`
-const encodeClaude = (absCwd: string): string => absCwd.replace(/[/._]/g, "-");
-const encodeCodebuddy = (absCwd: string): string =>
-  absCwd.replace(/^[/]+/, "").replace(/[/.]/g, "-");
-const encodeForRoot = (root: string, absCwd: string): string =>
-  root === PROJECT_ROOT_CODEBUDDY ? encodeCodebuddy(absCwd) : encodeClaude(absCwd);
+// cwd→projectDir encoding is backend-specific; projectDirsFor yields one
+// candidate per active backend (primary first) using each one's own dialect.
+// (The old local copies diverged — the Claude encoder here also mapped `_`,
+// which does NOT match what Claude Code writes.)
 
 // Expected jsonl path for a freshly-spawned session whose transcript doesn't
-// exist on disk yet (claude only writes it after the first user input). Used so
+// exist on disk yet (a CLI only writes it after the first user input). Used so
 // a brand-new `new_claude_session` still shows up in the list immediately.
 const expectedJsonl = (cwd: string, sessionId: string): string => {
   if (!cwd || !sessionId) return "";
-  for (const root of PROJECT_ROOTS) {
-    const enc = encodeForRoot(root, cwd);
-    if (existsSync(join(root, enc))) return join(root, enc, `${sessionId}.jsonl`);
-  }
-  return join(PROJECT_ROOT_INTERNAL, encodeClaude(cwd), `${sessionId}.jsonl`);
+  const cands = projectDirsFor(cwd);
+  const hit = cands.find(({ dir }) => existsSync(dir)) ?? cands[0];
+  return hit ? join(hit.dir, `${sessionId}.jsonl`) : "";
 };
 
 // Resume-mode fallback: a claude launched with bare `-r`/`--resume` carries no
@@ -160,8 +160,7 @@ const expectedJsonl = (cwd: string, sessionId: string): string => {
 // sharing a cwd don't both resolve to the same newest file.
 const inferByCwd = (cwd: string, taken: Set<string>): { sessionId: string; jsonlPath: string } | null => {
   if (!cwd) return null;
-  for (const root of PROJECT_ROOTS) {
-    const dir = join(root, encodeForRoot(root, cwd));
+  for (const { dir } of projectDirsFor(cwd)) {
     if (!existsSync(dir)) continue;
     let files: string[];
     try {
@@ -289,7 +288,7 @@ export const scanClaudeSessions = async (): Promise<SessionInfo[]> => {
   const byPane = new Map<string, { pid: number; owner: PaneOwner; cwd: string; explicitSid: string }>();
   for (const pid of pids) {
     const cmd = cmdlineOf(pid);
-    if (!cmd || !looksLikeClaude(cmd)) continue;
+    if (!cmd || !looksLikeAgentCli(cmd)) continue;
     const owner = tmuxOwnerOf(pid, paneIdx);
     if (!owner) continue; // tmux scope
     const explicitSid = sessionIdFromCmd(cmd);
@@ -319,6 +318,7 @@ export const scanClaudeSessions = async (): Promise<SessionInfo[]> => {
       tmuxPane: owner.paneId,
       lastActivity,
       summary: summarize(jsonlPath),
+      cli: backendForPath(jsonlPath).name,
     });
   };
 
