@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 import { dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { input, password, select, confirm, checkbox } from "@inquirer/prompts";
+import { parse as parseJsonc } from "jsonc-parser";
 import { patchJsonc } from "../shared/config-writer.js";
 import { expandHome } from "../shared/paths.js";
 
@@ -77,6 +78,25 @@ const post = async (p: string, body: unknown): Promise<unknown> => {
   return r.json().catch(() => ({}));
 };
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// ── Existing credentials ─────────────────────────────────────────────
+// secrets.json 是 botId/secret 的唯一落盘点 (config.jsonc 只留非敏感字段)。
+// 重跑 init 最常见的场景是换 agent / 换模式, 凭证没变 —— 每次重敲一遍 secret
+// 既烦又容易敲错, 所以检测到已有值就默认复用。
+interface BotCreds { botId?: string; secret?: string }
+const readBotCreds = (): BotCreds => {
+  const p = expandHome(SECRETS);
+  if (!existsSync(p)) return {};
+  try {
+    const bot = (parseJsonc(readFileSync(p, "utf8")) as { bot?: BotCreds } | undefined)?.bot;
+    return bot ?? {};
+  } catch {
+    return {};
+  }
+};
+// 只露头尾, 中间省略 —— 足够用户确认"是这个机器人", 又不把凭证打进终端 scrollback。
+const mask = (s: string): string =>
+  s.length <= 10 ? `${s.slice(0, 2)}***` : `${s.slice(0, 6)}***${s.slice(-4)}`;
 
 // ── Build + install + reload daemon ──────────────────────────────────
 const ensureBuild = (): void => {
@@ -157,8 +177,20 @@ const main = async (): Promise<void> => {
 
   // ── Step 1: prompts ────────────────────────────────────────────
   step(1, "采集配置");
-  const botId = await input({ message: "智能机器人 botId:", required: true });
-  const secret = await password({ message: "机器人 secret:", mask: "•" });
+  const existing = readBotCreds();
+  const reuseCreds = existing.botId
+    ? await confirm({
+        message: `检测到已有凭证 botId=${mask(existing.botId)}${existing.secret ? " (含 secret)" : ""}，复用？`,
+        default: true,
+      })
+    : false;
+  const botId = reuseCreds && existing.botId
+    ? existing.botId
+    : await input({ message: "智能机器人 botId:", required: true });
+  // 复用 botId 但 secrets.json 里没有 secret (老配置手写过 config.jsonc) 时仍要问。
+  const secret = reuseCreds && existing.secret
+    ? existing.secret
+    : await password({ message: "机器人 secret:", mask: "•" });
   const agentKinds = (await checkbox({
     message: "选择 Claude agent (空格多选, 至少一个 — hook/MCP/env 会注入到每个选中项):",
     choices: [
@@ -217,11 +249,15 @@ const main = async (): Promise<void> => {
     { path: ["approval", "matcher"], value: ".*" },
     { path: ["sync", "targets"], value: targets },
   ]);
-  log(c.dim(`  写入 ${SECRETS} ...`));
-  patchJsonc(SECRETS, [
-    { path: ["bot", "botId"], value: botId },
-    { path: ["bot", "secret"], value: secret },
-  ]);
+  if (botId === existing.botId && secret === existing.secret) {
+    log(c.dim(`  复用 ${SECRETS} 中的凭证 (未改写)`));
+  } else {
+    log(c.dim(`  写入 ${SECRETS} ...`));
+    patchJsonc(SECRETS, [
+      { path: ["bot", "botId"], value: botId },
+      { path: ["bot", "secret"], value: secret },
+    ]);
+  }
 
   ensureBuild();
   if (enableHook) runSync();
