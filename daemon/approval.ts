@@ -1276,11 +1276,20 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
           log.warn({ err: (e as Error).message }, "allow_always notice send failed");
         }
       } else if (gen.length === 0) {
-        // 含 $()/反引号等动态构造, 生成不了可靠字面规则 — 本次一次性放行并告知。
+        // 生成不了可靠字面规则 (含 $()/反引号动态构造, 或分隔符切进了引号内部) —
+        // 本次一次性放行并告知。文案区分两种成因, 避免误导排查方向。
+        const dynamic = /[`]|\$\(/.test(
+          typeof (toolInput as Record<string, unknown> | null)?.command === "string"
+            ? ((toolInput as Record<string, unknown>).command as string)
+            : "",
+        );
+        const why = dynamic
+          ? "该命令含动态构造（$() / 反引号），字面规则无法可靠描述其行为"
+          : "该命令的引号/结构无法安全切分出可靠前缀";
         try {
           await client.sendMessage(targetChatId(approver), {
             msgtype: "markdown",
-            markdown: { content: "📌 该命令含动态构造（$() 等），无法生成可靠规则，本次已一次性放行。" },
+            markdown: { content: `📌 ${why}，本次已一次性放行（未保存规则）。` },
           });
         } catch { /* best-effort */ }
       }
