@@ -147,11 +147,14 @@ t("总是: 段首环境变量前缀剥掉后生成", () => {
 t("总是: 含 $()/反引号不生成(返回空)", () => {
   assert.deepEqual(alwaysAllowRulesFor("Bash", bash("echo $(whoami)")), []);
 });
-t("总是: 引号内的管道符被误切时不生成垃圾规则(实战回归)", () => {
+t("总是: 引号内管道符不再误切, 正确生成规则(引号感知升级)", () => {
   assert.deepEqual(
     alwaysAllowRulesFor("Bash", bash('grep -h -iE "proxy|7890|1087" ~/.zshrc | head -8')),
-    [],
+    ["Bash(grep *)", "Bash(head *)"],
   );
+});
+t("总是: 引号未闭合不生成", () => {
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash('grep "unclosed pattern file.txt')), []);
 });
 t("匹配: 反斜杠转义的管道/分号不作段分隔(grep 交替、find \\;)", () => {
   assert.equal(
@@ -184,6 +187,28 @@ t("总是: 生成的规则能匹配原命令(闭环)", () => {
   const cmd = 'date "+%Y%m%d"; cd /a && timeout=60 python3 .claude/skills/x/run.py --b';
   const rules = alwaysAllowRulesFor("Bash", bash(cmd));
   assert.ok(ruleAllows(rules, "Bash", bash(cmd)), `generated rules should allow original: ${rules.join(", ")}`);
+});
+
+// ── 引号感知分段 ────────────────────────────────────────────────────────
+t("引号感知: 单引号内的管道不切段(rg 交替实战回归)", () => {
+  assert.equal(
+    ruleAllows(["Bash(rg *)"], "Bash", bash("rg -il 'commons-processor|cournot|flywheel' /tmp")),
+    "Bash(rg *)",
+  );
+});
+t("引号感知: 双引号内的换行与管道不切段(ontology ask 长文实战回归)", () => {
+  const cmd = '~/.claude/skills/ontology/ontology ask "第一行\n第二行|带管道; 带分号"';
+  assert.equal(
+    ruleAllows(["Bash(~/.claude/skills/ontology/ontology ask *)"], "Bash", bash(cmd)),
+    "Bash(~/.claude/skills/ontology/ontology ask *)",
+  );
+});
+t("引号感知: python3 -c 整体成单段(正确地卡, 而非切碎地卡)", () => {
+  assert.equal(ruleAllows(["Bash(cd *)"], "Bash", bash('cd /tmp && python3 -c "import os\nprint(1)"')), undefined);
+});
+t("引号感知: 引号外的分隔符照常切段", () => {
+  assert.equal(ruleAllows(["Bash(cat *)"], "Bash", bash("cat 'a|b.txt' | bash")), undefined);
+  assert.ok(ruleAllows(["Bash(cat *)", "Bash(head *)"], "Bash", bash("cat 'a|b.txt' | head")));
 });
 
 // ── heredoc 剥离 ────────────────────────────────────────────────────────

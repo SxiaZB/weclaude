@@ -150,6 +150,9 @@ const Approval = z.object({
   // 用于给危险前缀 (如 "Bash(rm *)", "Bash(git push *)") 兜底 — 即使 ⏱ 窗口开着
   // 也逐条确认, 语义对齐 Claude Code 的 permissions.ask。
   askRules: z.array(z.string()).default([]),
+  // 审批卡 quote_area 里命令/参数体的最大字符数。WeCom 未公开该字段上限, 发送
+  // 失败会自动缩到 600 重试一次 (见 approval.ts), 所以可以放心调大。
+  cardQuoteMaxChars: z.number().int().positive().default(1200),
 });
 
 const SyncTarget = z.object({
