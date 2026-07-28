@@ -696,9 +696,24 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
     // Terminal stop_reason → emit turn_end so onItem closes the live bubble.
     // `tool_use` is intentionally excluded — more turns will follow once the
     // tool result lands; finalizing now would split a single logical reply.
-    if (isFinal) out.push({ kind: "turn_end" });
+    //
+    // 但 stop_reason 是 **消息级** 字段, 而 CC 把同一个 message.id 拆成多行落盘
+    // (thinking / text / tool_use 各占一行), 每行都原样带着这个 stop_reason ——
+    // 终态消息的 thinking 行先落盘, 就已经是 end_turn 了。在它上面收口 = turn 提前
+    // 结束: 紧随其后的真正答案(text 行)落在已关闭的 turn 之外, 只能走 standalone,
+    // 且此后整轮的 tool/text 全部退化成散装气泡。终态消息里必然有 text 块 (含
+    // tool_use 的消息 stop_reason 恒为 "tool_use"), 且实测终态消息从不拆出第二个
+    // text 行 —— 所以"本行带 text 块"精确等价于"本消息的最后一行"。
+    if (isFinal && blocks.some((b) => b?.type === "text")) out.push({ kind: "turn_end" });
     return out;
   }
+
+  // CC (≥2.1.198) 在一轮真正跑完后写一行 `system/turn_duration` —— 权威收口信号。
+  // 补上 stop_reason 路径覆盖不到的场景: 被 esc 打断的 turn 只剩 thinking 行, 永远
+  // 没有终态 text 行, 否则 brief turn 会一直挂到 hardTimer。与 stop_reason 收口重复
+  // 时无害 —— closeBriefTurn / finalizeStream 都是幂等的。goal 模式下 Stop hook 拦住
+  // 了收尾, CC 不写这一行, 所以不会把自主执行提前踢出 goal 模式。
+  if (line.type === "system" && line.subtype === "turn_duration") return [{ kind: "turn_end" }];
 
   // Slash-command records for TUI-only commands land here as `type:"system"`,
   // `subtype:"local_command"` — the invocation itself and, if present, a
@@ -1479,6 +1494,9 @@ interface AttachState {
   briefHadTool?: boolean;
   /** 本 turn 由 slash 命令 (/context…) 触发 —— 其 skill_output 即答案, 写进气泡而非 standalone。 */
   briefIsSlash?: boolean;
+  /** CLI 侧最近一条用户输入, 用作下一个"无气泡 turn"(ensureBriefTurn) 的 userQuery。
+   *  WeCom 发起的 turn 直接从 dispatch 拿到原文, 用不到它。 */
+  pendingBriefQuery?: string;
   /** True while a `/goal` is active (session-scoped Stop hook self-driving the
    *  model). Goal runs never emit a terminal stop_reason, so brief-mode's
    *  turn_end-gated flush would swallow the whole run into the turn store while
@@ -1930,6 +1948,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   //   • 无工具 → 直接把 Claude 最终文本 (或 slash 命令的 skill_output) 写进这条气泡。
   //   • 有工具 → 气泡收成 "✴️ 详情链接", 最终文本另发一条 standalone。
   // 其它所有 item 只写入 turn detail store。
+  // 能证明"assistant 已经在产出"的 item —— 见到它们才补开无气泡 turn。
+  const BRIEF_TURN_OPENERS = new Set<RenderItem["kind"]>(["text", "tool_use", "tool_result", "skill_output"]);
+
   const briefDetailLink = (turnId: string): string =>
     `✴️ [View turn details](${buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId)})`;
 
@@ -1967,6 +1988,23 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       log.warn({ sessionId: a.sessionId, turnId, err: (e as Error).message }, "brief: turn ack failed");
     }
     log.info({ sessionId: a.sessionId, turnId, isSlash }, "brief: turn started");
+  };
+
+  // 无气泡 turn。CLI 侧自己开的一轮 (WeCom 从没发过消息, 拿不到 frame/streamId), 以及
+  // 收口后仍有 item 补写进来的情况, 都要有一个 turn 承接 —— 否则每条 tool/text 都掉进
+  // fallback standalone, 一轮工具密集的对话能在群里刷出几十条散装气泡。这里只推一条
+  // 详情链接当入口, 其余全部收进 turn 页, 与 WeCom 侧发起的 turn 表现一致。
+  const ensureBriefTurn = (a: AttachState): void => {
+    if (a.briefTurnId) return;
+    const turnId = newTurnId();
+    a.briefTurnId = turnId;
+    a.briefHadTool = false;
+    a.briefIsSlash = false;
+    const q = a.pendingBriefQuery?.replace(/^> ?/gm, "").trim();
+    a.pendingBriefQuery = undefined;
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: q || undefined });
+    enqueueStandalone(a, briefDetailLink(turnId));
+    log.info({ sessionId: a.sessionId, turnId }, "brief: turn started (CLI-side, no bubble)");
   };
 
   // 本轮一旦出现工具调用 / tool_result / 非 final 文本, 就说明这不是"一句话答完"的
@@ -2034,9 +2072,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // 收口结论: 无工具 → 答案 + 详情链接一并写进 loading 气泡 (仍是一条消息);
         // 有工具 → 气泡留给 closeBriefTurn 收详情链接, 结论另发 standalone。
         // 每个 turn 都必须留一个可回溯入口, 单句回答也要带链接。
-        if (a.briefHadTool) sendStandalone(a, item.body);
+        // 无气泡 turn (ensureBriefTurn 开的) 没有可写的气泡, 链接已在开场推过 → 直接发结论。
+        if (a.briefHadTool || !a.briefBubble) sendStandalone(a, item.body);
         else void finishBriefBubble(a, `${item.body}\n\n${briefDetailLink(turnId)}`);
-        recordCloseOpenTurns(a.target, turnId);
+        recordCloseOpenTurns({ target: a.target, sessionId: a.sessionId, exceptId: turnId });
       }
       return;
     }
@@ -2120,6 +2159,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // turn_end. Placed before the brief short-circuit so goal wins over brief.
     if (item.kind === "goal_start") { enterGoalMode(a, item.condition); return; }
     if (a.goalActive) { handleGoalItem(a, item); return; }
+    // Brief 模式下没有活跃 turn 时, 任何 assistant 侧产出都补开一个无气泡 turn ——
+    // 覆盖 CLI 侧直接开的新一轮 (WeCom 没参与, 拿不到 frame) 与收口后的零星补写。
+    // user_text 只记下来当下一轮的 query, 不开 turn (CLI 敲字 ≠ 一定有回复)。
+    if (cfg.wrc.mirror.brief && !a.briefTurnId) {
+      if (item.kind === "user_text") a.pendingBriefQuery = item.body;
+      else if (BRIEF_TURN_OPENERS.has(item.kind)) ensureBriefTurn(a);
+    }
     // Usage snapshots never flow into WeCom bubbles — brief 分支下 handleBriefItem
     // 会把它写进 turn store, 非 brief 下直接吞掉, 保持 onItem 主流程只处理有渲染
     // 输出的 item 类型。

@@ -101,9 +101,11 @@ export interface DetailStore {
   appendTurnItem(id: string, item: TurnItem): void;
   addTurnUsage(id: string, delta: { model?: string; messageId?: string; usage: TurnUsage }): void;
   closeTurn(id: string): void;
-  // 收尾所有仍开着的 turn (可选按 target 限定, 可选排除某一 id)。返回被关闭的 id。
-  // 用途: 新一轮发出 finish 消息时, 把此前遗留未关闭的 turn 一并标记结束。
-  closeOpenTurns(target?: string, exceptId?: string): string[];
+  // 收尾所有仍开着的 turn (可选按 target / sessionId 限定, 可选排除某一 id)。返回被
+  // 关闭的 id。用途: 新一轮发出 finish 消息时, 把此前遗留未关闭的 turn 一并标记结束。
+  // sessionId 必须传: 同一个 chat 下的多个 #tag 会话共享 target, 只按 target 收尾会
+  // 把兄弟 agent 正在跑的 turn 页面提前打成「已完成」(页面随即停止轮询, 看着像卡死)。
+  closeOpenTurns(scope: { target?: string; sessionId?: string; exceptId?: string }): string[];
   put(rec: DetailRecord): void;
   get(id: string): DetailRecord | undefined;
 }
@@ -246,13 +248,14 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
       if (!r || r.kind !== "turn" || r.closed) return;
       put({ ...r, closed: true, updatedAt: Date.now() });
     },
-    closeOpenTurns: (target, exceptId) => {
+    closeOpenTurns: ({ target, sessionId, exceptId }) => {
       const now = Date.now();
       const closed: string[] = [];
       for (const [id, r] of store) {
         if (r.kind !== "turn" || r.closed) continue;
         if (id === exceptId) continue;
         if (target && r.target !== target) continue;
+        if (sessionId && r.sessionId !== sessionId) continue;
         put({ ...r, closed: true, updatedAt: now });
         closed.push(id);
       }
