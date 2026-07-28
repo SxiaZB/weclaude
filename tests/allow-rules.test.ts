@@ -186,6 +186,40 @@ t("总是: 生成的规则能匹配原命令(闭环)", () => {
   assert.ok(ruleAllows(rules, "Bash", bash(cmd)), `generated rules should allow original: ${rules.join(", ")}`);
 });
 
+// ── heredoc 剥离 ────────────────────────────────────────────────────────
+t("heredoc: 带引号 heredoc 正文不参与匹配(写报告场景)", () => {
+  const cmd = "cat > /tmp/report.txt <<'EOF'\nh2. 标题 | 内容; rm -rf x\n$(fake)\nEOF";
+  assert.equal(ruleAllows(["Bash(cat *)"], "Bash", bash(cmd)), "Bash(cat *)");
+});
+t("heredoc: 未加引号的 heredoc 正文会展开, 不可剥离(保守发卡)", () => {
+  const cmd = "cat > /tmp/x <<EOF\n$(rm -rf /tmp/y)\nEOF";
+  assert.equal(ruleAllows(["Bash(cat *)"], "Bash", bash(cmd)), undefined);
+});
+t("heredoc: deny 扫描对不可剥离的 heredoc 按原文扫(fail-closed)", () => {
+  const cmd = "cat > /tmp/x <<EOF\ndd if=/dev/zero\nEOF";
+  assert.equal(ruleMatchesAny(["Bash(dd *)"], "Bash", bash(cmd)), "Bash(dd *)");
+});
+t("heredoc: 总是可对带引号 heredoc 命令生成规则", () => {
+  const cmd = "cat > /tmp/x.txt <<'EOF'\n任意正文 | 含分隔符\nEOF";
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash(cmd)), ["Bash(cat *)"]);
+});
+
+// ── 生成护栏: 解释器与覆盖过滤 ──────────────────────────────────────────
+t("总是: 解释器头部拿不到脚本路径时整体放弃(不生成 Bash(python3 *))", () => {
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("python3 - <<'PYEOF'\nprint(1)\nPYEOF")), []);
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("bash -c ls")), []);
+});
+t("总是: 解释器带脚本路径仍正常生成", () => {
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("python3 tools/gen.py --x")), ["Bash(python3 tools/gen.py *)"]);
+});
+t("总是: 已被现有规则覆盖的段不再生成冗余规则", () => {
+  assert.deepEqual(
+    alwaysAllowRulesFor("Bash", bash("cd service && npx tsc --noEmit && echo TS_OK"),
+      ["Bash(cd *)", "Bash(echo *)"]),
+    ["Bash(npx tsc *)"],
+  );
+});
+
 // ── mapClaudePermissions (Claude settings.json 导入映射) ────────────────
 t("导入: 三层各自映射且保序去重", () => {
   const m = mapClaudePermissions({
