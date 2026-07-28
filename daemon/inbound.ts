@@ -15,6 +15,7 @@ import { getLastResponse } from "./last-response.js";
 import { scanClaudeSessions, type SessionInfo } from "./session-scan.js";
 import { computeUsage, renderUsageReport } from "./usage.js";
 import { computeAuditReport } from "./audit.js";
+import { syncProjectConfig, renderSyncReport } from "./cfg-sync.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
 import { tagOfKey, withTagHeader } from "./session-label.js";
 import {
@@ -135,6 +136,13 @@ const NEW_RE = /^\/new(?:\s+(claude-internal|claude|codebuddy))?$/i;
 const isNewCommand = (text: string): boolean => NEW_RE.test(text.trim());
 const cliOfNewCommand = (text: string): CliBackendName | undefined =>
   NEW_RE.exec(text.trim())?.[1]?.toLowerCase() as CliBackendName | undefined;
+// `/cfgsync` (alias `/sync`) — reconcile the project's per-CLI config trees.
+// Bare form is a dry run; `apply` is the only form that writes.
+const CFGSYNC_RE = /^\/(?:cfgsync|sync)(?:\s+(apply))?$/i;
+const parseCfgSyncCommand = (text: string): { apply: boolean } | undefined => {
+  const m = CFGSYNC_RE.exec(text.trim());
+  return m ? { apply: Boolean(m[1]) } : undefined;
+};
 const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 const isEnterCommand = (text: string): boolean => text.trim() === "/n";
@@ -179,6 +187,7 @@ const renderHelp = (): string =>
     "`/usage` 真实订阅额度 %",
     "`/cost` token/成本估算",
     "`/audit` 本会话 token/成本明细 (含 subagent) · `/audit <tag>` 指定标签会话",
+    "`/cfgsync` 预演跨 CLI 项目配置同步 · `/cfgsync apply` 执行 (需授权)",
     "`/help` 本帮助",
     "`/skill-b` 广播接口用法 (贴给 Claude)",
     "",
@@ -724,6 +733,22 @@ export const installInboundRouter = (
         const r = await bridge.submitPane(who);
         await replyText(frame, msg, who, r.ok ? "✅ Enter sent" : `[weclaude] /n failed: ${r.reason ?? "unknown"}`);
       }
+      return { stop: true };
+    }
+    // /cfgsync [apply] — 3-way merge of the bound project's per-CLI config
+    // trees (CLAUDE.md ⇄ CODEBUDDY.md, .claude/{skills,commands,agents} ⇄
+    // .codebuddy/...). Writes files, so it sits AFTER the allowFrom gate.
+    const cs = parseCfgSyncCommand(text);
+    if (cs) {
+      const cwd = "getCwd" in bridge ? bridge.getCwd(who).runningCwd : expandHome(cfg.wrc.cwd);
+      let body: string;
+      try {
+        body = renderSyncReport(await syncProjectConfig(cwd, cs.apply));
+      } catch (e) {
+        body = `[weclaude] /cfgsync failed: ${(e as Error).message}`;
+      }
+      log.info({ who, cwd, apply: cs.apply }, "/cfgsync");
+      await replyText(frame, msg, who, body);
       return { stop: true };
     }
     // /peers — this chat's own session roster (default + `#tag` siblings), with
