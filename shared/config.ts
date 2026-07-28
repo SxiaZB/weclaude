@@ -152,7 +152,12 @@ const Approval = z.object({
   askRules: z.array(z.string()).default([]),
   // 审批卡 quote_area 里命令/参数体的最大字符数。WeCom 未公开该字段上限, 发送
   // 失败会自动缩到 600 重试一次 (见 approval.ts), 所以可以放心调大。
+  // 注意手机端客户端只渲染 quote 区前 2~3 行 (实测), 看全命令靠下面的前置消息。
   cardQuoteMaxChars: z.number().int().positive().default(1200),
+  // Bash 命令超过 ~200 字 (卡片手机端可见极限) 时, 发卡前先推一条含完整命令的
+  // markdown 消息 (普通气泡可展开, 无卡片渲染截断)。此值为前置消息的总字数上限
+  // (超出截断并注明; 按 1800 字/条分块发送)。0 = 关闭前置消息。
+  fullCommandPreludeChars: z.number().int().nonnegative().default(3600),
 });
 
 const SyncTarget = z.object({
