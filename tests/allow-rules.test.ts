@@ -153,6 +153,20 @@ t("总是: 引号内的管道符被误切时不生成垃圾规则(实战回归)"
     [],
   );
 });
+t("匹配: 反斜杠转义的管道/分号不作段分隔(grep 交替、find \\;)", () => {
+  assert.equal(
+    ruleAllows(["Bash(grep *)", "Bash(cd *)"], "Bash", bash('cd /tmp && grep -n "tidb-ro\\|qm-ro" cfg.py')),
+    "Bash(cd *) + Bash(grep *)",
+  );
+  // 未转义的管道仍然切段
+  assert.equal(ruleAllows(["Bash(grep *)"], "Bash", bash("grep a f | bash")), undefined);
+});
+t("总是: 转义管道的 grep 交替模式可生成规则(实战回归)", () => {
+  assert.deepEqual(
+    alwaysAllowRulesFor("Bash", bash('cd /tmp/x && grep -n "def foo\\|def bar" main.py')),
+    ["Bash(cd /tmp/x *)", "Bash(grep *)"],
+  );
+});
 t("总是: 引号配对的正常管道命令不受影响", () => {
   assert.deepEqual(
     alwaysAllowRulesFor("Bash", bash('grep "ERROR" app.log | head -3')),

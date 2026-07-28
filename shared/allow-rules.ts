@@ -66,7 +66,9 @@ const bashSpecMatches = (spec: string, segment: string): boolean => {
 // 含命令替换的整条命令直接不命中 — 规则匹配的是字面前缀, 而 $(…)/反引号的实际
 // 行为取决于运行时展开, 字面匹配给不出可信判断。
 const HAS_SUBSTITUTION = /[`]|\$\(/;
-const SEGMENT_SPLIT = /\r?\n|&&|\|\||;|\|/;
+// 反斜杠转义的 ; 和 | 不是 shell 分隔符 (grep "a\|b" 的正则交替、find 的 \; ),
+// 不能当段边界切 — 否则 grep 交替模式永远匹配不上 Bash(grep *) 类规则。
+const SEGMENT_SPLIT = /\r?\n|&&|\|\||(?<!\\)[;|]/;
 
 const bashCommandAllowed = (bashSpecs: Array<string | undefined>, command: string): string[] | undefined => {
   if (HAS_SUBSTITUTION.test(command)) return undefined;
