@@ -19,6 +19,7 @@ import type { WSClient, WsFrame, WsFrameHeaders, EventMessageWith, TemplateCard,
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
+import { isModalPane, type ModalPaneVerdict } from "../shared/modal-pane.js";
 import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl } from "./detail.js";
@@ -1017,6 +1018,25 @@ const extractPaneAssistantTail = (pane: string): string => {
   return text.length >= 12 ? text : "";
 };
 
+// Is the pane sitting on a modal picker that would eat an injection?
+//
+// Deliberately NOT capturePaneTail: that one passes `-S -N`, which reaches
+// into the scrollback. A confirm the user already answered lives in the
+// scrollback forever, so a scrollback-inclusive capture would keep matching it
+// long after the pane went back to accepting input — wedging the mirror shut
+// permanently. Bare `-p` captures only what is currently on screen.
+//
+// Trailing blank rows are trimmed first so the 15-row window lands on the
+// bottom-most *content* (a picker's footer is its last line); 15 rows spans
+// "title → options → footer" on every confirm layout we've seen.
+const MODAL_SCAN_ROWS = 15;
+const detectModalPicker = async (target: string): Promise<ModalPaneVerdict> => {
+  const r = await tmuxRun(["capture-pane", "-t", target, "-p"]);
+  if (!r.ok) return { modal: false };
+  const lines = r.stdout.replace(/\s+$/u, "").split("\n");
+  return isModalPane(lines.slice(-MODAL_SCAN_ROWS).join("\n"));
+};
+
 // Two fingerprints, derived from different ends of `text`:
 //   headFp — first 8 non-ws chars; used for "did paste land" against a wide
 //     window because long pastes wrap and the head sits near the top of the
@@ -1041,6 +1061,23 @@ const fingerprints = (text: string): { headFp: string; tailFp: string } => {
 //   4. on stuck-after-Enter, retry Enter once with extra settle.
 const injectViaTmux = async (target: string, text: string, images: string[], log: Logger, freshSpawn: boolean): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
   log.info({ target, len: text.length, images: images.length, freshSpawn }, "mirror inject (tmux)");
+
+  // Never type into a modal picker (see detectModalPicker). Checked before the
+  // image pump too — a C-v into a picker is just as destructive as a paste.
+  // Escape hatch: WECLAUDE_MODAL_GUARD=0, in case a future TUI layout trips it.
+  if (process.env.WECLAUDE_MODAL_GUARD !== "0") {
+    const modal = await detectModalPicker(target);
+    if (modal.modal) {
+      log.warn({ target, title: modal.title }, "mirror inject: modal picker on pane, refusing to inject");
+      const what = modal.title ? `「${modal.title}」` : "原生确认框";
+      return {
+        ok: false,
+        reason: `目标会话停在 CLI ${what} 等待确认,消息未送达。`
+          + `(强行注入会替你点掉确认框并吞掉这条消息)`
+          + `请到 tmux 里处理该确认框,或发 /stop 取消当前操作后重发。`,
+      };
+    }
+  }
 
   // Pump images first via clipboard+C-v so each one is attached as a separate
   // image content block. Each C-v needs a brief settle for Claude Code's TUI
