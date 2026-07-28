@@ -966,6 +966,15 @@ const RECENT_SIGS_MAX = 64;
 // Anything else (webp/heic/...) we transcode to PNG via `sips` first; sips ships
 // with macOS so no extra dep. Files are cached next to the original; cleanup is
 // left to the inbox dir's regular eviction.
+//
+// 注入策略 —— JXA 主路径 + AppleScript 兜底：
+//   codebuddy v2.72.0 的 release note 明确说"macOS 图片粘贴新增 JXA NSPasteboard
+//   后备方案，兼容企业微信等第三方截图工具"——说明 codebuddy 的 TUI 在主路径
+//   (AppleScript «class PNGf») 读不到图时，会走 JXA `$.NSPasteboard.generalPasteboard`
+//   后备。我们显式用 JXA 写一份 `NSPasteboardTypePNG` flavor，保证 codebuddy 的
+//   后备路径一定能读到；同时 `NSPasteboardTypePNG` 和 `«class PNGf»` 在系统层是
+//   同一个 UTI (public.png)，Claude Code 的主路径读 JXA 写入的 flavor 也没问题。
+//   JXA 失败（极少见，比如 AppKit 框架加载失败）才回退到纯 AppleScript。
 const PB_CLASS_BY_EXT: Record<string, string> = {
   png: "«class PNGf»",
   jpg: "JPEG picture",
@@ -996,11 +1005,34 @@ const setMacClipboardImage = async (imgPath: string): Promise<{ ok: boolean; rea
     pathToUse = tmp;
     pbClass = "«class PNGf»";
   }
-  // POSIX path quoting: backslash-escape `\` and `"` for AppleScript string literal.
+  // POSIX path quoting: backslash-escape `\` and `"` for both AppleScript and
+  // JXA string literals (二者转义规则一致)。
   const escaped = pathToUse.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+  // 主路径：JXA 直接写 NSPasteboardTypePNG。clearContents 后单 flavor 写入，
+  // 同时覆盖 codebuddy v2.72.0 JXA 后备读路径和 Claude Code 主路径。
+  // (public.png UTI 与 «class PNGf» 同一，Claude Code 读这份不会回归。)
+  const jxa = [
+    "ObjC.import('AppKit');",
+    "const pb = $.NSPasteboard.generalPasteboard;",
+    "pb.clearContents();",
+    `const data = $.NSData.dataWithContentsOfFile("${escaped}");`,
+    "if (data.isNil()) $.abort('read failed');",
+    "pb.setData(data, forType: $.NSPasteboardTypePNG);",
+  ].join(" ");
+  const rJxa = await runProc("osascript", ["-l", "JavaScript", "-e", jxa]);
+  if (rJxa.ok) return { ok: true };
+
+  // 兜底：JXA 失败才回退纯 AppleScript（用原 pbClass，可能是 JPEG/GIF/TIFF，
+  // 不强转 PNG —— 这条路径本来就是 Claude Code 历史验证过的）。
   const script = `set the clipboard to (read POSIX file "${escaped}" as ${pbClass})`;
-  const r = await runProc("osascript", ["-e", script]);
-  if (!r.ok) return { ok: false, reason: `osascript: ${r.stderr.slice(-200)}` };
+  const rApple = await runProc("osascript", ["-e", script]);
+  if (!rApple.ok) {
+    return {
+      ok: false,
+      reason: `clipboard set failed: jxa=${rJxa.stderr.slice(-120)}; applescript=${rApple.stderr.slice(-120)}`,
+    };
+  }
   return { ok: true };
 };
 
@@ -1100,8 +1132,24 @@ const fingerprints = (text: string): { headFp: string; tailFp: string } => {
 //   3. narrow-window poll (last 5 rows = just the input box, NOT the echo
 //      above) for tailFp absence → submit was honored.
 //   4. on stuck-after-Enter, retry Enter once with extra settle.
-const injectViaTmux = async (target: string, text: string, images: string[], log: Logger, freshSpawn: boolean): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
-  log.info({ target, len: text.length, images: images.length, freshSpawn }, "mirror inject (tmux)");
+const injectViaTmux = async (target: string, text: string, images: string[], log: Logger, freshSpawn: boolean, backendName: CliBackendName): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
+  log.info({ target, len: text.length, images: images.length, freshSpawn, backendName }, "mirror inject (tmux)");
+
+  // 图片注入策略按后端分流：
+  //   claude / claude-internal —— 走 macOS 剪贴板 + Ctrl+V，TUI 收到 \x16 后
+  //     直接读系统剪贴板的 PNGf flavor，附加为 image content block。
+  //   codebuddy —— 它的 TUI 在 TMUX 环境下收到 C-v 后会先调
+  //     syncTmuxToSystemClipboard()（执行 `tmux save-buffer - | pbcopy`），
+  //     这会用 tmux buffer 的文本内容覆盖系统剪贴板，把 daemon 刚写入的
+  //     PNGf flavor 冲掉（pbcopy 只写 public.utf8-plain-text，NSImage 读不到）。
+  //     所以 codebuddy 走 C-v 必然失败 —— 改走 @<path> 文本提及，让 LLM
+  //     调 Read 工具读图（Read 支持图片，见 codebuddy tools-reference.md）。
+  //     v2.52.4 之后 @<path> 不自动转 image block，但 LLM 看到路径会 Read。
+  if (backendName === "codebuddy") {
+    const refs = images.map((p) => `@${p}`);
+    const textWithRefs = refs.length ? (text ? `${refs.join("\n")}\n${text}` : refs.join("\n")) : text;
+    return injectViaTmuxText(target, textWithRefs, log, freshSpawn);
+  }
 
   // Pump images first via clipboard+C-v so each one is attached as a separate
   // image content block. Each C-v needs a brief settle for Claude Code's TUI
@@ -1127,6 +1175,12 @@ const injectViaTmux = async (target: string, text: string, images: string[], log
     return e.ok ? { ok: true } : { ok: false, reason: `tmux send-keys Enter failed: ${e.stderr.slice(-200)}` };
   }
 
+  return injectViaTmuxText(target, text, log, freshSpawn);
+};
+
+// 文本 paste + Enter 提交 + 自校验。从 injectViaTmux 抽出来，让 codebuddy
+// 后端的 @<path> 回退路径也能复用同样的 paste-verify 逻辑。
+const injectViaTmuxText = async (target: string, text: string, log: Logger, freshSpawn: boolean): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
   // Warm pane: tight timings, low latency. Fresh spawn (claude --resume just
   // started, transcript still loading): extended timings — bracketed-paste
   // end can take 4-7s to be honored on a cold TUI. Only the fresh-spawn path
@@ -1295,7 +1349,9 @@ const injectViaSpawn = (args: InjectArgs): Promise<{ ok: boolean; reason?: strin
 
 const inject = (args: InjectArgs): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
   const target = (args.tmuxTarget ?? "").trim();
-  return target ? injectViaTmux(target, args.text, args.images ?? [], args.log, args.freshSpawn ?? false) : injectViaSpawn(args);
+  if (!target) return injectViaSpawn(args);
+  const backendName = backendForPath(args.jsonlPath).name;
+  return injectViaTmux(target, args.text, args.images ?? [], args.log, args.freshSpawn ?? false, backendName);
 };
 
 // ── Per-session injection queue ───────────────────────────────────────
