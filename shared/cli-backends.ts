@@ -57,6 +57,11 @@ export interface NormalizedTranscriptLine {
   };
   isMeta?: boolean;
   isSidechain?: boolean;
+  /** 后端只能说"这条 assistant 消息写完了", 说不出"这一轮结束了" (codebuddy: 每条
+   *  记录都是独立的 completed message, 中途叙述与最终答复完全同形)。置位表示**软**
+   *  收口 —— mirror-bridge 挂一小段静默期确认, 期间来了新 item 就撤销。原生 Claude
+   *  有 end_turn / turn_duration 两个硬信号, 永远不置位。 */
+  softTurnEnd?: boolean;
 }
 
 export interface CliBackend {
@@ -179,12 +184,12 @@ const normalizeCodebuddy = (raw: unknown): NormalizedTranscriptLine | null => {
         model: providerData.model as string | undefined,
         usage: providerData.usage as NormalizedTranscriptLine["message"] extends { usage?: infer U } ? U : undefined,
       };
-      // Map codebuddy status:"completed" → stop_reason:"end_turn" so brief-mode's
-      // turn-end flush fires. Other status values left undefined (defer to the
-      // timeout-based turn-end fallback in the caller).
+      // status:"completed" 只说明这条记录写完了 —— codebuddy 把中途叙述和最终答复
+      // 写成同形的独立 message, 映射成 stop_reason:"end_turn" 会让"中间说一句"就把
+      // 整个 turn 收掉 (后半轮全部退化成散装气泡)。改为软收口, 交给 mirror-bridge
+      // 用静默期确认。
       const status = r.status as string | undefined;
-      if (status === "completed") (msg as { stop_reason?: string }).stop_reason = "end_turn";
-      return { type: "assistant", ...uuids, message: msg };
+      return { type: "assistant", ...uuids, message: msg, softTurnEnd: status === "completed" };
     }
     return null;
   }

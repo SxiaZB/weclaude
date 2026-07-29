@@ -115,7 +115,7 @@ export const recordTurnClose = (id: string): void => {
 };
 
 // 收尾此前遗留未关闭的 turn (按 target + sessionId 限定, 排除仍在收尾的当前 turn)。
-export const recordCloseOpenTurns = (scope: { target?: string; sessionId?: string; exceptId?: string }): void => {
+export const recordCloseOpenTurns = (scope: { target?: string; sessionId?: string; exceptIds?: readonly string[] }): void => {
   if (!store) return;
   for (const id of store.closeOpenTurns(scope)) {
     const full = store.get(id);

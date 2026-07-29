@@ -312,6 +312,8 @@ interface TranscriptLine {
   };
   isMeta?: boolean;
   isSidechain?: boolean;
+  /** 见 NormalizedTranscriptLine.softTurnEnd —— 后端只能确认"这条消息写完了"。 */
+  softTurnEnd?: boolean;
 }
 
 // Target keys are `user:xxx[#tag]` / `chat:xxx[#tag]`. Strip the principal
@@ -447,11 +449,12 @@ type RenderItem =
       calls: Array<{ toolUseId: string; name: string; input: unknown }>;
     }
   | { kind: "tool_result"; body: string; toolUseId: string; full: string }
-  // Assistant turn truly ended (stop_reason ∈ {end_turn, stop_sequence,
-  // max_tokens}). Emitted AFTER any text/tool_use items from the same line so
-  // onItem can finalize the bubble once the content has been appended. Pure
-  // signal — no body to render.
-  | { kind: "turn_end" }
+  // Assistant turn ended. Emitted AFTER any text/tool_use items from the same
+  // line so onItem can finalize the bubble once the content has been appended.
+  // Pure signal — no body to render.
+  //   • 硬信号 (soft 缺省): stop_reason==="end_turn" 的终态行, 或 system/turn_duration。
+  //   • soft:true: 后端只能说"这条消息写完了" (codebuddy), 需静默期确认才作数。
+  | { kind: "turn_end"; soft?: boolean }
   // Per-assistant-line usage snapshot (model + token counts). Consumed only in
   // brief mode where it's fed into the turn store for aggregate chip display.
   // Non-brief onItem drops it silently — no bubble, no stream side effect.
@@ -618,13 +621,24 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
     const blocks = line.message?.content;
     if (!Array.isArray(blocks)) return [];
     // Mark text items emitted from a terminal-stop_reason line as `final`.
-    // Per Anthropic protocol, a line with stop_reason ∈ {end_turn, stop_sequence,
-    // max_tokens} contains only text blocks (tool_use → stop_reason="tool_use"),
+    // Per Anthropic protocol, an `end_turn` line contains only text blocks
+    // (tool_use → stop_reason="tool_use"),
     // so these texts ARE the agent's final answer for the turn. Downstream uses
     // `final` to decide bubble splits — mid-turn text appends; only final text
     // after tools peels out into its own standalone (preview = real answer).
+    // 只认 end_turn。另两个终态在 CC 落盘语义里都不是"这一轮说完了":
+    //   • stop_sequence —— 实测 152 次里 ~150 次是 CC 合成的错误/限额行
+    //     ("API Error: …" / "You've hit your session limit" / "No response
+    //     requested."), 其中可重试的那种 (stalled mid-stream / ECONNRESET) CC 会
+    //     自动续跑同一轮, 在它上面收口 = turn 中途断掉。真正终止的那些后面必跟
+    //     system/turn_duration, 由下方权威信号兜住, 不会漏收。
+    //   • max_tokens —— 语义是"消息被截断", CC 继续同一轮; 全量 transcript 0 命中。
     const sr = line.message?.stop_reason;
-    const isFinal = sr === "end_turn" || sr === "stop_sequence" || sr === "max_tokens";
+    const isFinal = sr === "end_turn";
+    // final 是三态: true=终句, false=已知的中途输出, undefined=后端说不清 (软收口)。
+    // 软后端不能填 false —— 那会让每句叙述都触发 earlyLinkBubble, 把 loading 气泡
+    // 提前收成详情链接, 一句话答完的 turn 也要拆成两条消息。
+    const textFinal = isFinal ? true : line.softTurnEnd ? undefined : false;
     let pending: Array<{ toolUseId: string; name: string; input: unknown }> = [];
     const flushPending = (): void => {
       if (pending.length === 0) return;
@@ -652,7 +666,7 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
       if (b?.type === "text" && typeof b.text === "string") {
         flushPending();
         const t = b.text.trim();
-        if (t && !deps.isOwnAssistantSend?.(t)) out.push({ kind: "text", body: t, final: isFinal });
+        if (t && !deps.isOwnAssistantSend?.(t)) out.push({ kind: "text", body: t, final: textFinal });
       } else if (b?.type === "tool_use" && deps.includeTools) {
         const name = b.name ?? "tool";
         const toolUseId = b.id ?? "";
@@ -705,6 +719,8 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
     // tool_use 的消息 stop_reason 恒为 "tool_use"), 且实测终态消息从不拆出第二个
     // text 行 —— 所以"本行带 text 块"精确等价于"本消息的最后一行"。
     if (isFinal && blocks.some((b) => b?.type === "text")) out.push({ kind: "turn_end" });
+    // 软收口 (codebuddy): 这条消息写完了, 但说不出后面还有没有 function_call。
+    else if (line.softTurnEnd) out.push({ kind: "turn_end", soft: true });
     return out;
   }
 
@@ -1422,6 +1438,23 @@ interface ToolEntry {
   result?: string;
 }
 
+/** Brief turn 的 loading 气泡 —— 起始以 "…" (finish=false) 挂住不关闭。turn 收口时
+ *  才定最终内容: 无工具→直接把结论写进这个气泡; 有工具→写详情链接 (结论另发
+ *  standalone)。hardTimer 兜底 WeCom ~6min stream 窗口, 到点强制收口。 */
+interface BriefBubble {
+  frame: WsFrameHeaders;
+  streamId: string;
+  hardTimer: NodeJS.Timeout;
+  done: boolean;
+}
+
+/** 已经 ack 过 (气泡挂出去了)、turn 记录也建好了, 但还没轮到它当活跃 turn。 */
+interface QueuedTurn {
+  turnId: string;
+  bubble: BriefBubble;
+  isSlash: boolean;
+}
+
 interface ActiveStream {
   turnId: string;
   frame: WsFrameHeaders;
@@ -1489,11 +1522,21 @@ interface AttachState {
   /** Brief turn 的 loading 气泡 —— 起始以 "…" (finish=false) 挂住不关闭。turn 收口
    *  时才定最终内容: 无工具→直接把结论写进这个气泡; 有工具→写详情链接 (结论另发
    *  standalone)。hardTimer 兜底 WeCom ~6min stream 窗口, 到点强制收口。 */
-  briefBubble?: { frame: WsFrameHeaders; streamId: string; hardTimer: NodeJS.Timeout; done: boolean };
+  briefBubble?: BriefBubble;
+  /** 尚未激活的 turn。上一 turn 还在跑时又收到 WeCom 消息 —— CC 会把它排进自己的队列,
+   *  要等当前轮结束才处理, 所以这边也必须排队: 强关当前 turn 会把仍在产出的后半轮
+   *  改挂到新 turn 上 (旧 turn 页提前变「已完成」)。closeBriefTurn 顺序放行。 */
+  briefQueue?: QueuedTurn[];
   /** 本 turn 是否出现过 tool_use —— 决定气泡收口写结论还是写详情链接。 */
   briefHadTool?: boolean;
   /** 本 turn 由 slash 命令 (/context…) 触发 —— 其 skill_output 即答案, 写进气泡而非 standalone。 */
   briefIsSlash?: boolean;
+  /** 本 turn 的结论是否已经落地 (写进气泡或发了 standalone), 防止软收口重复推送。 */
+  briefConcluded?: boolean;
+  /** 本 turn 最近一条 assistant text。软收口没有"终句"标记, 收口时拿它当结论。 */
+  briefLastText?: string;
+  /** 软收口的静默期计时器 —— 任何新 item 到达即撤销。 */
+  softEnd?: NodeJS.Timeout;
   /** CLI 侧最近一条用户输入, 用作下一个"无气泡 turn"(ensureBriefTurn) 的 userQuery。
    *  WeCom 发起的 turn 直接从 dispatch 拿到原文, 用不到它。 */
   pendingBriefQuery?: string;
@@ -1605,6 +1648,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // for >60s mid-turn and we don't want to drop the bubble while it's chewing.
   const FLUSH_MS = 250;
   const HARD_TIMEOUT_MS = 350_000;
+  /** 软收口静默期。后端只能说"这条消息写完了"(codebuddy) 时, 等这么久没有新 item
+   *  才认定一轮结束。取值只需盖住"叙述消息落盘 → 紧随其后的 function_call 落盘"
+   *  这一段, 与模型思考/工具执行时长无关。 */
+  const SOFT_TURN_END_MS = 4_000;
   const STREAM_SOFT_CAP = 18_000;
   const TOOL_DETAIL_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -1954,13 +2001,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const briefDetailLink = (turnId: string): string =>
     `✴️ [View turn details](${buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId)})`;
 
-  // 收口 loading 气泡: finish=true 写入最终内容, 只生效一次。发送失败则退回 standalone。
-  const finishBriefBubble = async (a: AttachState, content: string): Promise<void> => {
-    const b = a.briefBubble;
+  // 收口一条 loading 气泡: finish=true 写入最终内容, 只生效一次。发送失败退回 standalone。
+  // 排队中的 turn 也持有气泡, 所以气泡是显式入参而不是从 a 上取。
+  const finishBubble = async (a: AttachState, b: BriefBubble | undefined, content: string): Promise<void> => {
     if (!b || b.done) return;
     b.done = true;
     clearTimeout(b.hardTimer);
-    a.briefBubble = undefined;
+    if (a.briefBubble === b) a.briefBubble = undefined;
     try {
       await client.replyStream(b.frame, b.streamId, withSessionTag(a.target, content || " "), true);
     } catch (e) {
@@ -1969,25 +2016,49 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
   };
 
-  const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string, isSlash = false, userQuery = ""): Promise<void> => {
-    if (a.briefTurnId) closeBriefTurn(a); // 上一 turn 未收尾, 强制关掉再开新的
-    const turnId = newTurnId();
-    a.briefTurnId = turnId;
+  const finishBriefBubble = (a: AttachState, content: string): Promise<void> => finishBubble(a, a.briefBubble, content);
+
+  // 让一个已建好记录的 turn 成为活跃 turn。turn 级状态在这里统一归零 —— 唯一入口。
+  const openBriefTurn = (a: AttachState, q: QueuedTurn): void => {
+    a.briefTurnId = q.turnId;
+    a.briefBubble = q.bubble;
+    a.briefIsSlash = q.isSlash;
     a.briefHadTool = false;
-    a.briefIsSlash = isSlash;
+    a.briefConcluded = false;
+    a.briefLastText = undefined;
+    log.info({ sessionId: a.sessionId, turnId: q.turnId, isSlash: q.isSlash }, "brief: turn started");
+  };
+
+  // WeCom 侧发起一个 turn: 立刻挂 loading 气泡当 ack, 再决定是马上激活还是排队。
+  // 上一 turn 还在跑时绝不能强关它 —— CC 那边新消息也是排队的, 当前轮的后半段还会
+  // 继续落盘, 强关会把它们改挂到新 turn 上, 旧 turn 页则提前变「已完成」。
+  const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string, isSlash = false, userQuery = ""): Promise<void> => {
+    const turnId = newTurnId();
     recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: userQuery.trim() || undefined });
-    // hardTimer 兜底: turn 若无 final text / turn_end 收口 (卡死/漏收), 到点仍收气泡。
-    const hardTimer = setTimeout(
-      () => void finishBriefBubble(a, briefDetailLink(turnId)),
-      HARD_TIMEOUT_MS,
-    );
-    a.briefBubble = { frame, streamId, hardTimer, done: false };
+    // hardTimer 兜底: turn 若无终句 / turn_end 收口 (卡死/漏收), 到点仍收气泡。
+    const bubble: BriefBubble = { frame, streamId, hardTimer: undefined as unknown as NodeJS.Timeout, done: false };
+    const q: QueuedTurn = { turnId, bubble, isSlash };
+    bubble.hardTimer = setTimeout(() => {
+      // 到点还在排队 = 前一个 turn 卡死或漏收 turn_end。强关它放行 —— 队列必须能自愈,
+      // 否则这条消息的产出会一直记到那个僵尸 turn 上。气泡此时已过 WeCom 更新窗口,
+      // 收成详情链接即可, 真正要紧的是让本 turn 激活。
+      if (a.briefQueue?.includes(q)) {
+        log.warn({ sessionId: a.sessionId, turnId }, "brief: queued turn timed out — force-closing the stuck one");
+        closeBriefTurn(a);
+      }
+      void finishBubble(a, bubble, briefDetailLink(turnId));
+    }, HARD_TIMEOUT_MS);
+    if (a.briefTurnId) {
+      (a.briefQueue ??= []).push(q);
+      log.info({ sessionId: a.sessionId, turnId, queued: a.briefQueue.length }, "brief: turn queued (previous still running)");
+    } else {
+      openBriefTurn(a, q);
+    }
     try {
       await client.replyStream(frame, streamId, withSessionTag(a.target, "…"), false); // 挂住 loading 气泡, 不关闭
     } catch (e) {
       log.warn({ sessionId: a.sessionId, turnId, err: (e as Error).message }, "brief: turn ack failed");
     }
-    log.info({ sessionId: a.sessionId, turnId, isSlash }, "brief: turn started");
   };
 
   // 无气泡 turn。CLI 侧自己开的一轮 (WeCom 从没发过消息, 拿不到 frame/streamId), 以及
@@ -1997,12 +2068,15 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const ensureBriefTurn = (a: AttachState): void => {
     if (a.briefTurnId) return;
     const turnId = newTurnId();
-    a.briefTurnId = turnId;
-    a.briefHadTool = false;
-    a.briefIsSlash = false;
-    const q = a.pendingBriefQuery?.replace(/^> ?/gm, "").trim();
+    const query = a.pendingBriefQuery?.replace(/^> ?/gm, "").trim();
     a.pendingBriefQuery = undefined;
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: q || undefined });
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: query || undefined });
+    a.briefTurnId = turnId;
+    a.briefBubble = undefined;
+    a.briefIsSlash = false;
+    a.briefHadTool = false;
+    a.briefConcluded = false;
+    a.briefLastText = undefined;
     enqueueStandalone(a, briefDetailLink(turnId));
     log.info({ sessionId: a.sessionId, turnId }, "brief: turn started (CLI-side, no bubble)");
   };
@@ -2017,18 +2091,42 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     void finishBriefBubble(a, briefDetailLink(a.briefTurnId));
   };
 
-  const closeBriefTurn = (a: AttachState): void => {
+  // 本轮结论落地, 只生效一次:
+  //   • 无工具 → 结论 + 详情链接一并写进 loading 气泡 (仍是一条消息);
+  //   • 有工具 / 无气泡 turn → 气泡留给 closeBriefTurn 收详情链接, 结论另发 standalone。
+  // 每个 turn 都必须留一个可回溯入口, 单句回答也要带链接。
+  const concludeBriefTurn = (a: AttachState, body: string): void => {
+    const turnId = a.briefTurnId;
+    if (!turnId || a.briefConcluded || !body.trim()) return;
+    a.briefConcluded = true;
+    if (a.briefHadTool || !a.briefBubble) sendStandalone(a, body);
+    else void finishBriefBubble(a, `${body}\n\n${briefDetailLink(turnId)}`);
+    // 排队中的 turn 已经建了记录但还没跑, 不能被这把扫帚扫成「已完成」。
+    const keep = [turnId, ...(a.briefQueue ?? []).map((q) => q.turnId)];
+    recordCloseOpenTurns({ target: a.target, sessionId: a.sessionId, exceptIds: keep });
+  };
+
+  /** soft=true: 收口信号来自静默期确认 (后端无终句标记), 拿本轮最后一句 text 当结论。
+   *  硬信号路径上结论早已由 final text 落地, briefConcluded 会挡住重复推送。 */
+  const closeBriefTurn = (a: AttachState, soft = false): void => {
     if (!a.briefTurnId) return;
-    // 气泡还开着 (有工具的 turn: final text 只发了 standalone, 气泡留到这里收链接;
-    // 或空 turn 无 final text) —— 收口: 统一写详情链接, 保证每个 turn 都有可点入口。
+    if (soft) concludeBriefTurn(a, a.briefLastText ?? "");
+    // 气泡还开着 (有工具的 turn: 结论只发了 standalone, 气泡留到这里收链接; 或空 turn
+    // 没有结论) —— 收口: 统一写详情链接, 保证每个 turn 都有可点入口。
     if (a.briefBubble && !a.briefBubble.done) {
       void finishBriefBubble(a, briefDetailLink(a.briefTurnId));
     }
     recordTurnClose(a.briefTurnId);
     log.info({ sessionId: a.sessionId, turnId: a.briefTurnId }, "brief: turn closed");
     a.briefTurnId = undefined;
+    a.briefBubble = undefined;
     a.briefHadTool = false;
     a.briefIsSlash = false;
+    a.briefConcluded = false;
+    a.briefLastText = undefined;
+    // 放行下一个排队的 turn —— 它的气泡早在 ack 时就挂出去了, 这里只是激活。
+    const next = a.briefQueue?.shift();
+    if (next) openBriefTurn(a, next);
   };
 
   // Route one RenderItem into the turn store. final text 会额外作为 standalone 发群。
@@ -2067,20 +2165,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
     if (item.kind === "text") {
       recordTurnItem(turnId, { t: "text", body: item.body, ts: now, final: item.final === true });
-      if (item.final !== true) earlyLinkBubble(a); // 非 final 中间输出 → 立刻推链接
-      if (item.final === true) {
-        // 收口结论: 无工具 → 答案 + 详情链接一并写进 loading 气泡 (仍是一条消息);
-        // 有工具 → 气泡留给 closeBriefTurn 收详情链接, 结论另发 standalone。
-        // 每个 turn 都必须留一个可回溯入口, 单句回答也要带链接。
-        // 无气泡 turn (ensureBriefTurn 开的) 没有可写的气泡, 链接已在开场推过 → 直接发结论。
-        if (a.briefHadTool || !a.briefBubble) sendStandalone(a, item.body);
-        else void finishBriefBubble(a, `${item.body}\n\n${briefDetailLink(turnId)}`);
-        recordCloseOpenTurns({ target: a.target, sessionId: a.sessionId, exceptId: turnId });
-      }
+      a.briefLastText = item.body; // 软收口时拿它当结论 (那条路径上没有 final 标记)
+      // final===false 才是"确知的中途输出"; undefined 是后端说不清, 不能据此提前收气泡。
+      if (item.final === false) earlyLinkBubble(a);
+      if (item.final === true) concludeBriefTurn(a, item.body);
       return;
     }
     if (item.kind === "turn_end") {
-      closeBriefTurn(a);
+      closeBriefTurn(a, item.soft === true);
       return;
     }
     if (item.kind === "turn_usage") {
@@ -2115,7 +2207,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const banner = goalBanner(condition);
     if (a.briefBubble && !a.briefBubble.done) void finishBriefBubble(a, banner);
     else enqueueStandalone(a, banner);
-    if (a.briefTurnId) closeBriefTurn(a); // bubble now done → closeBriefTurn skips re-finalizing
+    // 连同排队中的 turn 一起收掉: goal 期间所有 item 走 handleGoalItem, 排队的 turn
+    // 永远等不到自己的产出。closeBriefTurn 会逐个放行再关闭, 每个都留下详情链接。
+    while (a.briefTurnId) closeBriefTurn(a); // bubble now done → closeBriefTurn skips re-finalizing
     a.goalActive = true;
     log.info({ sessionId: a.sessionId, target: a.target, condition }, "goal: entered progress mode");
   };
@@ -2135,7 +2229,23 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // tool_use / tool_result / user_text / turn_usage: recorded to detail store; no bubble.
   };
 
+  // 软收口到点: 静默期内没有新 item, 确认这一轮真的结束了。
+  const fireSoftTurnEnd = (a: AttachState): void => {
+    a.softEnd = undefined;
+    log.debug({ sessionId: a.sessionId, turnId: a.briefTurnId }, "soft turn_end confirmed");
+    if (a.goalActive) { handleGoalItem(a, { kind: "turn_end" }); return; }
+    if (cfg.wrc.mirror.brief && a.briefTurnId) { closeBriefTurn(a, true); return; }
+    if (a.liveStream && !a.liveStream.closed) void finalizeStream(a, a.liveStream);
+  };
+
   const onItem = (a: AttachState, item: RenderItem): void => {
+    // 任何新 item 到达 = 上一条"消息写完了"并不代表这一轮结束 → 撤销待确认的软收口。
+    // 硬信号 (end_turn / turn_duration) 的后端永远不会走到这里。
+    if (a.softEnd) { clearTimeout(a.softEnd); a.softEnd = undefined; }
+    if (item.kind === "turn_end" && item.soft === true) {
+      a.softEnd = setTimeout(() => fireSoftTurnEnd(a), SOFT_TURN_END_MS);
+      return;
+    }
     // Record tool_use signatures unconditionally (before any state branching),
     // so flushBeforeCard's poll-drain can detect that the to-be-approved tool
     // is now persisted in the jsonl regardless of DEFERRED/STREAMING/IDLE.
@@ -2276,7 +2386,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (a.migrationWatcher) { a.migrationWatcher.cancel(); a.migrationWatcher = undefined; }
     if (a.outbound?.kind === "deferred") clearTimeout(a.outbound.timer);
     a.outbound = undefined;
-    if (a.briefTurnId) closeBriefTurn(a);
+    if (a.softEnd) { clearTimeout(a.softEnd); a.softEnd = undefined; }
+    while (a.briefTurnId) closeBriefTurn(a); // 活跃 + 排队中的 turn 全部收掉
     if (a.liveStream && !a.liveStream.closed) void finalizeStream(a, a.liveStream);
     if (a.standaloneBuf) { clearTimeout(a.standaloneBuf.timer); flushStandalone(a); }
     a.tail.stop();
@@ -3423,7 +3534,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         }
       }
       if (brief) {
-        // 关闭上一 turn (若存在), 起新 turn: 立刻推详情 URL 覆盖 loading 气泡。
+        // 挂 loading 气泡并起新 turn (上一 turn 还在跑则排队, 由它收口时放行)。
         // 后续 onItem 走 handleBriefItem, 不再走 stream / defer 路径。
         await startBriefTurn(a, frame, streamId, isSlash, text);
       } else if (!armMigration && !eagerOpen) {
