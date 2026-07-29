@@ -1,6 +1,7 @@
 // Pending request store: req_id → resolver. In-memory, daemon-lifetime.
 // Used for both PreToolUse approvals and any other "send card → wait click" flows.
 import { randomUUID } from "node:crypto";
+import { baseOfKey } from "../shared/session-label.js";
 
 export type Decision = "allow" | "allow_session" | "allow_window" | "deny";
 
@@ -123,11 +124,14 @@ export const resolvePendingsByChat = (
   decision: Decision,
   excludeReqId?: string,
 ): Array<{ reqId: string; meta: PendingMeta }> => {
+  // 按 base principal 比对: chatKey 是带 `#tag` 的 session key, 但窗口是 chat 级
+  // 授权 — 同 chat 下其它 tag 会话的待批卡也在这一次点击的覆盖范围内。
+  const base = baseOfKey(chatKey);
   const hits: Array<{ reqId: string; meta: PendingMeta }> = [];
   for (const [reqId, p] of store.entries()) {
     if (reqId === excludeReqId) continue;
     if (p.meta.kind !== "approval") continue;
-    if (p.meta.chatKey !== chatKey) continue;
+    if (!p.meta.chatKey || baseOfKey(p.meta.chatKey) !== base) continue;
     hits.push({ reqId, meta: p.meta });
   }
   hits.forEach(({ reqId, meta }) => {

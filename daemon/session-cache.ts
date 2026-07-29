@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { expandHome } from "../shared/paths.js";
+import { baseOfKey } from "../shared/session-label.js";
 import type { Decision } from "./pending.js";
 
 interface Entry {
@@ -62,6 +63,12 @@ export const cacheClear = (): void => cache.clear();
 // Persisted to disk so daemon restart doesn't drop the user's choice.
 const autoApproveUntilByChat = new Map<string, number>();
 
+// 归一化: 审批目标是 mirror target (`user:abc#fix`), 带 `#tag`。窗口是 CHAT 级
+// 的授权 — 用户点一次「放行 N 分钟」是对这个聊天说的, 不是对某个 tag 会话说的,
+// 所以所有窗口读写都先塌到 base principal, 同 chat 下新开的 `#tag` 会话直接继承。
+// 调用方仍传带 tag 的 key (卡片渲染要 tag emoji), 归一化只发生在存储边界。
+const scopeOf = baseOfKey;
+
 // 保存最近一次窗口卡片的元信息，用于"取消"时重建卡片不丢上下文。
 export interface WindowMeta {
   toolName: string;
@@ -115,8 +122,10 @@ export const initAutoWindowPersistence = (stateDir: string): void => {
     for (const [chatKey, entry] of Object.entries(data.windows ?? {})) {
       if (!entry || typeof entry.until !== "number") continue;
       if (entry.until <= now) continue;
-      autoApproveUntilByChat.set(chatKey, entry.until);
-      if (entry.meta) windowMetaByChat.set(chatKey, entry.meta);
+      // 旧盘上可能是带 tag 的 key — 落地时一并塌到 base。
+      const k = scopeOf(chatKey);
+      autoApproveUntilByChat.set(k, Math.max(autoApproveUntilByChat.get(k) ?? 0, entry.until));
+      if (entry.meta) windowMetaByChat.set(k, entry.meta);
     }
     // 清掉过期项后落盘一次。
     persist();
@@ -127,24 +136,25 @@ export const initAutoWindowPersistence = (stateDir: string): void => {
 
 export const setAutoWindow = (chatKey: string, ttlMs: number, meta?: WindowMeta): number => {
   const until = Date.now() + ttlMs;
-  autoApproveUntilByChat.set(chatKey, until);
-  if (meta) windowMetaByChat.set(chatKey, meta);
+  autoApproveUntilByChat.set(scopeOf(chatKey), until);
+  if (meta) windowMetaByChat.set(scopeOf(chatKey), meta);
   persist();
   return until;
 };
 
 export const getWindowMeta = (chatKey: string): WindowMeta | undefined =>
-  windowMetaByChat.get(chatKey);
+  windowMetaByChat.get(scopeOf(chatKey));
 
 export const autoWindowRemainingMs = (chatKey: string): number =>
-  Math.max(0, (autoApproveUntilByChat.get(chatKey) ?? 0) - Date.now());
+  Math.max(0, (autoApproveUntilByChat.get(scopeOf(chatKey)) ?? 0) - Date.now());
 
 export const isAutoWindowActive = (chatKey: string): boolean => {
-  const until = autoApproveUntilByChat.get(chatKey);
+  const base = scopeOf(chatKey);
+  const until = autoApproveUntilByChat.get(base);
   if (until === undefined) return false;
   if (Date.now() >= until) {
-    autoApproveUntilByChat.delete(chatKey);
-    windowMetaByChat.delete(chatKey);
+    autoApproveUntilByChat.delete(base);
+    windowMetaByChat.delete(base);
     persist();
     return false;
   }
@@ -156,8 +166,8 @@ export const clearAutoWindow = (chatKey?: string): void => {
     autoApproveUntilByChat.clear();
     windowMetaByChat.clear();
   } else {
-    autoApproveUntilByChat.delete(chatKey);
-    windowMetaByChat.delete(chatKey);
+    autoApproveUntilByChat.delete(scopeOf(chatKey));
+    windowMetaByChat.delete(scopeOf(chatKey));
   }
   persist();
 };
