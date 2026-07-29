@@ -126,19 +126,28 @@ const installDaemon = (): void => {
 //
 // 失败即 throw — 没装上 hook 等于整套授权链路废掉,继续往下跑只会让用户看到
 // 假的"✅ 引导完成",再被 auto mode 拦截一脸懵。
+// status 为 null 的两种真实原因: spawn 失败 (error, 多为 ENOENT —— bin 是
+// alias/函数或不在继承的 PATH 里) 或进程被信号杀死。两者都不是「退出码」,
+// 必须分开报,否则用户拿到 null 一脸懵。
+const describeSpawn = (r: ReturnType<typeof spawnSync>): string =>
+  r.error ? `无法启动 (${r.error.message})`
+  : r.signal ? `被信号 ${r.signal} 杀死`
+  : `退出码 ${r.status}`;
+
 const installPlugin = (claudeBin: string): void => {
   log(c.dim(`  注册 marketplace + 安装插件 (${claudeBin}) ...`));
   const m = spawnSync(claudeBin, ["plugin", "marketplace", "add", REPO], { stdio: "inherit" });
   if (m.status !== 0) {
     throw new Error(
-      `plugin marketplace add 失败 (退出码 ${m.status}) — hook 无法注册。\n` +
+      `plugin marketplace add 失败 (${describeSpawn(m)}) — hook 无法注册。\n` +
+      `  若提示无法启动: ${claudeBin} 不在 PATH 或是 shell alias/函数, 请用绝对路径重试。\n` +
       `  手动: ${claudeBin} plugin marketplace add ${REPO}`,
     );
   }
   const i = spawnSync(claudeBin, ["plugin", "install", "weclaude@weclaude-local", "--scope", "user"], { stdio: "inherit" });
   if (i.status !== 0) {
     throw new Error(
-      `plugin install 失败 (退出码 ${i.status}) — hook 无法注册。\n` +
+      `plugin install 失败 (${describeSpawn(i)}) — hook 无法注册。\n` +
       `  常见原因: ${claudeBin} 版本过旧,不支持当前插件源类型 — 请先升级 ${claudeBin} 后重试 init。\n` +
       `  手动: ${claudeBin} plugin install weclaude@weclaude-local --scope user`,
     );
@@ -261,7 +270,12 @@ const main = async (): Promise<void> => {
 
   ensureBuild();
   if (enableHook) runSync();
-  if (enableHook) installPlugin(claudeBin);
+  // marketplace 插件只存在于 claude 家族; codebuddy 的 hook 由 sync 直接
+  // 写进 ~/.codebuddy/settings.json (插件未发布到其市场), 装插件必然失败。
+  if (enableHook) {
+    const pluginBins = [...new Set(agentKinds.filter((k) => k !== "codebuddy").map(claudeBinFor))];
+    for (const bin of pluginBins) installPlugin(bin);
+  }
   installDaemon();
 
   log(c.dim("  等待 daemon 上线..."));
