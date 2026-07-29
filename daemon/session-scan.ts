@@ -8,8 +8,9 @@
 // sweep, which only the resident daemon is positioned to do.
 //
 // Scope: tmux-hosted sessions only (a session with no pane can't receive
-// pasted input, so it's not a useful mirror target). Linux-only (reads /proc);
-// returns [] elsewhere, degrading gracefully.
+// pasted input, so it's not a useful mirror target). Linux reads /proc;
+// macOS falls back to `ps` + `lsof` (no /proc there); other platforms
+// degrade to [] gracefully.
 import { spawn } from "node:child_process";
 import { readdirSync, readFileSync, existsSync, statSync, readlinkSync } from "node:fs";
 import { join, basename } from "node:path";
@@ -48,7 +49,16 @@ const dirnameOfNode = (): string => {
 };
 
 const augmentedPath = (orig: string | undefined): string => {
-  const extras = [dirnameOfNode(), "/opt/homebrew/bin", "/usr/local/bin", `${process.env.HOME ?? ""}/.local/bin`].filter(Boolean);
+  // sbin dirs matter: lsof lives in /usr/sbin on macOS, and launchd starts the
+  // daemon with a stripped PATH that lacks it.
+  const extras = [
+    dirnameOfNode(),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    `${process.env.HOME ?? ""}/.local/bin`,
+    "/usr/sbin",
+    "/sbin",
+  ].filter(Boolean);
   const seen = new Set<string>();
   return [orig ?? "", ...extras]
     .flatMap((p) => p.split(":"))
@@ -56,9 +66,9 @@ const augmentedPath = (orig: string | undefined): string => {
     .join(":");
 };
 
-const runTmux = (args: string[]): Promise<{ ok: boolean; stdout: string }> =>
+const runCmd = (cmd: string, args: string[]): Promise<{ ok: boolean; stdout: string }> =>
   new Promise((resolve) => {
-    const p = spawn("tmux", args, {
+    const p = spawn(cmd, args, {
       env: { ...process.env, PATH: augmentedPath(process.env.PATH) },
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -68,10 +78,22 @@ const runTmux = (args: string[]): Promise<{ ok: boolean; stdout: string }> =>
     p.on("close", (code) => resolve({ ok: code === 0, stdout: out }));
   });
 
+const runTmux = (args: string[]): Promise<{ ok: boolean; stdout: string }> => runCmd("tmux", args);
+
+// ── Process table snapshot ──────────────────────────────────────────────
+// One scan produces pid → {ppid, cmd} for the whole host; the tmux-pane walk
+// and the agent-cli filter both read from it, so the source (Linux /proc vs
+// macOS ps) is a contained difference.
+
+interface ProcEntry {
+  ppid: number;
+  cmd: string;
+}
+
 // Read /proc/<pid>/stat → ppid. comm (2nd field) is wrapped in parens and may
 // itself contain spaces/parens, so split on the LAST ')' and index from there:
 // fields after comm are state ppid ... → ppid is index 1 of the tail.
-const ppidOf = (pid: number): number | null => {
+const ppidOfProc = (pid: number): number | null => {
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     const rp = stat.lastIndexOf(")");
@@ -84,7 +106,7 @@ const ppidOf = (pid: number): number | null => {
   }
 };
 
-const cmdlineOf = (pid: number): string => {
+const cmdlineOfProc = (pid: number): string => {
   try {
     return readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
   } catch {
@@ -92,12 +114,62 @@ const cmdlineOf = (pid: number): string => {
   }
 };
 
-const cwdOf = (pid: number): string => {
+const procSnapshotLinux = (): Map<number, ProcEntry> => {
+  const m = new Map<number, ProcEntry>();
+  let pids: number[];
   try {
-    return readlinkSync(`/proc/${pid}/cwd`);
+    pids = readdirSync("/proc").filter((n) => /^\d+$/.test(n)).map((n) => parseInt(n, 10));
   } catch {
-    return "";
+    return m;
   }
+  for (const pid of pids) {
+    const ppid = ppidOfProc(pid);
+    if (ppid != null) m.set(pid, { ppid, cmd: cmdlineOfProc(pid) });
+  }
+  return m;
+};
+
+// macOS: `ps` snapshot. -ww keeps long cmdlines (a `--session-id` near the end
+// of a wrapped command would otherwise be truncated away); BSD ps rejects a
+// bare `ax` mixed with dashed flags, hence `-ax`.
+const procSnapshotPs = async (): Promise<Map<number, ProcEntry>> => {
+  const r = await runCmd("ps", ["-ww", "-ax", "-o", "pid=,ppid=,command="]);
+  const m = new Map<number, ProcEntry>();
+  if (!r.ok) return m;
+  for (const line of r.stdout.split("\n")) {
+    const mm = /^\s*(\d+)\s+(\d+)\s+(.*\S)\s*$/.exec(line);
+    if (mm) m.set(parseInt(mm[1]!, 10), { ppid: parseInt(mm[2]!, 10), cmd: mm[3]! });
+  }
+  return m;
+};
+
+const procSnapshot = (): Promise<Map<number, ProcEntry>> | Map<number, ProcEntry> =>
+  process.platform === "linux" ? procSnapshotLinux() : procSnapshotPs();
+
+// cwd is only needed for the handful of agent-cli candidates, so it's resolved
+// lazily per platform: Linux reads /proc directly; macOS batches one lsof call
+// (`-Fn` → machine-readable `p<pid>` / `n<path>` records).
+const cwdMapFor = async (pids: number[]): Promise<Map<number, string>> => {
+  const m = new Map<number, string>();
+  if (pids.length === 0) return m;
+  if (process.platform === "linux") {
+    for (const pid of pids) {
+      try {
+        m.set(pid, readlinkSync(`/proc/${pid}/cwd`));
+      } catch {
+        /* process gone or unreadable */
+      }
+    }
+    return m;
+  }
+  const r = await runCmd("lsof", ["-a", "-p", pids.join(","), "-d", "cwd", "-Fn"]);
+  if (!r.ok) return m;
+  let cur = 0;
+  for (const line of r.stdout.split("\n")) {
+    if (line.startsWith("p")) cur = parseInt(line.slice(1), 10);
+    else if (line.startsWith("n") && cur > 0) m.set(cur, line.slice(1));
+  }
+  return m;
 };
 
 // Pull a `--session-id <uuid>` out of a cmdline. Returns "" when absent
@@ -205,12 +277,16 @@ const tmuxPaneIndex = async (): Promise<Map<number, PaneOwner>> => {
 
 // Climb the ppid chain from `pid` until we hit a pid that owns a tmux pane.
 // Bounded to avoid pathological loops.
-const tmuxOwnerOf = (pid: number, paneIdx: Map<number, PaneOwner>): PaneOwner | null => {
+const tmuxOwnerOf = (
+  pid: number,
+  procs: Map<number, ProcEntry>,
+  paneIdx: Map<number, PaneOwner>,
+): PaneOwner | null => {
   let cur: number | null = pid;
   for (let i = 0; i < 40 && cur != null && cur > 1; i++) {
     const hit = paneIdx.get(cur);
     if (hit) return hit;
-    const pp = ppidOf(cur);
+    const pp: number | undefined = procs.get(cur)?.ppid;
     if (pp == null || pp === cur) break;
     cur = pp;
   }
@@ -219,30 +295,29 @@ const tmuxOwnerOf = (pid: number, paneIdx: Map<number, PaneOwner>): PaneOwner | 
 
 export const scanClaudeSessions = async (): Promise<SessionInfo[]> => {
   const paneIdx = await tmuxPaneIndex();
-  let pids: number[];
-  try {
-    pids = readdirSync("/proc").filter((n) => /^\d+$/.test(n)).map((n) => parseInt(n, 10));
-  } catch {
-    return []; // not Linux / no /proc
-  }
+  const procs = await procSnapshot();
+  if (procs.size === 0) return []; // unsupported platform / ps+proc both missing
 
   // Collect tmux-hosted claude workers, then collapse to ONE session per pane
   // (a tmux pane runs exactly one claude session; a pane may host several
   // claude processes — shim + worker + nested — which must not each count as
   // a separate session). Per pane: prefer a process carrying an explicit
   // `--session-id`; else fall back to one resume-mode inference by cwd.
-  const byPane = new Map<string, { pid: number; owner: PaneOwner; cwd: string; explicitSid: string }>();
-  for (const pid of pids) {
-    const cmd = cmdlineOf(pid);
-    if (!cmd || !looksLikeAgentCli(cmd)) continue;
-    const owner = tmuxOwnerOf(pid, paneIdx);
+  const byPane = new Map<string, { pid: number; owner: PaneOwner; explicitSid: string }>();
+  for (const [pid, e] of procs) {
+    if (!e.cmd || !looksLikeAgentCli(e.cmd)) continue;
+    const owner = tmuxOwnerOf(pid, procs, paneIdx);
     if (!owner) continue; // tmux scope
-    const explicitSid = sessionIdFromCmd(cmd);
+    const explicitSid = sessionIdFromCmd(e.cmd);
     const prev = byPane.get(owner.paneId);
     if (!prev || (!prev.explicitSid && explicitSid)) {
-      byPane.set(owner.paneId, { pid, owner, cwd: cwdOf(pid), explicitSid });
+      byPane.set(owner.paneId, { pid, owner, explicitSid });
     }
   }
+
+  // Resolve cwd only for the chosen worker per pane (a handful of pids).
+  const cwds = await cwdMapFor(Array.from(byPane.values()).map((w) => w.pid));
+  const panes = Array.from(byPane.values()).map((w) => ({ ...w, cwd: cwds.get(w.pid) ?? "" }));
 
   const seen = new Set<string>();
   const out: SessionInfo[] = [];
@@ -268,7 +343,6 @@ export const scanClaudeSessions = async (): Promise<SessionInfo[]> => {
     });
   };
 
-  const panes = Array.from(byPane.values());
   // Pass 1: explicit `--session-id` — exact, no ambiguity. Seeds `seen` so
   // resume inference in pass 2 can't re-claim these ids. A freshly-spawned
   // session may not have written its jsonl yet — fall back to the expected
