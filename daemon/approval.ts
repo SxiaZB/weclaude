@@ -22,6 +22,8 @@ import {
   getWindowMeta,
 } from "./session-cache.js";
 import { alwaysAllowRulesFor, ruleAllows, ruleMatchesAny } from "../shared/allow-rules.js";
+import { claudeConfigWrite, type ClaudeConfigHit } from "../shared/claude-config-path.js";
+import type { NativeModalAnswer } from "./mirror-bridge.js";
 import { appendUnique } from "../shared/config-writer.js";
 import { redact } from "./redact.js";
 import { dangerOf, dangerModeSkips, dangerSkips, type DangerHit } from "./danger.js";
@@ -1411,6 +1413,17 @@ interface ApprovalDeps {
    *  "thinking" bubble. Mirror mode wires this through; headless mode leaves it
    *  undefined (no mirror pipe to drain). */
   flushBeforeCard?: (sessionId: string, expect?: { toolName: string; toolInput: unknown }) => Promise<void>;
+  /** Mirror-only: the four pane primitives the `.claude/**` guard needs.
+   *  `hasPane` decides whether the guard may promise "we'll press the confirm";
+   *  `answer` presses it after approval; `cancel` + `tell` are the fallback that
+   *  turns an unanswerable confirm into an explicit reason for the model.
+   *  Undefined in headless mode → guard stays off (nothing to press there). */
+  nativeModal?: {
+    hasPane: (sessionId: string) => boolean;
+    answer: (sessionId: string, opts: { waitMs: number }) => Promise<NativeModalAnswer>;
+    cancel: (sessionId: string) => Promise<{ ok: boolean; reason?: string }>;
+    tell: (sessionId: string, text: string) => Promise<{ ok: boolean; reason?: string }>;
+  };
 }
 
 const resolveApprover = (
@@ -1422,7 +1435,7 @@ const resolveApprover = (
   return mirror || pickApprover(cfg);
 };
 
-export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarget, flushBeforeCard }: ApprovalDeps): Handler => {
+export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarget, flushBeforeCard, nativeModal }: ApprovalDeps): Handler => {
   setCardQuoteMax(cfg.approval.cardQuoteMaxChars);
   const detailUrlFor = (id: string): string =>
     buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
@@ -1449,6 +1462,57 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         : `（${i + 1}/${chunks.length}）\n`;
       await client.sendMessage(target, { msgtype: "markdown", markdown: { content: head + chunks[i]! } });
     }
+  };
+
+  const notify = async (approver: string, content: string): Promise<void> => {
+    try {
+      await client.sendMessage(targetChatId(approver), { msgtype: "markdown", markdown: { content } });
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "notify send failed");
+    }
+  };
+
+  // 批准一次 `.claude/**` 写操作之后的收尾: 把 CC 那个不过 hook 的原生确认框按掉。
+  //
+  // 必须在 json(res) **之后**跑 —— CC 只有等 hook 进程退出才会继续走它自己的守卫、
+  // 才会把框渲染出来。所以这里是 fire-and-forget, 由 answer() 内部轮询等框出现。
+  //
+  // 按不掉时不干等: Esc 取消掉这次调用, 再把原因作为一条用户消息注入 pane。模型
+  // 收到的就是明确的"这条路走不通 + 该怎么绕", 而不是静默卡住 —— 等价于预拦截
+  // deny + reason, 只是走镜像通道传达。
+  const settleClaudeConfigModal = async (
+    sessionId: string,
+    approver: string,
+    hit: ClaudeConfigHit,
+  ): Promise<void> => {
+    const nm = nativeModal;
+    if (!nm) return;
+    const r = await nm.answer(sessionId, { waitMs: cfg.approval.claudeConfigModalWaitMs });
+    if (r.status === "answered") {
+      log.info({ sessionId, path: hit.path, pressed: `${r.index}. ${r.label}` }, "claude-config modal answered");
+      await notify(approver, `🔓 已代按 CLI 原生确认框「${r.title ?? "确认"}」→ 选项 ${r.index}. ${r.label}（${hit.path}）`);
+      return;
+    }
+    if (r.status === "no_modal") {
+      log.info({ sessionId, path: hit.path }, "claude-config modal never appeared (nothing to press)");
+      return;
+    }
+    // unparsable / still_modal / no_pane —— 走取消 + 告知。
+    log.warn({ sessionId, path: hit.path, status: r.status }, "claude-config modal not answered, cancelling");
+    const cancelled = await nm.cancel(sessionId);
+    // Esc 之后 TUI 要一拍才回到输入框; 注入本身还有 modal 守卫兜底(框没退就拒绝注入)。
+    if (cancelled.ok) await new Promise((res) => setTimeout(res, 800));
+    const why = `⚠️ 刚才那步（写 \`${hit.path}\`）被 weclaude 取消了：`
+      + `改动 \`.claude/**\` 会让 Claude Code 弹它自己的原生确认框，那个框不经过 PreToolUse hook、`
+      + `企微端点不到，我这次也没能安全代按（${r.status}）。`
+      + `请改用实体真实路径（例如把 skill 实体放在 \`<角色>/skills/\` 再软链回 \`.claude/skills/\`），`
+      + `或让我在你本地终端旁边时再做这一步。`;
+    const told = cancelled.ok ? await nm.tell(sessionId, why) : { ok: false, reason: cancelled.reason };
+    await notify(
+      approver,
+      `⚠️ 原生确认框未能代按（${r.status}）。已${cancelled.ok ? "" : "尝试"}发 Esc 取消本次调用`
+        + `${told.ok ? "，并把原因告知了会话" : `（原因注入失败：${told.reason ?? "unknown"}，请到 tmux 里看一眼）`}。`,
+    );
   };
 
   // Flush 一个 batch: 单成员 → 普通卡 (与未启用聚合一致); 多成员 → 批量卡。
@@ -1558,9 +1622,26 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
       log.info({ toolName, sessionId, rule: askHit }, "ask-rule force card");
     }
 
+    // `.claude/**` 写守卫 (见 shared/claude-config-path.ts): 这类改动会让 CC 立起
+    // 它自己的原生确认框, 那个框不过 hook —— 规则一放行就是"不发卡 + pane 阻塞"的
+    // 静默死锁。命中且该 session 有活 pane 可代按时强制发卡 (压过 allowRules /
+    // ⏱窗口 / 会话缓存), 批准后 settleClaudeConfigModal 去把框按掉。
+    // 没有活 pane (headless / 未镜像的本地会话) → 不介入: 那种情形用户就在键盘前,
+    // 自己按掉即可, 拦下来只是挡工作。
+    const guardHit = cfg.approval.claudeConfigGuard ? claudeConfigWrite(toolName, toolInput) : undefined;
+    const guardActive = Boolean(guardHit && nativeModal?.hasPane(sessionId));
+    if (guardHit) {
+      log.info(
+        { toolName, sessionId, path: guardHit.path, why: guardHit.why, guardActive },
+        guardActive ? "claude-config guard force card" : "claude-config write detected (no live pane, passing through)",
+      );
+    }
+    // 必发卡 = askRules 命中 或 守卫生效。两者都要压过放行/窗口/缓存三条捷径。
+    const mustCard = Boolean(askHit) || guardActive;
+
     // allowRules: matcher 拦下的工具里再挖细粒度豁免 (Bash 可按命令前缀区分)。
     // 交互卡工具 (AskUserQuestion 等) 在 ruleAllows 内部硬保护, 规则写了也不放行。
-    const ruleHit = askHit ? undefined : ruleAllows(cfg.approval.allowRules, toolName, toolInput);
+    const ruleHit = mustCard ? undefined : ruleAllows(cfg.approval.allowRules, toolName, toolInput);
     if (ruleHit) {
       log.info({ toolName, sessionId, rule: ruleHit }, "allow-rule skip");
       json(res, 200, { decision: "allow", reason: `allow_rule:${ruleHit}` } satisfies ApproveResp);
@@ -1652,8 +1733,8 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     }
 
     // Auto-approve window: while active for THIS chat, requests short-circuit to allow.
-    // 危险名单 / askRules 命中的请求不吃窗口 — 即使开着 ⏱ 也逐条确认。
-    if (!danger && !askHit && approver && isAutoWindowActive(approver)) {
+    // 危险名单 / askRules 命中 / 守卫生效的请求不吃窗口 — 即使开着 ⏱ 也逐条确认。
+    if (!danger && !mustCard && approver && isAutoWindowActive(approver)) {
       const remainSec = Math.ceil(autoWindowRemainingMs(approver) / 1000);
       log.info({ toolName, sessionId, chatKey: approver, remainSec }, "auto-window allow");
       json(res, 200, {
@@ -1663,9 +1744,9 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
       return;
     }
 
-    // Session cache (危险名单 / askRules 命中的请求同样不吃缓存)
+    // Session cache (危险名单 / askRules 命中 / 守卫生效的请求同样不吃缓存)
     const ck = cacheKey(sessionId, toolName, toolInput);
-    const cached = danger || askHit ? undefined : cacheGet(ck);
+    const cached = danger || mustCard ? undefined : cacheGet(ck);
     if (cached) {
       log.info({ ck, cached }, "cache hit");
       json(res, 200, {
@@ -1797,7 +1878,16 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
           });
         } catch { /* best-effort */ }
       }
-      const gen = askBlocked ? [] : alwaysAllowRulesFor(toolName, toolInput, cfg.approval.allowRules);
+      // 守卫生效的调用同理: 规则存了也永远被守卫压过 (且放行它就等于放回死锁),
+      // 只做一次性放行并说明为什么「总是」在这里不成立。
+      if (!askBlocked && guardActive) {
+        await notify(
+          approver,
+          `⚠️ \`.claude/**\` 写操作不支持「总是」：这类改动会触发 CLI 原生确认框，`
+            + `而那个框只有在你点过卡之后才能被代按 —— 免审就等于回到静默死锁。本次已放行。`,
+        );
+      }
+      const gen = askBlocked || guardActive ? [] : alwaysAllowRulesFor(toolName, toolInput, cfg.approval.allowRules);
       const added = gen.filter((r) => !cfg.approval.allowRules.includes(r));
       if (added.length > 0) {
         cfg.approval.allowRules.push(...added); // 同步热生效; 文件写入失败也不回滚
@@ -1817,7 +1907,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         } catch (e) {
           log.warn({ err: (e as Error).message }, "allow_always notice send failed");
         }
-      } else if (!askBlocked && gen.length === 0) {
+      } else if (!askBlocked && !guardActive && gen.length === 0) {
         // 生成不了可靠字面规则 (含 $()/反引号动态构造, 或分隔符切进了引号内部) —
         // 本次一次性放行并告知。文案区分两种成因, 避免误导排查方向。
         const dynamic = /[`]|\$\(/.test(
@@ -1872,6 +1962,15 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
       decision: decisionToHook(decision),
       reason: decision,
     } satisfies ApproveResp);
+
+    // 放行 `.claude/**` 写操作后, CC 会在 hook 退出后立起自己的原生确认框 —— 必须
+    // 等响应发出去才能去按 (框此刻还不存在)。fire-and-forget: 这条 HTTP 请求已经
+    // 结束, 失败也只能靠告知, 不能再改判决。
+    if (guardActive && guardHit && decisionToHook(decision) === "allow") {
+      void settleClaudeConfigModal(sessionId, approver, guardHit).catch((e) => {
+        log.warn({ err: (e as Error).message, sessionId }, "settleClaudeConfigModal failed");
+      });
+    }
   };
 };
 
