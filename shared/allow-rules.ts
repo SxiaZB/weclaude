@@ -102,6 +102,7 @@ const RAW_SPLIT = /\r?\n|&&|\|\||(?<!\\)[;|]/;
 // 纯文本 split 会把它们切成碎段导致永远匹配不上规则 (实战最大误卡来源)。
 // 语义: 单引号内无转义; 双引号内 \x 转义; 引号外 \x 转义 (覆盖 \| \; )。
 // 未闭合引号 / 孤立 & (后台执行) → 返回 undefined, 调用方走保守路径。
+// fd 重定向里的 & (`2>&1` `>&2` `&>file`) 不算孤立 &, 是普通字符。
 // 导出给 claude-config-path.ts 复用: 那里也要"复合命令逐段判定", 分段语义必须
 // 与规则匹配完全一致, 各写一份必然漂移。
 export const splitSegments = (cmd: string): string[] | undefined => {
@@ -130,7 +131,11 @@ export const splitSegments = (cmd: string): string[] | undefined => {
     }
     if (ch === "&") {
       if (cmd[i + 1] === "&") { i++; segs.push(cur); cur = ""; continue; }
-      return undefined; // 孤立 & 后台执行, 保守处理
+      // fd 重定向的 & 是重定向语法的一部分, 不是后台执行符: `2>&1` `>&2` `2>&-`
+      // (& 紧跟在 > 后) 与 `&>file` `&>>file` (& 紧接 >)。漏掉这一条会让每个
+      // `cmd 2>&1 | head` 整体放弃分段 → 明明被规则覆盖也要发卡, 且「总是」存不下规则。
+      if (cmd[i - 1] === ">" || cmd[i + 1] === ">") { cur += ch; continue; }
+      return undefined; // 真正孤立的 & : 后台执行, 保守处理
     }
     if (ch === "\r") continue;
     cur += ch;

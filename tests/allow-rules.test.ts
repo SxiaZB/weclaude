@@ -1,6 +1,6 @@
 // 单元测试: shared/allow-rules.ts + shared/claude-permissions.ts — 运行: npx tsx tests/allow-rules.test.ts
 import assert from "node:assert";
-import { alwaysAllowRulesFor, parseRule, ruleAllows, ruleMatchesAny } from "../shared/allow-rules.js";
+import { alwaysAllowRulesFor, parseRule, ruleAllows, ruleMatchesAny, splitSegments } from "../shared/allow-rules.js";
 import { mapClaudePermissions } from "../shared/claude-permissions.js";
 
 let passed = 0;
@@ -209,6 +209,35 @@ t("引号感知: python3 -c 整体成单段(正确地卡, 而非切碎地卡)", 
 t("引号感知: 引号外的分隔符照常切段", () => {
   assert.equal(ruleAllows(["Bash(cat *)"], "Bash", bash("cat 'a|b.txt' | bash")), undefined);
   assert.ok(ruleAllows(["Bash(cat *)", "Bash(head *)"], "Bash", bash("cat 'a|b.txt' | head")));
+});
+
+// ── fd 重定向的 & ───────────────────────────────────────────────────────
+// `2>&1` 的 & 曾被当成后台执行符 → 整条命令放弃分段 → 明明被规则覆盖也发卡,
+// 且点「总是」永远存不下规则 (实战回归: ls -la ~/Code/... 2>&1 | head -40)。
+t("fd 重定向: 2>&1 不阻断分段(实战回归)", () => {
+  assert.deepEqual(
+    splitSegments("ls -la ~/Code/x 2>&1 | head -40"),
+    ["ls -la ~/Code/x 2>&1", "head -40"],
+  );
+  assert.ok(ruleAllows(["Bash(ls *)", "Bash(head *)"], "Bash", bash("ls -la ~/Code/x 2>&1 | head -40")));
+});
+t("fd 重定向: >&2 / &>file / &>>file / 2>&- 各形态均不阻断分段", () => {
+  assert.ok(ruleAllows(["Bash(echo *)"], "Bash", bash("echo boom >&2")));
+  assert.ok(ruleAllows(["Bash(npm run *)"], "Bash", bash("npm run build &>/tmp/b.log")));
+  assert.ok(ruleAllows(["Bash(npm run *)"], "Bash", bash("npm run build &>>/tmp/b.log")));
+  assert.ok(ruleAllows(["Bash(ls *)"], "Bash", bash("ls -la 2>&-")));
+});
+t("fd 重定向: 真正孤立的 & (后台执行) 仍保守拒绝", () => {
+  assert.equal(splitSegments("npm run dev &"), undefined);
+  assert.equal(splitSegments("sleep 60 & echo done"), undefined);
+  assert.equal(ruleAllows(["Bash(sleep *)", "Bash(echo *)"], "Bash", bash("sleep 60 & echo done")), undefined);
+});
+t("fd 重定向: 带重定向的命令点「总是」能生成规则", () => {
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("kubectl get pods 2>&1 | head -20")), [
+    "Bash(kubectl get *)",
+    "Bash(head *)",
+  ]);
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("npm run dev &")), []);
 });
 
 // ── heredoc 剥离 ────────────────────────────────────────────────────────
