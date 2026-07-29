@@ -500,13 +500,35 @@ export const installInboundRouter = (
   // the user-facing one-line ack. When `who` carries a `#tag` suffix, use
   // the raw tag as the tmux window name so the pane shows readably in the
   // status bar (e.g. `#docs` → window `docs`, not the principal slug).
-  const autoSpawnAndAttach = async (who: string, cli?: CliBackendName): Promise<string> => {
+  const spawnSession = async (who: string, cli?: CliBackendName): Promise<string> => {
     if (!("newSession" in bridge)) return "[weclaude] /new only available in mirror mode";
     const tag = tagOf(who);
     const r = await bridge.newSession(who, tag || who, cli);
     if (!r.ok) return `[weclaude] /new failed: ${r.reason ?? "unknown"}`;
     return `✅ 新会话已建立 \`${r.sessionId}\``;
   };
+
+  // 同一 `#tag` 的两条消息会并发落进 gate,双双判定「未附着」→ 双 spawn,后者
+  // newSession 会 kill 掉前者的 pane,前者的 dispatch 再 `--resume` 重生出孤儿
+  // pane,消息乱序。spawn 窗口有 3s+(TUI_SETTLE_MS),所以必须按会话串行。
+  const spawnQ = new Map<string, Promise<unknown>>();
+  const serializeSpawn = <T>(key: string, job: () => Promise<T>): Promise<T> => {
+    const next = (spawnQ.get(key) ?? Promise.resolve()).then(job, job);
+    spawnQ.set(key, next.catch(() => undefined).finally(() => {
+      if (spawnQ.get(key) === next) spawnQ.delete(key);
+    }));
+    return next;
+  };
+
+  // 显式 /new:排队但仍强制重开(用户就是要换一个)。
+  const autoSpawnAndAttach = (who: string, cli?: CliBackendName): Promise<string> =>
+    serializeSpawn(who, () => spawnSession(who, cli));
+
+  // 隐式建会话(裸 `#tag` 第一条消息):轮到自己时若前一条已经把会话建好,直接
+  // 复用,不再 respawn —— 否则先到的消息会被注入进一个刚被杀掉的 pane。
+  const ensureSession = (who: string): Promise<string> =>
+    serializeSpawn(who, async () =>
+      "hasMirrorTarget" in bridge && bridge.hasMirrorTarget(who) ? "✅ 复用已建立的会话" : await spawnSession(who));
 
   // 事件订阅 / 广播命令。授权后调用,不再走 bridge dispatch。返回 true 表示已处理。
   const topicLog = log.child({ mod: "topics" });
@@ -841,7 +863,7 @@ export const installInboundRouter = (
     // to auto-spawn: this inbound becomes both the binding signal and the
     // first prompt — attach, then fall through to dispatch.
     if ("hasMirrorTarget" in bridge && !bridge.hasMirrorTarget(who)) {
-      const reply = await autoSpawnAndAttach(who);
+      const reply = await ensureSession(who);
       if (!reply.startsWith("✅")) {
         await replyText(frame, msg, who, reply);
         return { stop: true };
