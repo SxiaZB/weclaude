@@ -1579,6 +1579,10 @@ interface AttachState {
   /** Debounce buffer for the standalone fallback path. liveStream 活时为 undefined,
    *  fallback 落入时累积 item.body, debounce 窗口结束统一发出, 抑制工具调用刷屏。 */
   standaloneBuf?: { parts: string[]; timer: NodeJS.Timeout };
+  /** 刚由 newSession 铸出的 pane —— TUI 只有 TUI_SETTLE_MS 那么大。首条 inject
+   *  必须用冷启动时序,否则 paste 校验会在 TUI 抓到 pty 之前超时并重贴一次,
+   *  两次 paste 最终都落进输入框 = 提示词重复。一次性,由第一次 dispatch 消费。 */
+  justSpawned?: boolean;
   /** Set when `/clear` was injected: the next user prompt will land in a fresh
    *  jsonl with a new sessionId. A watcher polls the project dir to migrate
    *  this attachment onto the new file. Cleared once migration completes or
@@ -3146,6 +3150,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       pendingCwd: "",
     });
     if (!att.ok) return { ok: false, reason: att.reason };
+    // 首条注入吃冷时序(injectText 走 /mirror/spawn 时已经硬编码 freshSpawn:true,
+    // dispatch 这条隐式建会话的路径此前漏了)。
+    const spawned = byTarget.get(target);
+    if (spawned) spawned.justSpawned = true;
     // Clear the chat's pendingCwd on the BASE record too — the queued switch
     // has just been consumed by this respawn. Without this, a subsequent /new
     // #other would re-apply the same cd and diverge from user intent.
@@ -3520,17 +3528,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const pane = paneOf(target);
       if (!pane) return { ok: false, reason: "no tmux pane bound for target" };
       if (!(await tmuxPaneAlive(pane))) return { ok: false, reason: "tmux pane no longer alive — the session needs /new or a respawn" };
-      // Pick the most-recently-active attached client — switch-client with no
-      // -c is ambiguous under multiple clients and a no-op under none.
-      const clients = await tmuxRun(["list-clients", "-F", "#{client_activity} #{client_name}"]);
+      // Only clients already attached to the pane's OWN session are candidates:
+      // switching a client that sits on an unrelated session would yank the
+      // user's other terminal window into weclaude. Most-recently-active wins —
+      // switch-client with no -c is ambiguous under multiple clients.
+      const s = await tmuxRun(["display-message", "-p", "-t", pane, "#{session_name}"]);
+      const sess = s.stdout.trim() || cfg.wrc.tmuxPrefix;
+      const clients = await tmuxRun(["list-clients", "-t", sess, "-F", "#{client_activity} #{client_name}"]);
       const best = clients.stdout.split("\n").filter(Boolean)
         .map((l) => { const i = l.indexOf(" "); return { act: Number(l.slice(0, i)), name: l.slice(i + 1) }; })
         .sort((x, y) => y.act - x.act)[0]?.name;
       if (!best) {
         // Nothing to switch; tell the user how to get a client onto the session.
-        const s = await tmuxRun(["display-message", "-p", "-t", pane, "#{session_name}"]);
-        const sess = s.stdout.trim() || cfg.wrc.tmuxPrefix;
-        return { ok: false, reason: `没有已 attach 的 tmux 客户端。先在终端执行: \`tmux attach -t ${sess}\`` };
+        return { ok: false, reason: `没有 attach 到 \`${sess}\` 的 tmux 客户端。先在终端执行: \`tmux attach -t ${sess}\`` };
       }
       // A pane target pulls session + window selection along with it.
       const r = await tmuxRun(["switch-client", "-c", best, "-t", pane]);
@@ -3660,7 +3670,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // but DON'T erase tmuxSession from store — next inbound will retry,
         // making the system self-healing instead of one-failure-permanent.
         const paneAlive = a.tmuxPane ? await tmuxPaneAlive(a.tmuxPane) : false;
-        let freshSpawn = false;
+        let freshSpawn = a.justSpawned === true;
+        a.justSpawned = false;
         if (!paneAlive) {
           log.warn({ target: a.target, sessionId: sid, oldPane: a.tmuxPane, oldSession: a.tmuxSession }, "mirror: no live tmux pane, respawning");
           // Interactive `claude --resume <sid>` does NOT keep appending to the
