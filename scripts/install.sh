@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# Install resident daemon. Auto-detects macOS (launchd) vs Linux (systemd --user).
+# Install a resident wezard service. Auto-detects macOS (launchd) vs Linux (systemd --user).
+#   install.sh [daemon|svr]   (default: daemon)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 NODE="$(command -v node)"
 HOME_DIR="$HOME"
-LABEL="com.wezard.daemon"
+
+COMPONENT="${1:-daemon}"
+case "$COMPONENT" in
+  daemon) LABEL="com.wezard.daemon"; UNIT="wezard.service";     ENTRY="dist/daemon/index.js" ;;
+  svr)    LABEL="com.wezard.svr";    UNIT="wezard-svr.service"; ENTRY="dist/svr/index.js" ;;
+  *) echo "usage: install.sh [daemon|svr]"; exit 2 ;;
+esac
 
 [[ -x "$NODE" ]] || { echo "node not found in PATH"; exit 1; }
 
 # Build if missing
-if [[ ! -f "$REPO/dist/daemon/index.js" ]]; then
+if [[ ! -f "$REPO/$ENTRY" ]]; then
   echo "[install] building..."
   (cd "$REPO" && npm install --silent && npx tsc -p tsconfig.json)
 fi
@@ -56,18 +63,18 @@ case "$OS" in
   Linux)
     UNIT_DIR="$HOME_DIR/.config/systemd/user"
     mkdir -p "$UNIT_DIR"
-    UNIT_DST="$UNIT_DIR/wezard.service"
+    UNIT_DST="$UNIT_DIR/$UNIT"
     sed \
       -e "s|__NODE__|$NODE|g" \
       -e "s|__REPO__|$REPO|g" \
       -e "s|__HOME__|$HOME_DIR|g" \
-      "$REPO/systemd/wezard.service.template" > "$UNIT_DST"
+      "$REPO/systemd/${UNIT}.template" > "$UNIT_DST"
     systemctl --user daemon-reload
-    systemctl --user enable --now wezard.service
+    systemctl --user enable --now "$UNIT"
     echo "[install] systemd unit enabled: $UNIT_DST"
     ;;
   *)
     echo "unsupported OS: $OS"; exit 1 ;;
 esac
 
-echo "[install] done. Logs at $HOME_DIR/.wezard/daemon.{stdout,stderr,log}"
+echo "[install] $COMPONENT done. Logs at $HOME_DIR/.wezard/"

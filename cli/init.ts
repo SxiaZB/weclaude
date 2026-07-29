@@ -16,6 +16,8 @@ import { input, password, select, confirm, checkbox } from "@inquirer/prompts";
 import { parse as parseJsonc } from "jsonc-parser";
 import { patchJsonc } from "../shared/config-writer.js";
 import { expandHome } from "../shared/paths.js";
+import { resolvePublicHost } from "../shared/lan-ip.js";
+import { loadOrCreateSvrToken } from "../shared/svr-token.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO = pathResolve(here, "..", "..");
@@ -23,6 +25,10 @@ const REPO = pathResolve(here, "..", "..");
 const CONFIG = "~/.wezard/config.jsonc";
 const SECRETS = "~/.wezard/secrets.json";
 const CLAIM_PHRASE = "将本对话设置为默认会话";
+const SVR_HOST = "0.0.0.0";
+const SVR_PORT = 17891;
+const SVR_STATE = "~/.wezard/svr";
+const SVR_TOKEN_FILE = "~/.wezard/svr-token";
 
 // ── Pretty output (no ink — keep deps light) ─────────────────────────
 const c = {
@@ -114,8 +120,53 @@ const runSync = (): void => {
 
 const installDaemon = (): void => {
   log(c.dim("  installing resident daemon..."));
-  const r = spawnSync("bash", [`${REPO}/scripts/install.sh`], { stdio: "inherit" });
+  const r = spawnSync("bash", [`${REPO}/scripts/install.sh`, "daemon"], { stdio: "inherit" });
   if (r.status !== 0) throw new Error("install.sh failed");
+};
+
+// ── Detail relay (svr) ───────────────────────────────────────────────
+// 卡片里的 chat/detail 链接根不能是回环 —— 用户点开是在手机/企微内置浏览器里,
+// 回环指向的是他自己的设备。所以链接用本机 LAN IP,同网段即可直连。
+// svr 与 daemon 同机也值得独立跑: 记录经 POST /d 转发, 日后把 svr 挪到公网机器
+// 只需改 daemon.detailRemoteBase, daemon 侧零改动。
+const installSvr = (): void => {
+  log(c.dim("  installing detail relay (svr)..."));
+  const r = spawnSync("bash", [`${REPO}/scripts/install.sh`, "svr"], { stdio: "inherit" });
+  if (r.status !== 0) throw new Error("install.sh svr failed");
+};
+
+// 探活走回环 —— svr 绑 0.0.0.0, 本机 curl 得到的是同一个监听。LAN IP 只用于链接文案。
+const waitSvrReady = async (port: number, timeoutMs: number): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ok = await fetch(`http://127.0.0.1:${port}/healthz`)
+      .then((r) => r.ok)
+      .catch(() => false);
+    if (ok) return;
+    await sleep(500);
+  }
+  throw new Error(
+    `svr did not answer /healthz on :${port} — 查看 ~/.wezard/svr.stderr.log (端口占用?)`,
+  );
+};
+
+// 回环通 ≠ 链接可用: macOS 应用防火墙的 block-all 模式放行 loopback, 却把 LAN
+// 入连接建连后直接掐断 (curl 表现为 "Empty reply from server")。等用户点开卡片
+// 链接才发现是死链就太晚了 —— init 阶段按最终链接根实测一次。
+const warnIfLanBlocked = async (base: string, ip: string): Promise<void> => {
+  if (ip === "127.0.0.1") return;
+  const ok = await fetch(`${base}/healthz`, { signal: AbortSignal.timeout(3000) })
+    .then((r) => r.ok)
+    .catch(() => false);
+  if (ok) return;
+  log(c.yellow(`  ⚠ ${base} 回环可达但内网不可达 — 手机/企微里点开链接会打不开。`));
+  if (process.platform === "darwin") {
+    log(c.yellow("    macOS 应用防火墙拦了 node 的入连接，放行后即可:"));
+    log(c.dim("      sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setblockall off"));
+    log(c.dim(`      sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$(command -v node)"`));
+  } else {
+    log(c.yellow(`    检查防火墙是否放行 ${SVR_PORT}/tcp。`));
+  }
 };
 
 // Register the local repo as a Claude Code marketplace and install the
@@ -245,6 +296,15 @@ const main = async (): Promise<void> => {
   const claudeBin = claudeBinFor(primary);
 
   // ── Step 1b: write configs ─────────────────────────────────────
+  // svr 的 base/token 必须在 daemon 起来之前落盘 —— daemon 只在 boot 时读一次
+  // detailRemoteBase/Token, 晚写等于第一轮链接全指向回环。
+  const svrIP = resolvePublicHost(SVR_HOST);
+  const svrBase = `http://${svrIP}:${SVR_PORT}`;
+  const svrToken = loadOrCreateSvrToken(SVR_TOKEN_FILE);
+  if (svrIP === "127.0.0.1") {
+    log(c.yellow("  ⚠ 未探测到内网 IP，详情链接将只在本机可打开 (可稍后改 daemon.detailPublicBase)"));
+  }
+
   log(c.dim(`  写入 ${CONFIG} ...`));
   patchJsonc(CONFIG, [
     { path: ["bot", "websocketUrl"], value: "wss://openws.work.weixin.qq.com" },
@@ -257,16 +317,25 @@ const main = async (): Promise<void> => {
     { path: ["approval", "enabled"], value: enableHook },
     { path: ["approval", "matcher"], value: ".*" },
     { path: ["sync", "targets"], value: targets },
+    { path: ["svr", "host"], value: SVR_HOST },
+    { path: ["svr", "port"], value: SVR_PORT },
+    { path: ["svr", "stateDir"], value: SVR_STATE },
+    { path: ["svr", "tokenFile"], value: SVR_TOKEN_FILE },
+    { path: ["daemon", "detailRemoteBase"], value: svrBase },
   ]);
-  if (botId === existing.botId && secret === existing.secret) {
-    log(c.dim(`  复用 ${SECRETS} 中的凭证 (未改写)`));
-  } else {
-    log(c.dim(`  写入 ${SECRETS} ...`));
-    patchJsonc(SECRETS, [
-      { path: ["bot", "botId"], value: botId },
-      { path: ["bot", "secret"], value: secret },
-    ]);
-  }
+  // token 走 secrets.json 而不是 config.jsonc —— 后者常被丢进 dotfile 仓库。
+  const credsChanged = botId !== existing.botId || secret !== existing.secret;
+  if (!credsChanged) log(c.dim(`  复用 ${SECRETS} 中的凭证 (未改写)`));
+  else log(c.dim(`  写入 ${SECRETS} ...`));
+  patchJsonc(SECRETS, [
+    ...(credsChanged
+      ? [
+          { path: ["bot", "botId"], value: botId },
+          { path: ["bot", "secret"], value: secret },
+        ]
+      : []),
+    { path: ["daemon", "detailRemoteToken"], value: svrToken },
+  ]);
 
   ensureBuild();
   if (enableHook) runSync();
@@ -276,6 +345,10 @@ const main = async (): Promise<void> => {
     const pluginBins = [...new Set(agentKinds.filter((k) => k !== "codebuddy").map(claudeBinFor))];
     for (const bin of pluginBins) installPlugin(bin);
   }
+  installSvr();
+  await waitSvrReady(SVR_PORT, 20_000);
+  log(c.green(`  ✓ svr ready — 详情/会话链接根: ${c.bold(svrBase)}`));
+  await warnIfLanBlocked(svrBase, svrIP);
   installDaemon();
 
   log(c.dim("  等待 daemon 上线..."));

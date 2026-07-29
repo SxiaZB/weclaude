@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Detail relay. `scripts/install.sh svr` materializes the real plist into
+     ~/Library/LaunchAgents with absolute paths. host/port come from
+     ~/.wezard/config.jsonc (svr.*) — no CLI args here. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wezard.svr</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__NODE__</string>
+        <string>__REPO__/dist/svr/index.js</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>NODE_ENV</key>
+        <string>production</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.wezard/svr.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.wezard/svr.stderr.log</string>
+</dict>
+</plist>

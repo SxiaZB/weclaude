@@ -10,11 +10,10 @@
 // 存储直接复用 daemon 的 createDetailStore (append-only JSONL + LRU + 24h TTL)。
 // 信任模型: token 相同 = 可写; 读端不签名 (拿到 id 即可读)。id 是 uuid, 不可枚举。
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { randomBytes } from "node:crypto";
-import { dirname } from "node:path";
+import { mkdirSync } from "node:fs";
 import pino from "pino";
 import { expandHome } from "../shared/paths.js";
+import { loadOrCreateSvrToken } from "../shared/svr-token.js";
 import { createDetailStore, type DetailRecord } from "../shared/detail-store.js";
 import { renderDetailPage, renderNotFound } from "../shared/detail-render.js";
 import { createChatRoutes, chatRouteTable } from "../shared/chat-http.js";
@@ -91,19 +90,6 @@ Defaults come from ~/.wezard/config.jsonc (svr.*) when present; CLI overrides.
 `);
 };
 
-const loadOrCreateToken = (explicit: string | undefined, tokenFile: string): string => {
-  if (explicit && explicit.length > 0) return explicit;
-  const abs = expandHome(tokenFile);
-  if (existsSync(abs)) {
-    const t = readFileSync(abs, "utf8").trim();
-    if (t.length > 0) return t;
-  }
-  const t = randomBytes(24).toString("hex");
-  mkdirSync(dirname(abs), { recursive: true });
-  writeFileSync(abs, `${t}\n`, { mode: 0o600 });
-  return t;
-};
-
 const readBody = async (req: IncomingMessage): Promise<Buffer> => {
   const chunks: Buffer[] = [];
   for await (const c of req) chunks.push(c as Buffer);
@@ -130,7 +116,7 @@ const main = async (): Promise<void> => {
   const log = pino({ level: args.logLevel, name: "wezard-svr" });
   const stateDir = expandHome(args.stateDir);
   mkdirSync(stateDir, { recursive: true });
-  const token = loadOrCreateToken(args.token, args.tokenFile);
+  const token = loadOrCreateSvrToken(args.tokenFile, args.token);
   const store = createDetailStore({ stateDir, log });
   // Chat 视图 (SPA + JSON API + SSE) 与 daemon 完全同源 —— svr 侧的记录是 POST /d
   // 推过来的, store.subscribe 一样会触发, 所以远端浏览也是实时的。
