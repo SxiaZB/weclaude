@@ -1465,6 +1465,11 @@ export interface MirrorBridge {
    *  prompt / press-enter-to-continue, or submits the input box as-is. No-op
    *  for spawn-mode attachments (no live TTY). */
   submitPane: (target: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** Switch the most-recently-active attached tmux client to this session's
+   *  pane (session + window + pane all selected) — the WeCom-side "show me
+   *  the terminal" escape hatch. Fails with an attach hint when no tmux
+   *  client is attached anywhere. */
+  revealPane: (target: string) => Promise<{ ok: boolean; reason?: string }>;
   /** Cwd lifecycle for the chat-bound project path. `getCwd` returns
    *  `{ runningCwd, pendingCwd, defaultCwd }` so /pwd can render all three
    *  truthfully. `setPendingCwd` writes the user-requested next cwd into the
@@ -3483,6 +3488,30 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const r = await tmuxRun(["send-keys", "-t", a.tmuxPane, "Enter"]);
       if (r.code !== 0) return { ok: false, reason: `send-keys Enter failed: ${r.stdout.slice(-200) || r.code}` };
       log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /n — Enter sent to pane");
+      return { ok: true };
+    },
+    revealPane: async (target) => {
+      // paneOf (not byTarget.get) so a cold binding surviving only in the
+      // persisted store can still be revealed after a daemon reload.
+      const pane = paneOf(target);
+      if (!pane) return { ok: false, reason: "no tmux pane bound for target" };
+      if (!(await tmuxPaneAlive(pane))) return { ok: false, reason: "tmux pane no longer alive — the session needs /new or a respawn" };
+      // Pick the most-recently-active attached client — switch-client with no
+      // -c is ambiguous under multiple clients and a no-op under none.
+      const clients = await tmuxRun(["list-clients", "-F", "#{client_activity} #{client_name}"]);
+      const best = clients.stdout.split("\n").filter(Boolean)
+        .map((l) => { const i = l.indexOf(" "); return { act: Number(l.slice(0, i)), name: l.slice(i + 1) }; })
+        .sort((x, y) => y.act - x.act)[0]?.name;
+      if (!best) {
+        // Nothing to switch; tell the user how to get a client onto the session.
+        const s = await tmuxRun(["display-message", "-p", "-t", pane, "#{session_name}"]);
+        const sess = s.stdout.trim() || cfg.wrc.tmuxPrefix;
+        return { ok: false, reason: `没有已 attach 的 tmux 客户端。先在终端执行: \`tmux attach -t ${sess}\`` };
+      }
+      // A pane target pulls session + window selection along with it.
+      const r = await tmuxRun(["switch-client", "-c", best, "-t", pane]);
+      if (r.code !== 0) return { ok: false, reason: `switch-client failed: ${r.stdout.slice(-200) || r.code}` };
+      log.info({ target, pane, client: best }, "mirror /reveal — tmux client switched");
       return { ok: true };
     },
     getCwd,

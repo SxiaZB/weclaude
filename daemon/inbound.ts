@@ -146,6 +146,7 @@ const parseCfgSyncCommand = (text: string): { apply: boolean } | undefined => {
 const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 const isEnterCommand = (text: string): boolean => text.trim() === "/n";
+const isRevealCommand = (text: string): boolean => text.trim() === "/reveal";
 const isHelpCommand = (text: string): boolean => /^\/(?:help|\?|h)$/i.test(text.trim());
 const isSkillBCommand = (text: string): boolean => text.trim() === "/skill-b";
 
@@ -162,6 +163,7 @@ const renderHelp = (): string =>
     "`/sessions` 列出 live 会话 · `/sessions <emoji|id>` 切换",
     "`/stop` 打断当前生成 (Esc)",
     "`/n` 向 CLI 输入回车 (Enter)",
+    "`/reveal` 把终端的 tmux 窗口切到本会话",
     "",
     "▎切换 CLI 后端",
     "`/new codebuddy` 用指定 CLI 新开 (claude / claude-internal / codebuddy)",
@@ -746,6 +748,18 @@ export const installInboundRouter = (
       } else {
         const r = await bridge.submitPane(who);
         await replyText(frame, msg, who, r.ok ? "✅ Enter sent" : `[weclaude] /n failed: ${r.reason ?? "unknown"}`);
+      }
+      return { stop: true };
+    }
+    // Authorized `/reveal` — switch the attached tmux client to this session's
+    // pane so the user lands in the terminal showing the live TUI. Mirror-mode
+    // only; routed by `#tag` like any other session command.
+    if (isRevealCommand(text)) {
+      if (!("revealPane" in bridge)) {
+        await replyText(frame, msg, who, "[weclaude] /reveal only available in mirror mode");
+      } else {
+        const r = await bridge.revealPane(who);
+        await replyText(frame, msg, who, r.ok ? "✅ 已切到本会话的 tmux 窗口" : `[weclaude] /reveal failed: ${r.reason ?? "unknown"}`);
       }
       return { stop: true };
     }
