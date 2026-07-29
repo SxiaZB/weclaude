@@ -33,6 +33,7 @@ import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl, buildChatUrl } from "./detail.js";
 import type { TurnUsage } from "./detail.js";
 import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
+import { splitMarkdown } from "../shared/md-chunk.js";
 import { randomTip } from "./tips.js";
 import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, type PeerInfo } from "./peers.js";
 
@@ -770,26 +771,12 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
   return [];
 };
 
-// Greedy line-wise packing — never cuts mid-line, so a `[text](url)` link
-// (always emitted as a single line) is never bisected. A single oversized
-// line falls back to char-slicing for that line only.
-const splitChunks = (s: string, max: number): string[] => {
-  if (s.length <= max) return [s];
-  const out: string[] = [];
-  let cur = "";
-  const flush = (): void => { if (cur) { out.push(cur); cur = ""; } };
-  for (const line of s.split("\n")) {
-    if (line.length > max) {
-      flush();
-      for (let i = 0; i < line.length; i += max) out.push(line.slice(i, i + max));
-      continue;
-    }
-    const next = cur ? cur + "\n" + line : line;
-    if (next.length > max) { flush(); cur = line; } else { cur = next; }
-  }
-  flush();
-  return out;
-};
+// Block-wise packing (shared/md-chunk): never cuts mid-line, and never cuts a
+// fenced block or table in a way that breaks rendering — see splitMarkdown.
+const splitChunks = splitMarkdown;
+
+// Room reserved in every chunk for the `emoji \`#tag\` \`2/5\`` header line.
+const TAG_HEADER_BUDGET = 32;
 
 interface TailHandle {
   stop: () => void;
@@ -1835,8 +1822,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // pushes from a single mirror stay ordered; different mirrors run in parallel.
   const sendStandalone = (a: AttachState, content: string): void => {
     const chatId = stripPrincipalPrefix(a.target);
-    const tagged = withSessionTag(a.target, content);
-    const chunks = splitChunks(tagged, cfg.wrc.mirror.chunkChars);
+    // Tag AFTER splitting — one header per bubble, so chunk 2..N stay
+    // attributable to the session instead of arriving anonymous.
+    const pieces = splitChunks(content, Math.max(200, cfg.wrc.mirror.chunkChars - TAG_HEADER_BUDGET));
+    const chunks = pieces.map((p, i) =>
+      withSessionTag(a.target, p, pieces.length > 1 ? `${i + 1}/${pieces.length}` : undefined));
     a.standalonePending = a.standalonePending
       .then(async () => {
         for (const c of chunks) {
@@ -2717,7 +2707,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       );
     }
     const merged = parts.join("\n\n---\n\n");
-    return splitChunks(merged, cfg.wrc.mirror.chunkChars);
+    return splitChunks(merged, Math.max(200, cfg.wrc.mirror.chunkChars - TAG_HEADER_BUDGET));
   };
 
   const resolveToolDetail = (turnId: string): { target: string; markdown: string[] } | undefined => {
@@ -3810,9 +3800,11 @@ export const installMirrorEventListener = (
     }
     const chatId = stripPrincipalPrefix(detail.target);
     void (async () => {
-      for (const md of detail.markdown) {
+      const n = detail.markdown.length;
+      for (const [i, md] of detail.markdown.entries()) {
         try {
-          await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content: withSessionTag(detail.target, md) } });
+          const content = withSessionTag(detail.target, md, n > 1 ? `${i + 1}/${n}` : undefined);
+          await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content } });
         } catch (e) {
           log.warn({ err: (e as Error).message, turnId }, "tool detail push failed");
         }

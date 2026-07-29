@@ -62,8 +62,12 @@ export const tagBadge = (target: string | undefined): string => {
   return tag ? `${labelFor(tag)} ` : "";
 };
 
-/** Prefix markdown content with the `emoji \`#tag\`` header; identity when untagged. */
-export const withTagHeader = (target: string | undefined, content: string): string => {
+/** Prefix markdown content with the `emoji \`#tag\`` header; identity when untagged.
+ *  `seq` ("2/5") marks one piece of a split push — it rides in the same header
+ *  line so every chunk of a long reply is attributable on its own, and shows
+ *  alone when the session is untagged. */
+export const withTagHeader = (target: string | undefined, content: string, seq?: string): string => {
   const tag = tagOfKey(target);
-  return tag ? `${labelFor(tag)} \`#${tag}\`\n\n${content}` : content;
+  const head = [tag ? `${labelFor(tag)} \`#${tag}\`` : "", seq ? `\`${seq}\`` : ""].filter(Boolean).join(" ");
+  return head ? `${head}\n\n${content}` : content;
 };
