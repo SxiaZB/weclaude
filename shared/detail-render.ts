@@ -4,6 +4,7 @@
 import { structuredPatch, parsePatch, type StructuredPatchHunk } from "diff";
 import { highlightCode, langFromPath } from "./highlight.js";
 import { ansiToHtml } from "./ansi.js";
+import { staleAt, turnDone } from "./chat-view.js";
 import type {
   ApprovalDecision,
   ApprovalDetailRecord,
@@ -638,7 +639,7 @@ const tagSig = (html: string): string =>
 // 一个 turn 的可复用切片: 排序后的 items、渲染好的气泡、完成态与耗时。
 // 单 turn 页 (renderTurnPage) 和 chat 线程页 (renderTurnGroup) 共用同一份产物 ——
 // keyPrefix 让线程页里多个 turn 的 data-key 不互撞。
-const turnParts = (r: TurnDetailRecord, keyPrefix = ""): {
+const turnParts = (r: TurnDetailRecord, keyPrefix = "", now = Date.now()): {
   items: TurnItem[];
   bodies: string[];
   done: boolean;
@@ -664,9 +665,10 @@ const turnParts = (r: TurnDetailRecord, keyPrefix = ""): {
     }
     return "";
   });
-  // 出现 assistant·final 即视为本轮结束 —— closeTurn 可能滞后, 但 final 就是最后一条。
-  const done = r.closed || items.some((it) => it.t === "text" && it.final === true);
-  return { items, bodies, done, ageMs: (done ? r.updatedAt : Date.now()) - r.createdAt };
+  // 结束判定统一收在 chat-view.turnDone (closed / final text / 静默超时), 详情页
+  // 与聊天视图必须给出同一个答案 —— 否则一个显示「进行中」另一个显示「已完成」。
+  const done = turnDone(r, now);
+  return { items, bodies, done, ageMs: (done ? r.updatedAt : now) - r.createdAt };
 };
 
 const renderTurnPage = (r: TurnDetailRecord): string => {
@@ -818,10 +820,13 @@ export interface TurnFragment {
   createdAt: number;
   updatedAt: number;
   done: boolean;
+  /** 见 chat-view.staleAt: 无新写入时本轮到点自动算结束。0 = 已结束。
+   *  SSE 只在有写入时推送, 靠它客户端才能自行把「正在思考」熄掉。 */
+  staleAt: number;
 }
 
-export const renderTurnGroup = (r: TurnDetailRecord): TurnFragment => {
-  const { items, bodies, done, ageMs } = turnParts(r, `${r.id}:`);
+export const renderTurnGroup = (r: TurnDetailRecord, now = Date.now()): TurnFragment => {
+  const { items, bodies, done, ageMs } = turnParts(r, `${r.id}:`, now);
   const u = r.usage;
   const ctxPeak = u ? (u.ctxPeak ?? u.input + u.cacheRead + u.cacheWrite) : 0;
   const chips = [
@@ -846,8 +851,14 @@ export const renderTurnGroup = (r: TurnDetailRecord): TurnFragment => {
     <span class="tg-time">${fmtTs(r.createdAt)}</span>${chips}
     <a class="tg-link" href="detail?id=${encodeURIComponent(r.id)}" target="_blank" title="${items.length} 项">↗</a>
   </div>`;
+  // staleAt 只走 JSON, 绝不进 HTML —— 它跟着 updatedAt 变, 一旦计入 sig, SSE 的
+  // "内容没变就不重发" 会彻底失效 (一个 turn 的 HTML 可以是几十 KB)。
   const body = `<section class="turn-group" data-key="t:${escHtml(r.id)}">${head}<div class="bubbles">${inner}</div></section>`;
-  return { id: r.id, html: tagSig(body), sig: hashStr(body), createdAt: r.createdAt, updatedAt: r.updatedAt, done };
+  return {
+    id: r.id, html: tagSig(body), sig: hashStr(body),
+    createdAt: r.createdAt, updatedAt: r.updatedAt,
+    done, staleAt: done ? 0 : staleAt(r),
+  };
 };
 
 export { escHtml, fmtTs, fmtDuration, fmtTok, TURN_CSS };

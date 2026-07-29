@@ -1,0 +1,157 @@
+/* Chat 详情视图外壳。turn 正文的样式来自 detail-render 的 SHARED_CSS/TURN_CSS,
+   由 /chat/app.css 拼在本文件之前 —— 这里只管三栏骨架、会话列表与页脚总账。 */
+
+html, body { height: 100% }
+body { overflow: hidden }
+
+.app { display: flex; height: 100vh; height: 100dvh }
+
+/* ── 侧栏: 会话列表 ─────────────────────────────────────────────── */
+.side {
+  width: 288px; flex: none; background: #fff; border-right: 1px solid #d0d7de;
+  display: flex; flex-direction: column; min-height: 0;
+}
+.side-head { padding: 13px 16px 11px; border-bottom: 1px solid #eaeef2 }
+.side-head .l1 { display: flex; align-items: baseline; gap: 8px }
+.side-head .t { font-size: 14px; font-weight: 600 }
+.side-head .n {
+  margin-left: auto; font-size: 11px; color: #8c959f;
+  font-variant-numeric: tabular-nums;
+}
+.side-head .s {
+  font-size: 11px; color: #8c959f; font-family: ui-monospace, Menlo, monospace;
+  word-break: break-all; margin-top: 3px;
+}
+
+.tags { flex: 1; min-height: 0; overflow-y: auto; padding: 6px 6px 12px }
+
+.tag-row {
+  position: relative; display: flex; gap: 10px; align-items: flex-start;
+  padding: 8px 10px 8px 11px; border-radius: 8px; cursor: pointer;
+  border: 1px solid transparent; transition: background .12s;
+}
+.tag-row:hover { background: #f6f8fa }
+/* 选中态用左侧色条而不是整块蓝底 —— 底色会和内部的 badge/预览抢注意力。 */
+.tag-row.on { background: #f0f4f9 }
+.tag-row.on::before {
+  content: ""; position: absolute; left: 2px; top: 9px; bottom: 9px;
+  width: 3px; border-radius: 2px; background: #0969da;
+}
+
+.tag-av {
+  width: 32px; height: 32px; flex: none; border-radius: 10px; background: #f1f3f6;
+  display: flex; align-items: center; justify-content: center; font-size: 17px;
+  position: relative; border: 1px solid #eaeef2;
+}
+.tag-av .live {
+  position: absolute; right: -3px; bottom: -3px; width: 10px; height: 10px;
+  border-radius: 50%; background: #1a7f37; border: 2px solid #fff;
+  animation: pulse 1.4s infinite;
+}
+@keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .3 } }
+
+.tag-main { min-width: 0; flex: 1 }
+.tag-l1 { display: flex; align-items: baseline; gap: 6px }
+.tag-name {
+  font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; font-family: ui-monospace, Menlo, monospace;
+}
+.tag-row.running .tag-name { color: #1a7f37 }
+.tag-ts {
+  margin-left: auto; flex: none; font-size: 11px; color: #8c959f;
+  font-family: ui-monospace, Menlo, monospace;
+}
+.tag-prev {
+  font-size: 12px; color: #656d76; margin-top: 2px; overflow: hidden;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  line-height: 1.45;
+}
+/* 每行第三层: 轮数 / 工具数 / token —— 不点进去也能判断哪个会话在真干活。 */
+.tag-meta {
+  display: flex; gap: 4px; align-items: center; margin-top: 4px;
+  font-size: 10.5px; color: #8c959f; font-family: ui-monospace, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.tag-meta .sep { opacity: .45 }
+.tag-meta .hot { color: #9a6700 }
+.tags .empty-side { padding: 28px 12px; text-align: center; color: #8c959f; font-size: 12px }
+
+/* ── 主区 ───────────────────────────────────────────────────────── */
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column }
+.topbar {
+  flex: none; display: flex; align-items: center; gap: 10px; padding: 11px 20px;
+  background: #fff; border-bottom: 1px solid #d0d7de;
+}
+.topbar .em { font-size: 18px }
+.topbar .h { font-size: 15px; font-weight: 600; font-family: ui-monospace, Menlo, monospace }
+.topbar .sub {
+  font-size: 11px; color: #8c959f; font-family: ui-monospace, Menlo, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.topbar .back { display: none; font-size: 18px; color: #656d76; cursor: pointer; padding: 0 4px }
+
+.thread {
+  flex: 1; min-height: 0; overflow-y: auto; overflow-anchor: none;
+  padding: 16px 20px 24px; -webkit-overflow-scrolling: touch;
+}
+.thread-in { max-width: 920px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px }
+.empty { color: #8c959f; text-align: center; padding: 60px 0; font-size: 13px }
+.more-btn {
+  align-self: center; background: #fff; border: 1px solid #d0d7de; border-radius: 16px;
+  padding: 5px 16px; font-size: 12px; color: #57606a; cursor: pointer; font-family: inherit;
+}
+.more-btn:hover { background: #f6f8fa; color: #0969da; border-color: #0969da55 }
+
+/* ── turn 分组 ──────────────────────────────────────────────────── */
+.turn-group { display: flex; flex-direction: column; gap: 10px }
+.tg-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding-bottom: 6px; border-bottom: 1px dashed #d8dee4;
+}
+.tg-dot { width: 7px; height: 7px; border-radius: 50%; background: #b1bac4; flex: none }
+.tg-dot.live { background: #1a7f37; animation: pulse 1.4s infinite }
+.tg-time { font-size: 11.5px; color: #8c959f; font-family: ui-monospace, Menlo, monospace }
+.tg-tok {
+  font-size: 11px; color: #57606a; background: #f1f3f6; border-radius: 9px;
+  padding: 1px 7px; font-family: ui-monospace, Menlo, monospace;
+}
+.tg-link { margin-left: auto; color: #8c959f; text-decoration: none; font-size: 13px }
+.tg-link:hover { color: #0969da }
+.turn-group .bubbles { margin-top: 0 }
+
+/* ── 页脚总账 ───────────────────────────────────────────────────── */
+.statusbar {
+  flex: none; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 7px 20px; background: #fff; border-top: 1px solid #d0d7de;
+  font-size: 11.5px; color: #57606a; font-family: ui-monospace, Menlo, monospace;
+}
+.statusbar .st { display: flex; align-items: baseline; gap: 5px }
+.statusbar .st .k {
+  color: #8c959f; text-transform: uppercase; letter-spacing: .4px; font-size: 10px;
+}
+.statusbar .st .v { color: #1f2328; font-weight: 700; font-variant-numeric: tabular-nums }
+/* 缺数据的指标压暗, 不再显示成有意义的 "0" —— 0 与「没采到」是两回事。 */
+.statusbar .st.void .v { color: #b1bac4; font-weight: 400 }
+.statusbar .pill { display: flex; align-items: center; gap: 5px; font-weight: 700 }
+.statusbar .pill .d { width: 7px; height: 7px; border-radius: 50%; background: #8c959f }
+.statusbar .pill.run { color: #1a7f37 }
+.statusbar .pill.run .d { background: #1a7f37; animation: pulse 1.4s infinite }
+.statusbar .model {
+  color: #57606a; background: #f1f3f6; border-radius: 9px; padding: 1px 7px;
+  max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sb-bar { display: flex; height: 6px; width: 120px; border-radius: 3px; overflow: hidden; background: #eaeef2 }
+.sb-bar .seg { height: 100% }
+.conn { margin-left: auto; display: flex; align-items: center; gap: 5px }
+.conn .d { width: 7px; height: 7px; border-radius: 50%; background: #1a7f37 }
+.conn.off .d { background: #cf222e }
+
+@media (max-width: 760px) {
+  .app { flex-direction: column }
+  .side { width: auto; border-right: 0; border-bottom: 1px solid #d0d7de; max-height: 44vh }
+  .app.reading .side { display: none }
+  .app.reading .topbar .back { display: block }
+  .thread { padding: 12px }
+  .statusbar { gap: 10px; padding: 7px 12px }
+  .sb-bar, .statusbar .model { display: none }
+}

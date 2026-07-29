@@ -1,10 +1,14 @@
 // Chat detail routes, shared verbatim by the daemon and the standalone svr —
 // both own a DetailStore, so both can serve the same view off it.
 //
-//   GET /chat        → static SPA shell (shared/chat-render)
-//   GET /api/chat    → the chat list: every `#tag` session of this chat + status
-//   GET /api/thread  → one tag's turns, as server-rendered HTML fragments
-//   GET /api/events  → SSE: chat-summary deltas + turn fragments for one tag
+//   GET /chat          → static SPA shell (shared/chat-render)
+//   GET /chat/app.css  → 视图样式 (detail 共用样式 + web/chat.css)
+//   GET /chat/app.js   → 视图脚本 (web/chat.js)
+//   GET /api/chat      → the chat list: every `#tag` session of this chat + status
+//   GET /api/thread    → one tag's turns, as server-rendered HTML fragments
+//   GET /api/events    → SSE: chat-summary deltas + turn fragments for one tag
+//
+// 资源路由不校验 `?id=` —— 它们是纯静态前端代码, 不含任何会话数据。
 //
 // Capability model unchanged from /detail: `?id=` is an unguessable record id
 // and IS the credential. The base principal is derived from it server-side and
@@ -14,13 +18,16 @@ import type { URL } from "node:url";
 import { baseOfKey } from "./session-label.js";
 import { chatSummary, isTurn, threadOf, turnDone } from "./chat-view.js";
 import { renderTurnGroup } from "./detail-render.js";
-import { renderChatPage } from "./chat-render.js";
+import { chatScript, chatStyles, renderChatPage } from "./chat-render.js";
+import type { Asset } from "./web-assets.js";
 import type { DetailRecord, DetailStore } from "./detail-store.js";
 
 export type SimpleHandler = (req: IncomingMessage, res: ServerResponse, url: URL) => void;
 
 export interface ChatRoutes {
   page: SimpleHandler;
+  styles: SimpleHandler;
+  script: SimpleHandler;
   chat: SimpleHandler;
   thread: SimpleHandler;
   events: SimpleHandler;
@@ -81,6 +88,18 @@ export const createChatRoutes = (store: DetailStore): ChatRoutes => {
     res.end(renderChatPage());
   };
 
+  // 前端资源: ETag 跟着文件 mtime 走 —— 改一次 web/chat.js 浏览器就重新取一次,
+  // 没改则 304, 而 shell 本身永远 no-store, 不会把旧版本钉死在缓存里。
+  const asset = (make: () => Asset): SimpleHandler => (req, res) => {
+    const a = make();
+    res.setHeader("cache-control", "no-cache");
+    res.setHeader("etag", a.etag);
+    if (req.headers["if-none-match"] === a.etag) { res.statusCode = 304; res.end(); return; }
+    res.statusCode = 200;
+    res.setHeader("content-type", a.type);
+    res.end(a.body);
+  };
+
   const chat: SimpleHandler = (_req, res, url) => {
     const scope = resolveScope(store, url);
     if (!scope) { json(res, 404, { ok: false, error: "未找到该会话 (链接可能已过期)" }); return; }
@@ -92,7 +111,8 @@ export const createChatRoutes = (store: DetailStore): ChatRoutes => {
     const scope = resolveScope(store, url);
     if (!scope) { json(res, 404, { ok: false, error: "未找到该会话 (链接可能已过期)" }); return; }
     const target = authorizedTarget(scope, url.searchParams.get("target"));
-    const all = threadOf(store.list(), target);
+    const now = Date.now();
+    const all = threadOf(store.list(), target, now);
     // 注意 Number(null) === 0 —— 缺省必须先判 null, 否则默认就成了"全量"。
     const raw = url.searchParams.get("limit");
     const n = raw === null ? Number.NaN : Number(raw);
@@ -102,10 +122,11 @@ export const createChatRoutes = (store: DetailStore): ChatRoutes => {
     json(res, 200, {
       ok: true,
       target,
+      at: now,
       total: all.length,
       truncated: shown.length < all.length,
-      running: all.some((r) => !turnDone(r)),
-      turns: shown.map(renderTurnGroup),
+      running: all.some((r) => !turnDone(r, now)),
+      turns: shown.map((r) => renderTurnGroup(r, now)),
     });
   };
 
@@ -135,7 +156,7 @@ export const createChatRoutes = (store: DetailStore): ChatRoutes => {
     const pushTurn = (id: string): void => {
       const r = store.get(id);
       if (!r || !isTurn(r)) return;
-      const frag = renderTurnGroup(r);
+      const frag = renderTurnGroup(r, Date.now());
       if (sentSig.get(id) === frag.sig) return;
       sentSig.set(id, frag.sig);
       send("turn", frag);
@@ -169,13 +190,21 @@ export const createChatRoutes = (store: DetailStore): ChatRoutes => {
     req.on("error", close);
   };
 
-  return { page, chat, thread, events };
+  return { page, styles: asset(chatStyles), script: asset(chatScript), chat, thread, events };
 };
 
 /** Path → handler map; the daemon registers each, svr dispatches through it. */
 export const chatRouteTable = (routes: ChatRoutes): Record<string, SimpleHandler> => ({
   "GET /chat": routes.page,
+  "GET /chat/app.css": routes.styles,
+  "GET /chat/app.js": routes.script,
   "GET /api/chat": routes.chat,
   "GET /api/thread": routes.thread,
   "GET /api/events": routes.events,
 });
+
+/** Route keys, single-sourced so the daemon's registration can't drift. */
+export const CHAT_ROUTE_KEYS = [
+  "GET /chat", "GET /chat/app.css", "GET /chat/app.js",
+  "GET /api/chat", "GET /api/thread", "GET /api/events",
+] as const;

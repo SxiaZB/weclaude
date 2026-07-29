@@ -19,7 +19,7 @@ import {
   type TurnUsage,
 } from "../shared/detail-store.js";
 import { renderDetailPage, renderNotFound } from "../shared/detail-render.js";
-import { createChatRoutes, chatRouteTable } from "../shared/chat-http.js";
+import { createChatRoutes, chatRouteTable, CHAT_ROUTE_KEYS } from "../shared/chat-http.js";
 
 export type { ToolDetailRecord, ApprovalDetailRecord, TurnDetailRecord, TurnItem, TurnUsage } from "../shared/detail-store.js";
 
@@ -163,7 +163,7 @@ export const chatHandlers = (): Record<string, Handler> => {
     res.end("detail store not ready");
   };
   return Object.fromEntries(
-    ["GET /chat", "GET /api/chat", "GET /api/thread", "GET /api/events"].map((key) => {
+    CHAT_ROUTE_KEYS.map((key) => {
       const h = routes[key];
       return [key, h ? ((req, res, url) => h(req, res, url)) as Handler : unavailable];
     }),
