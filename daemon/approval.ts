@@ -21,7 +21,7 @@ import {
   clearAutoWindow,
   getWindowMeta,
 } from "./session-cache.js";
-import { alwaysAllowRulesFor, ruleAllows, ruleMatchesAny } from "../shared/allow-rules.js";
+import { NEVER_RULE_ALLOW, alwaysAllowRulesFor, ruleAllows, ruleMatchesAny, splitSegments } from "../shared/allow-rules.js";
 import { claudeConfigWrite, type ClaudeConfigHit } from "../shared/claude-config-path.js";
 import type { NativeModalAnswer } from "./mirror-bridge.js";
 import { appendUnique } from "../shared/config-writer.js";
@@ -1908,16 +1908,19 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
           log.warn({ err: (e as Error).message }, "allow_always notice send failed");
         }
       } else if (!askBlocked && !guardActive && gen.length === 0) {
-        // 生成不了可靠字面规则 (含 $()/反引号动态构造, 或分隔符切进了引号内部) —
-        // 本次一次性放行并告知。文案区分两种成因, 避免误导排查方向。
-        const dynamic = /[`]|\$\(/.test(
-          typeof (toolInput as Record<string, unknown> | null)?.command === "string"
-            ? ((toolInput as Record<string, unknown>).command as string)
-            : "",
-        );
-        const why = dynamic
-          ? "该命令含动态构造（$() / 反引号），字面规则无法可靠描述其行为"
-          : "该命令的引号/结构无法安全切分出可靠前缀";
+        // 生成不了可靠字面规则 — 本次一次性放行并告知。成因有四种, 文案必须指对
+        // 排查方向: 曾把 `ls … 2>&1 | head` 的分段失败笼统报成"引号/结构"问题,
+        // 用户照着查引号自然查不出东西 (真凶是 fd 重定向的 & 被当成后台执行符)。
+        const cmdStr = typeof (toolInput as Record<string, unknown> | null)?.command === "string"
+          ? ((toolInput as Record<string, unknown>).command as string)
+          : "";
+        const why = NEVER_RULE_ALLOW.has(toolName)
+          ? `\`${toolName}\` 是交互工具，永不支持免审（硬保护）`
+          : /[`]|\$\(/.test(cmdStr)
+            ? "该命令含动态构造（$() / 反引号），字面规则无法可靠描述其行为"
+            : splitSegments(cmdStr) === undefined
+              ? "该命令含未闭合引号或后台执行符 `&`，无法安全分段"
+              : "该命令的结构提炼不出可靠前缀（异形段首、或解释器头部拿不到子命令）";
         try {
           await client.sendMessage(targetChatId(approver), {
             msgtype: "markdown",
