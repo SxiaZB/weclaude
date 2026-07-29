@@ -362,9 +362,12 @@ const withSessionTag = withTagHeader;
 //
 // Strategy: extract /cmd + args into a single styled line; strip the rest.
 // Returns "" when the message is purely meta — caller filters.
+// Opening tag tolerates attributes: codebuddy emits e.g.
+// `<system-reminder data-role="command-caveat">` (verified 100+ on disk) —
+// a bare `<tag>` match lets the whole caveat leak into the WeCom bubble.
 const SLASH_TAG_RE = /<command-name>([\s\S]*?)<\/command-name>/;
 const SLASH_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
-const META_TAG_RE = /<(command-message|command-name|command-args|local-command-stdout|local-command-caveat|system-reminder|task-notification)>[\s\S]*?<\/\1>/g;
+const META_TAG_RE = /<(command-message|command-name|command-args|local-command-stdout|local-command-caveat|system-reminder|task-notification)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
 const TASK_NOTIF_RE = /<task-notification>([\s\S]*?)<\/task-notification>/;
 
 // Claude Code's `/goal` installs a session-scoped Stop hook and injects this
