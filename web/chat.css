@@ -103,7 +103,13 @@ body { overflow: hidden }
 .more-btn:hover { background: #f6f8fa; color: #0969da; border-color: #0969da55 }
 
 /* ── turn 分组 ──────────────────────────────────────────────────── */
-.turn-group { display: flex; flex-direction: column; gap: 10px }
+/* section 的默认样式给了白底+边框, 但没有内边距 —— 气泡/工具行会直接贴着卡片
+   边缘, 所以这里补上一轮对话自己的呼吸空间。 */
+.turn-group {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 14px 16px 16px; border-radius: 12px; border-color: #e1e6ec;
+  box-shadow: 0 1px 2px #1f23280a;
+}
 .tg-head {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   padding-bottom: 6px; border-bottom: 1px dashed #d8dee4;
@@ -140,8 +146,15 @@ body { overflow: hidden }
   color: #57606a; background: #f1f3f6; border-radius: 9px; padding: 1px 7px;
   max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* token I/O 堆叠条 + 图例: 色块必须有名字, 否则底部那条彩带谁也读不懂。 */
+.sb-io { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0 }
+.sb-io > .k { color: #8c959f; text-transform: uppercase; letter-spacing: .4px; font-size: 10px }
 .sb-bar { display: flex; height: 6px; width: 120px; border-radius: 3px; overflow: hidden; background: #eaeef2 }
 .sb-bar .seg { height: 100% }
+.sb-leg { display: flex; align-items: center; gap: 9px; flex-wrap: wrap }
+.sb-leg .lg { display: flex; align-items: center; gap: 4px; font-size: 10.5px; color: #8c959f }
+.sb-leg .lg i { width: 8px; height: 8px; border-radius: 2px; flex: none }
+.sb-leg .lg b { color: #1f2328; font-weight: 700; font-variant-numeric: tabular-nums }
 .conn { margin-left: auto; display: flex; align-items: center; gap: 5px }
 .conn .d { width: 7px; height: 7px; border-radius: 50%; background: #1a7f37 }
 .conn.off .d { background: #cf222e }
@@ -152,6 +165,7 @@ body { overflow: hidden }
   .app.reading .side { display: none }
   .app.reading .topbar .back { display: block }
   .thread { padding: 12px }
+  .turn-group { padding: 12px }
   .statusbar { gap: 10px; padding: 7px 12px }
-  .sb-bar, .statusbar .model { display: none }
+  .sb-io, .statusbar .model { display: none }
 }

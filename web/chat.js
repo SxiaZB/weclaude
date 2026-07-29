@@ -186,6 +186,12 @@
 
   // ── 页脚总账 ──
   var COLORS = { input: '#0a7d6b', cacheRead: '#8250df', cacheWrite: '#953800', output: '#1a7f37' };
+  // 缩写键本身没有自解释性, 悬停给出中文口径 (尤其 ctx 是峰值、cache 是累计读写)。
+  var TIP = {
+    turns: '对话轮数', tools: '工具调用次数', api: 'API 请求次数',
+    ctx: '上下文峰值 — 单次请求送入的 input + 缓存 的最高值',
+    out: '累计输出 token', cache: '累计缓存 token (读 + 写)', time: '累计耗时',
+  };
   // 进行中的会话, 耗时要跟着走: durationMs 只统计到快照时刻 at, 之后的补上;
   // runningUntil 一过就冻住, 不会像旧版那样把静默期一路累加成几十小时。
   var liveDur = function (t) {
@@ -196,19 +202,27 @@
   var renderStatus = function (t) {
     if (!t) { sbEl.innerHTML = ''; return; }
     var u = t.usage || {}, run = isRunning(t);
-    var segs = [['input', 'Input'], ['cacheRead', 'Cache read'], ['cacheWrite', 'Cache write'], ['output', 'Output']]
+    var segs = [['input', '输入'], ['cacheRead', '缓存读'], ['cacheWrite', '缓存写'], ['output', '输出']]
       .filter(function (s) { return u[s[0]] > 0; });
     var total = segs.reduce(function (a, s) { return a + u[s[0]]; }, 0);
     // token 一条都没采到就别画那条空槽 —— 空进度条看着像"用了 0%", 是误导。
-    var bar = total > 0
-      ? '<span class="sb-bar">' + segs.map(function (s) {
-          return '<span class="seg" style="width:' + (u[s[0]] / total * 100).toFixed(2) + '%;background:' +
-            COLORS[s[0]] + '" title="' + s[1] + ': ' + fmtTok(u[s[0]]) + '"></span>';
-        }).join('') + '</span>'
+    // 光有色块看不出哪段是什么 (tooltip 要悬停才知道), 所以条后面always跟图例。
+    var io = total > 0
+      ? '<span class="sb-io" title="累计 token I/O · 共 ' + fmtTok(total) + '">' +
+          '<span class="k">token i/o</span>' +
+          '<span class="sb-bar">' + segs.map(function (s) {
+            return '<span class="seg" style="width:' + (u[s[0]] / total * 100).toFixed(2) + '%;background:' +
+              COLORS[s[0]] + '" title="' + s[1] + ': ' + fmtTok(u[s[0]]) + '"></span>';
+          }).join('') + '</span>' +
+          '<span class="sb-leg">' + segs.map(function (s) {
+            return '<span class="lg"><i style="background:' + COLORS[s[0]] + '"></i>' + s[1] +
+              '<b>' + fmtTok(u[s[0]]) + '</b></span>';
+          }).join('') + '</span>' +
+        '</span>'
       : '';
     // 值为 0 = 该指标没有数据 (老记录 / 网关不报 usage), 压暗成 "–" 与真实的 0 区分。
     var st = function (k, n, text) {
-      return '<span class="st' + (n ? '' : ' void') + '" title="' + esc(k) + '">' +
+      return '<span class="st' + (n ? '' : ' void') + '" title="' + esc(TIP[k] || k) + '">' +
         '<span class="k">' + k + '</span><span class="v">' + (n ? esc(text) : '–') + '</span></span>';
     };
     var cache = (u.cacheRead || 0) + (u.cacheWrite || 0);
@@ -222,7 +236,7 @@
       st('out', u.output, fmtTok(u.output)) +
       st('cache', cache, fmtTok(cache)) +
       st('time', liveDur(t), fmtDur(liveDur(t))) +
-      bar;
+      io;
   };
 
   // ── 线程 ──
