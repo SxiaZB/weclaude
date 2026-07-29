@@ -148,6 +148,21 @@ const findJsonlBySid = (sid: string, only?: CliBackend): string | undefined => {
     .sort((a, b) => b.m - a.m)[0]?.p;
 };
 
+// Backend-agnostic line adapter for the raw-jsonl predicates below. They were
+// written against Claude's schema (type:"user", isMeta, string content) —
+// codebuddy persists message/function_call records instead, so route every
+// parsed line through the owning backend's adapter first (identity for claude).
+const normalizeForPath = (path: string, raw: unknown): TranscriptLine | null =>
+  backendForPath(path).normalizeTranscriptLine(raw) as TranscriptLine | null;
+
+// Local-command noise on user lines: Claude marks the caveat / command-stdout
+// records isMeta; codebuddy persists them as PLAIN user messages (no isMeta
+// field at all). Predicates looking for the first REAL user line must skip
+// both forms explicitly.
+const isLocalCommandNoise = (content: unknown): boolean =>
+  typeof content === "string" &&
+  (content.includes('data-role="command-caveat"') || content.includes("<local-command-stdout>"));
+
 // True if `path` holds at least one real (non-meta, non-sidechain) user line —
 // i.e. it's a live session, not an empty just-touched jsonl. Bounded head read.
 const jsonlHasUserLine = (path: string): boolean => {
@@ -161,8 +176,8 @@ const jsonlHasUserLine = (path: string): boolean => {
     for (const line of buf.toString("utf8").split("\n")) {
       if (!line.trim()) continue;
       try {
-        const j = JSON.parse(line) as TranscriptLine;
-        if (j.type === "user" && !j.isMeta && !j.isSidechain) return true;
+        const j = normalizeForPath(path, JSON.parse(line));
+        if (j?.type === "user" && !j.isMeta && !j.isSidechain) return true;
       } catch { /* partial line */ }
     }
   } catch { /* unreadable */ }
@@ -2740,9 +2755,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       for (const line of text.split("\n")) {
         if (!line.trim()) continue;
         try {
-          const j = JSON.parse(line) as TranscriptLine;
-          if (j.type !== "user" || j.isMeta || j.isSidechain) continue;
+          const j = normalizeForPath(path, JSON.parse(line));
+          if (!j || j.type !== "user" || j.isMeta || j.isSidechain) continue;
           const c = j.message?.content;
+          // codebuddy writes the caveat + /clear + stdout as sibling plain user
+          // messages — skip the noise so the DECIDING line is the first real
+          // one, same as Claude's isMeta-filtered stream.
+          if (isLocalCommandNoise(c)) continue;
           // First non-meta user line decides: /clear → match; anything else → reject.
           return typeof c === "string" && SLASH_CLEAR_USER_RE.test(c);
         } catch { /* partial line */ }
@@ -2768,8 +2787,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       for (const line of buf.toString("utf8").split("\n")) {
         if (!line.trim()) continue;
         try {
-          const j = JSON.parse(line) as TranscriptLine;
-          if (j.type === "user" && !j.isMeta && !j.isSidechain && typeof j.uuid === "string") return j.uuid;
+          const j = normalizeForPath(path, JSON.parse(line));
+          if (j?.type === "user" && !j.isMeta && !j.isSidechain && !isLocalCommandNoise(j.message?.content) && typeof j.uuid === "string") return j.uuid;
         } catch { /* partial line */ }
       }
     } catch { /* unreadable */ }
