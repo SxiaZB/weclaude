@@ -187,6 +187,7 @@ const Approval = z.object({
   // plan mode、直接干活。用户仍可在本地 Shift+Tab 手动进 plan mode(那条路径
   // 不过 hook)。默认 true。设 false 恢复原行为(允许模型自动进 plan mode)。
   blockAutoPlanMode: z.boolean().default(true),
+  danger: Danger.default({}),
 });
 
 // sync.targets[].kind 的合法值。claude-internal / custom 等旧值自动 collapse

@@ -69,7 +69,20 @@
     "sessionCacheMinutes": 30,   // (session_id, tool, cmd_prefix_hash) → decision
     "windowMinutes": 5,          // 「⏱ N 分钟」按钮：开窗口期间所有请求自动 allow
     "sensitiveArgRedact": true,  // mask password/token-like values before sending to IM
-    "fallbackOnError": "ask"     // never "deny" — never break workflow
+    "fallbackOnError": "ask",    // never "deny" — never break workflow
+
+    // 危险名单：命中者强制逐次单独审批 —— 不吃自动窗口、不吃 session cache、
+    // 不参与批量合流、卡上没有「N 分钟全过」按钮、超时降级 ask 不静默放行。
+    // 内置覆盖 rm/git push/kubectl delete/DROP TABLE/敏感路径等；下面三组正则
+    // (大小写不敏感) 追加自定义规则，allowPatterns 优先级最高。
+    "danger": {
+      "enabled": true,
+      "builtin": true,
+      "commandPatterns": [],     // 例: ["\\bpm2\\s+delete\\b"]
+      "toolPatterns": [],        // 例: ["^mcp__prod__"]
+      "pathPatterns": [],        // 例: ["/prod/"]
+      "allowPatterns": []        // 例: ["\\brm\\s+-rf\\s+node_modules\\b"]
+    }
   },
 
   // ── claude / codebuddy wrapper sync ───────────────────────────────

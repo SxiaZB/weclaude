@@ -21,6 +21,7 @@ import {
   getWindowMeta,
 } from "./session-cache.js";
 import { redact } from "./redact.js";
+import { dangerOf, type DangerHit } from "./danger.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
@@ -61,6 +62,8 @@ interface CardArgs {
   transcriptTail: string;
   windowMinutes: number;
   detailUrl?: string;  // 空则不渲染 jump_list
+  /** 命中危险名单的规则名。非空 → 卡片去掉「全过」按钮, 必须单次确认。 */
+  danger?: string;
 }
 
 const TRUNC = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -213,6 +216,20 @@ const detailJumpList = (url?: string): TemplateCard["jump_list"] | undefined =>
 const emojiFor = tagBadge;
 const tagOf = (a: CardArgs): string => emojiFor(a.chatKey);
 
+// 危险卡: 只有 ❌ / ✅ — 不给「N 分钟全过」的入口, 否则一次点击就把后续
+// 所有危险操作也放行了, 名单等于失效。
+const approveButtons = (a: CardArgs): TemplateCard["button_list"] =>
+  a.danger
+    ? [
+        { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
+        { text: "✅ 确认执行", style: 4, key: encodeKey(a.reqId, "allow") },
+      ]
+    : [
+        { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
+        { text: fmtWindow(a.windowMinutes), style: 3, key: encodeKey(a.reqId, "allow_window") },
+        { text: "✅", style: 4, key: encodeKey(a.reqId, "allow") },
+      ];
+
 const buildCard = (a: CardArgs): TemplateCard => {
   const r = renderInput(a.toolName, a.toolInput, a.toolInputStr, a.cwd);
   const dir = dirName(a.cwd);
@@ -221,15 +238,15 @@ const buildCard = (a: CardArgs): TemplateCard => {
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: mainTitle(`🔐 授权 · ${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
+    main_title: mainTitle(
+      `${a.danger ? "⚠️ 危险" : "🔐 授权"} · ${tagOf(a)}${a.toolName} · ${dir}/`,
+      r.desc,
+    ),
+    ...(a.danger ? { sub_title_text: `命中危险名单「${a.danger}」· 需单独确认,不进入自动放行` } : {}),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
-    button_list: [
-      { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
-      { text: fmtWindow(a.windowMinutes), style: 3, key: encodeKey(a.reqId, "allow_window") },
-      { text: "✅", style: 4, key: encodeKey(a.reqId, "allow") },
-    ],
+    button_list: approveButtons(a),
   };
 };
 
@@ -278,7 +295,7 @@ const buildResolvedCard = (
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: mainTitle(`${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
+    main_title: mainTitle(`${a.danger ? "⚠️ " : ""}${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
     ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -343,6 +360,9 @@ interface ActiveBatch {
   toolName: string;
   approver: string;
   windowMinutes: number;
+  /** 危险名单规则名。危险请求永远是单成员批次 (不注册进 activeBatches,
+   *  没人能 join), 只为复用 flushBatch 的发卡/失败路径。 */
+  danger?: string;
   members: BatchMember[];
   flushTimer: NodeJS.Timeout;
   flushed: boolean;
@@ -943,9 +963,11 @@ interface ApproveResp {
 
 const decisionToHook = (d: Decision): "allow" | "deny" => (d === "deny" ? "deny" : "allow");
 
-const fallback = (cfg: Config, reason: string): ApproveResp => ({
-  decision: cfg.approval.fallbackOnError,
-  reason,
+// 危险操作永不走 fallbackOnError:"allow" — 超时/断线时降级为 ask, 交回本地 CLI
+// 由人来确认, 而不是静默放行一次 rm。
+const fallback = (cfg: Config, reason: string, danger?: unknown): ApproveResp => ({
+  decision: danger && cfg.approval.fallbackOnError === "allow" ? "ask" : cfg.approval.fallbackOnError,
+  reason: danger ? `${reason}:danger` : reason,
 });
 
 interface ApprovalDeps {
@@ -1003,6 +1025,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
             chatKey: batch.approver,
             transcriptTail: m.transcriptTail,
             windowMinutes: batch.windowMinutes,
+            danger: batch.danger,
             detailUrl: detailUrlFor(m.reqId),
           });
         })();
@@ -1120,8 +1143,12 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
     // 检查跳过 (window 需要一个 chat 才存在), 走后面的 no_approver fallback。
     const approver = resolveApprover(cfg, sessionId, getMirrorTarget);
 
+    // 危险名单: 命中者跳过 auto-window / session cache / 批量合流, 每次都单独发卡。
+    const danger: DangerHit | undefined = dangerOf(cfg, toolName, toolInput);
+    if (danger) log.info({ toolName, sessionId, rule: danger.rule }, "danger hit — forcing single approval");
+
     // Auto-approve window: while active for THIS chat, requests short-circuit to allow.
-    if (approver && isAutoWindowActive(approver)) {
+    if (!danger && approver && isAutoWindowActive(approver)) {
       const remainSec = Math.ceil(autoWindowRemainingMs(approver) / 1000);
       log.info({ toolName, sessionId, chatKey: approver, remainSec }, "auto-window allow");
       json(res, 200, {
@@ -1133,7 +1160,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
 
     // Session cache
     const ck = cacheKey(sessionId, toolName, toolInput);
-    const cached = cacheGet(ck);
+    const cached = danger ? undefined : cacheGet(ck);
     if (cached) {
       log.info({ ck, cached }, "cache hit");
       json(res, 200, {
@@ -1145,12 +1172,12 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
 
     if (!approver) {
       log.warn("no approver configured");
-      json(res, 200, fallback(cfg, "no_approver") satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "no_approver", danger) satisfies ApproveResp);
       return;
     }
     if (!client.isConnected) {
       log.warn("ws not connected");
-      json(res, 200, fallback(cfg, "ws_disconnected") satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "ws_disconnected", danger) satisfies ApproveResp);
       return;
     }
 
@@ -1175,6 +1202,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
         sessionId,
         chatKey: approver,
         transcriptTail,
+        danger: danger?.rule,
       },
       timeoutMs: longPollMs,
     });
@@ -1193,7 +1221,8 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
     // 选择普通 buildCard 或 buildBatchCard。0 = 关闭聚合, 立即 flush。
     const member: BatchMember = { reqId, toolInput: display, originalToolInput: toolInput, toolInputStr, cwd, transcriptTail };
     const bk = batchKeyOf(sessionId, toolName);
-    const existing = activeBatches.get(bk);
+    // 危险请求既不 join 也不被 join — 一次危险操作 = 一张卡 = 一次点击。
+    const existing = danger ? undefined : activeBatches.get(bk);
     if (existing && !existing.flushed) {
       existing.members.push(member);
       log.info({ batchId: existing.batchId, count: existing.members.length, reqId }, "batch joined");
@@ -1204,14 +1233,15 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
         toolName,
         approver,
         windowMinutes: cfg.approval.windowMinutes,
+        danger: danger?.rule,
         members: [member],
         flushed: false,
         flushTimer: undefined as unknown as NodeJS.Timeout, // set below
       };
-      const coalesceMs = cfg.approval.batchCoalesceMs;
+      const coalesceMs = danger ? 0 : cfg.approval.batchCoalesceMs;
       const fire = (): void => void flushBatch(batch);
       batch.flushTimer = coalesceMs > 0 ? setTimeout(fire, coalesceMs) : setImmediate(fire) as unknown as NodeJS.Timeout;
-      activeBatches.set(bk, batch);
+      if (!danger) activeBatches.set(bk, batch);
       batchById.set(batch.batchId, batch);
       evictBatches();
       log.info({ batchId: batch.batchId, reqId, coalesceMs }, "batch opened");
@@ -1223,14 +1253,16 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
       decision = await promise;
     } catch (e) {
       log.warn({ err: (e as Error).message, reqId }, "approval timed out");
-      json(res, 200, fallback(cfg, "approver_timeout") satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "approver_timeout", danger) satisfies ApproveResp);
       return;
     }
 
-    if (decision === "allow_session" && cfg.approval.sessionCacheMinutes > 0) {
+    // 危险决策一律不留痕: 不写 session cache、不开自动窗口 (卡上本就没这两个
+    // 按钮, 这里是防御性兜底 —— 决策也可能来自 sweep / 旧卡)。
+    if (!danger && decision === "allow_session" && cfg.approval.sessionCacheMinutes > 0) {
       cachePut(ck, decision, cfg.approval.sessionCacheMinutes * 60_000);
     }
-    if (decision === "allow_window" && cfg.approval.windowMinutes > 0) {
+    if (!danger && decision === "allow_window" && cfg.approval.windowMinutes > 0) {
       setAutoWindow(approver, cfg.approval.windowMinutes * 60_000, {
         toolName,
         toolInput: display,
@@ -1549,6 +1581,7 @@ export const installApprovalEventListener = (
               by,
               sessionId: meta?.sessionId ?? "",
               chatKey: meta?.chatKey ?? "",
+              danger: meta?.danger,
               detailUrl: detailUrlFor(reqId),
             });
         await client.updateTemplateCard(frame, card);

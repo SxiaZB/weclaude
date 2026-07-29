@@ -17,6 +17,9 @@ export interface PendingMeta {
    *  sessions bound to the same chat, not just the clicked one. */
   chatKey?: string;
   transcriptTail?: string;
+  /** 命中危险名单的规则名 (daemon/danger.ts)。非空 = 这张卡必须被人单独点,
+   *  永远不参与 allow_window 的批量放行。 */
+  danger?: string;
 }
 
 interface Pending {
@@ -131,6 +134,9 @@ export const resolvePendingsByChat = (
   for (const [reqId, p] of store.entries()) {
     if (reqId === excludeReqId) continue;
     if (p.meta.kind !== "approval") continue;
+    // 危险卡不在 sweep 覆盖范围: 用户点的是「N 分钟全过」, 那是对常规操作的
+    // 授权, 不能顺手把一条 rm -rf 也放行了。
+    if (p.meta.danger) continue;
     if (!p.meta.chatKey || baseOfKey(p.meta.chatKey) !== base) continue;
     hits.push({ reqId, meta: p.meta });
   }
