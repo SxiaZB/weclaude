@@ -3091,8 +3091,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     target: string,
     windowName?: string,
     cli?: CliBackendName,
-    opts?: { model?: string; cwd?: string },
-  ): Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }> => {
+    opts?: { model?: string; cwd?: string; silent?: boolean },
+  ): Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string; info?: string }> => {
     const prev = byTarget.get(target);
     // Resolution precedence (all chat-scoped except the running-cwd fallback):
     //   base.pending > target.running > base.running > default
