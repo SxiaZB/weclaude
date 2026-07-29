@@ -19,6 +19,7 @@ import {
   type TurnUsage,
 } from "../shared/detail-store.js";
 import { renderDetailPage, renderNotFound } from "../shared/detail-render.js";
+import { createChatRoutes, chatRouteTable } from "../shared/chat-http.js";
 
 export type { ToolDetailRecord, ApprovalDetailRecord, TurnDetailRecord, TurnItem, TurnUsage } from "../shared/detail-store.js";
 
@@ -128,24 +129,45 @@ export const getDetail = (id: string): DetailRecord | undefined => store?.get(id
 // URL 优先级: publicBase (反代/自定义 host) > remoteBase (chat 端直连 svr)
 // > fallback host+port (回环 → LAN IP 替换)。
 // forceInnerBrowser=1 / ww_vw / ww_vh: WeCom 桌面端识别参数, 让链接在内置浏览器打开。
+const detailRoot = (publicBase: string, fallbackHost: string, fallbackPort: number): string =>
+  publicBase && publicBase.length > 0
+    ? publicBase.replace(/\/+$/, "")
+    : remoteBase && remoteBase.length > 0
+      ? remoteBase.replace(/\/+$/, "")
+      : `http://${resolvePublicHost(fallbackHost)}:${fallbackPort}`;
+
+const detailParams = (id: string): string =>
+  new URLSearchParams({ id, forceInnerBrowser: "1", ww_vw: "1000", ww_vh: "800" }).toString();
+
 export const buildDetailUrl = (
   publicBase: string,
   fallbackHost: string,
   fallbackPort: number,
   id: string,
-): string => {
-  const root = publicBase && publicBase.length > 0
-    ? publicBase.replace(/\/+$/, "")
-    : remoteBase && remoteBase.length > 0
-      ? remoteBase.replace(/\/+$/, "")
-      : `http://${resolvePublicHost(fallbackHost)}:${fallbackPort}`;
-  const params = new URLSearchParams({
-    id,
-    forceInnerBrowser: "1",
-    ww_vw: "1000",
-    ww_vh: "800",
-  });
-  return `${root}/detail?${params.toString()}`;
+): string => `${detailRoot(publicBase, fallbackHost, fallbackPort)}/detail?${detailParams(id)}`;
+
+// Chat 视图入口。id 仍是那条 turn 记录 —— 它既是凭据, 也决定默认选中哪个 #tag。
+export const buildChatUrl = (
+  publicBase: string,
+  fallbackHost: string,
+  fallbackPort: number,
+  id: string,
+): string => `${detailRoot(publicBase, fallbackHost, fallbackPort)}/chat?${detailParams(id)}`;
+
+// Chat 视图路由 (页面 + JSON API + SSE)。store 未初始化时全部 503 —— 只可能发生在
+// initDetailPersistence 之前, 正常启动路径不会命中。
+export const chatHandlers = (): Record<string, Handler> => {
+  const routes = store ? chatRouteTable(createChatRoutes(store)) : {};
+  const unavailable: Handler = (_req, res) => {
+    res.statusCode = 503;
+    res.end("detail store not ready");
+  };
+  return Object.fromEntries(
+    ["GET /chat", "GET /api/chat", "GET /api/thread", "GET /api/events"].map((key) => {
+      const h = routes[key];
+      return [key, h ? ((req, res, url) => h(req, res, url)) as Handler : unavailable];
+    }),
+  );
 };
 
 export const makeDetailHandler = (log: Logger): Handler => {

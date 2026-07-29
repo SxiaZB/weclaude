@@ -15,7 +15,7 @@ import { readdirSync, readFileSync, existsSync, statSync, readlinkSync } from "n
 import { join, basename } from "node:path";
 import { activeBackends, backendForPath, projectDirsFor, type CliBackendName } from "../shared/cli-backends.js";
 import { expandHome } from "../shared/paths.js";
-import { labelFor } from "./session-label.js";
+import { labelFor } from "../shared/session-label.js";
 import { summarizeTail } from "./peers.js";
 
 export interface SessionInfo {

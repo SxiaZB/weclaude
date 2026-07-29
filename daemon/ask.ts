@@ -4,7 +4,7 @@ import type { Logger } from "pino";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
 import { createPending, resolvePending } from "./pending.js";
-import { tagBadge } from "./session-label.js";
+import { tagBadge } from "../shared/session-label.js";
 
 const stripPrefix = (s: string): string => {
   const i = s.indexOf(":");

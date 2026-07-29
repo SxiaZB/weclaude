@@ -30,9 +30,9 @@ import {
 } from "../shared/cli-backends.js";
 import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
-import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl } from "./detail.js";
+import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl, buildChatUrl } from "./detail.js";
 import type { TurnUsage } from "./detail.js";
-import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "./session-label.js";
+import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
 import { randomTip } from "./tips.js";
 import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, type PeerInfo } from "./peers.js";
 
@@ -2074,8 +2074,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // 能证明"assistant 已经在产出"的 item —— 见到它们才补开无气泡 turn。
   const BRIEF_TURN_OPENERS = new Set<RenderItem["kind"]>(["text", "tool_use", "tool_result", "skill_output"]);
 
+  // 链接落到 chat 视图: 默认选中本 turn 所属的 #tag, 贴底显示整条会话。turnId 依旧
+  // 是凭据 (不可枚举), 只是页面从"一个 turn"扩成"这个 chat 的全部会话"。
   const briefDetailLink = (turnId: string): string =>
-    `✴️ [View turn details](${buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId)})`;
+    `✴️ [View chat details](${buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId)})`;
 
   // 收口一条 loading 气泡: finish=true 写入最终内容, 只生效一次。发送失败退回 standalone。
   // 排队中的 turn 也持有气泡, 所以气泡是显式入参而不是从 a 上取。

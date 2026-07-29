@@ -635,13 +635,21 @@ const hashStr = (s: string): string => {
 const tagSig = (html: string): string =>
   html ? html.replace(/(data-key="[^"]*")/, `$1 data-sig="${hashStr(html)}"`) : "";
 
-const renderTurnPage = (r: TurnDetailRecord): string => {
+// 一个 turn 的可复用切片: 排序后的 items、渲染好的气泡、完成态与耗时。
+// 单 turn 页 (renderTurnPage) 和 chat 线程页 (renderTurnGroup) 共用同一份产物 ——
+// keyPrefix 让线程页里多个 turn 的 data-key 不互撞。
+const turnParts = (r: TurnDetailRecord, keyPrefix = ""): {
+  items: TurnItem[];
+  bodies: string[];
+  done: boolean;
+  ageMs: number;
+} => {
   const items = [...r.items].sort((a, b) => a.ts - b.ts);
   const paired = pairItems(items);
   // data-key = 稳定项键 (items 只追加、按 ts 单调, 位置永不前移 → 索引稳定唯一)。
   // 客户端 reconcile 按此键复用未变气泡的 DOM 节点, 从而保住用户手动展开/折叠的 <details>。
   const bodies = paired.map((p, i) => {
-    const key = `b${i}`;
+    const key = `${keyPrefix}b${i}`;
     if (p.kind === "pair") return renderToolBubble(p.use, p.result, key);
     const it = p.item;
     if (it.t === "text") return renderTextBubble(it, key);
@@ -658,7 +666,11 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
   });
   // 出现 assistant·final 即视为本轮结束 —— closeTurn 可能滞后, 但 final 就是最后一条。
   const done = r.closed || items.some((it) => it.t === "text" && it.final === true);
-  const ageMs = (done ? r.updatedAt : Date.now()) - r.createdAt;
+  return { items, bodies, done, ageMs: (done ? r.updatedAt : Date.now()) - r.createdAt };
+};
+
+const renderTurnPage = (r: TurnDetailRecord): string => {
+  const { items, bodies, done, ageMs } = turnParts(r);
   const statusBadge = done
     ? `<span class="badge allow">已完成 · ${fmtDuration(ageMs)}</span>`
     : `<span class="badge pending">进行中</span>`;
@@ -794,6 +806,51 @@ ${statsCard}
 <script>${script}</script>
 </body></html>`;
 };
+
+// ── Chat 线程视图用的单 turn 片段 ──────────────────────────────────────
+// 与 renderTurnPage 同源 (turnParts), 但去掉整页外壳与大统计卡: 线程里一个 turn
+// 只留一条分隔头 (时间 / model / 状态 / 本轮 token), 总账走页脚 status bar。
+// 返回 html + sig, 让客户端按 sig 判断"这条 turn 变没变", 不用 diff 整段 DOM。
+export interface TurnFragment {
+  id: string;
+  html: string;
+  sig: string;
+  createdAt: number;
+  updatedAt: number;
+  done: boolean;
+}
+
+export const renderTurnGroup = (r: TurnDetailRecord): TurnFragment => {
+  const { items, bodies, done, ageMs } = turnParts(r, `${r.id}:`);
+  const u = r.usage;
+  const ctxPeak = u ? (u.ctxPeak ?? u.input + u.cacheRead + u.cacheWrite) : 0;
+  const chips = [
+    r.model ? `<span class="chip model">${escHtml(r.model)}${r.modelAlt ? `<span class="alt"> +${r.modelAlt}</span>` : ""}</span>` : "",
+    u?.serviceTier && u.serviceTier !== "standard" ? `<span class="chip tier">${escHtml(u.serviceTier)}</span>` : "",
+    ctxPeak ? `<span class="tg-tok" title="上下文峰值">ctx ${fmtTok(ctxPeak)}</span>` : "",
+    u?.output ? `<span class="tg-tok" title="输出 token">out ${fmtTok(u.output)}</span>` : "",
+    // 耗时只在收口后写死 —— 进行中的 turn 每次渲染都会得到不同的 ageMs, 会把 sig 打乱,
+    // 让 SSE 的"内容没变就不重发"彻底失效。进行中的时长由页脚 status bar 负责。
+    done ? `<span class="tg-tok">${escHtml(fmtDuration(ageMs))}</span>` : "",
+  ].filter(Boolean).join("");
+  const queryBubble = r.userQuery
+    ? `<section class="bubble user" data-key="${r.id}:user">
+        <div class="bubble-head">💬 <span class="role">User</span></div>
+        <div class="q-body">${escHtml(r.userQuery)}</div>
+      </section>`
+    : "";
+  const typing = done ? "" : `<div class="typing" data-key="${r.id}:typing">Claude 正在思考</div>`;
+  const inner = [queryBubble, ...bodies, typing].map(tagSig).join("");
+  const head = `<div class="tg-head">
+    <span class="tg-dot${done ? "" : " live"}"></span>
+    <span class="tg-time">${fmtTs(r.createdAt)}</span>${chips}
+    <a class="tg-link" href="detail?id=${encodeURIComponent(r.id)}" target="_blank" title="${items.length} 项">↗</a>
+  </div>`;
+  const body = `<section class="turn-group" data-key="t:${escHtml(r.id)}">${head}<div class="bubbles">${inner}</div></section>`;
+  return { id: r.id, html: tagSig(body), sig: hashStr(body), createdAt: r.createdAt, updatedAt: r.updatedAt, done };
+};
+
+export { escHtml, fmtTs, fmtDuration, fmtTok, TURN_CSS };
 
 export const renderDetailPage = (r: DetailRecord): string => {
   if (r.kind === "tool") return renderToolPage(r);

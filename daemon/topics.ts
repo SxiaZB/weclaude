@@ -5,7 +5,7 @@ import type { WSClient } from "@wecom/aibot-node-sdk";
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import { patchJsonc } from "../shared/config-writer.js";
-import { withTagHeader } from "./session-label.js";
+import { withTagHeader } from "../shared/session-label.js";
 
 const stripPrefix = (s: string): string => {
   const i = s.indexOf(":");

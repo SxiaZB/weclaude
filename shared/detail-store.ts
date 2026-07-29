@@ -109,6 +109,11 @@ export interface DetailStore {
   closeOpenTurns(scope: { target?: string; sessionId?: string; exceptIds?: readonly string[] }): string[];
   put(rec: DetailRecord): void;
   get(id: string): DetailRecord | undefined;
+  /** Live snapshot of every retained record. Callers filter/derive; never mutate. */
+  list(): DetailRecord[];
+  /** Fires after every put — the single source the SSE feed hangs off, so a
+   *  record reaching the store (locally OR via svr's POST /d) pushes identically. */
+  subscribe(fn: (rec: DetailRecord) => void): () => void;
 }
 
 const TTL_MS = 24 * 3600_000;
@@ -168,16 +173,28 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
     opts.log?.info({ logPath }, "detail store: fresh log");
   }
 
+  // 订阅者异常不该拖垮写入路径 (一个断掉的 SSE 连接 ≠ 丢一条 detail)。
+  const subscribers = new Set<(rec: DetailRecord) => void>();
+  const notify = (rec: DetailRecord): void => {
+    for (const fn of subscribers) { try { fn(rec); } catch { /* ignore */ } }
+  };
+
   const put = (rec: DetailRecord): void => {
     store.set(rec.id, rec);
     if (store.size > MAX) gc();
     persist(rec);
     maybeCompact();
+    notify(rec);
   };
 
   return {
     put,
     get: (id) => store.get(id),
+    list: () => [...store.values()],
+    subscribe: (fn) => {
+      subscribers.add(fn);
+      return () => { subscribers.delete(fn); };
+    },
     recordTool: (rec) => {
       put({ kind: "tool", ...rec, createdAt: rec.createdAt ?? Date.now() });
     },

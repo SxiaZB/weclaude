@@ -24,7 +24,7 @@ import { redact } from "./redact.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
-import { tagBadge, withTagHeader } from "./session-label.js";
+import { tagBadge, withTagHeader } from "../shared/session-label.js";
 
 // ── Routing helpers ────────────────────────────────────────────────────
 const targetChatId = (principal: string): string => {

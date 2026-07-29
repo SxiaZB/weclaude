@@ -3,7 +3,7 @@ import type { WSClient } from "@wecom/aibot-node-sdk";
 import type { Logger } from "pino";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
-import { withTagHeader } from "./session-label.js";
+import { withTagHeader } from "../shared/session-label.js";
 
 // Strip principal prefix (`user:` / `chat:`) AND `#tag` suffix so callers
 // can pass daemon-internal target keys (`user:xxx#foo`) verbatim; the WeCom

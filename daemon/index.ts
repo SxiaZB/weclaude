@@ -11,7 +11,7 @@ import { makeBridge } from "./cc-bridge.js";
 import { startMirror, installMirrorEventListener, type MirrorBridge } from "./mirror-bridge.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { installApprovalEventListener, makeApproveHandler } from "./approval.js";
-import { initDetailPersistence, makeDetailHandler, configureRemoteForward } from "./detail.js";
+import { initDetailPersistence, makeDetailHandler, chatHandlers, configureRemoteForward } from "./detail.js";
 import { initAutoWindowPersistence } from "./session-cache.js";
 import { makeMessageHandler } from "./outbound.js";
 import { makeCardHandler, makeAskHandler, installAskEventListener } from "./ask.js";
@@ -24,7 +24,7 @@ import { makeWedocBridge } from "./wedoc.js";
 import { installResponseTracker } from "./last-response.js";
 import { scanClaudeSessions } from "./session-scan.js";
 import { startScheduler, publish as publishTopic } from "./topics.js";
-import { baseOfKey, keyOf } from "./session-label.js";
+import { baseOfKey, keyOf } from "../shared/session-label.js";
 import {
   startGraph,
   stopRun,
@@ -135,6 +135,7 @@ const main = async (): Promise<void> => {
   http.register("GET /claim/status", makeClaimStatusHandler());
   http.register("POST /claim/reset", makeClaimResetHandler());
   http.register("GET /detail", makeDetailHandler(log.child({ mod: "detail" })));
+  for (const [key, handler] of Object.entries(chatHandlers())) http.register(key, handler);
   installAskEventListener(ws.client, log.child({ mod: "ask" }));
 
   // 智能机器人 doc / smartsheet / contact MCP 桥接 — 总是注册路由, 失败让

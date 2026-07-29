@@ -17,6 +17,7 @@ import pino from "pino";
 import { expandHome } from "../shared/paths.js";
 import { createDetailStore, type DetailRecord } from "../shared/detail-store.js";
 import { renderDetailPage, renderNotFound } from "../shared/detail-render.js";
+import { createChatRoutes, chatRouteTable } from "../shared/chat-http.js";
 import { resolvePublicHost } from "../shared/lan-ip.js";
 import { loadConfig } from "../shared/config.js";
 
@@ -131,6 +132,9 @@ const main = async (): Promise<void> => {
   mkdirSync(stateDir, { recursive: true });
   const token = loadOrCreateToken(args.token, args.tokenFile);
   const store = createDetailStore({ stateDir, log });
+  // Chat 视图 (SPA + JSON API + SSE) 与 daemon 完全同源 —— svr 侧的记录是 POST /d
+  // 推过来的, store.subscribe 一样会触发, 所以远端浏览也是实时的。
+  const chat = chatRouteTable(createChatRoutes(store));
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -139,6 +143,8 @@ const main = async (): Promise<void> => {
         json(res, 200, { ok: true });
         return;
       }
+      const chatHandler = chat[`${req.method ?? "GET"} ${url.pathname}`];
+      if (chatHandler) { chatHandler(req, res, url); return; }
       if (req.method === "GET" && url.pathname === "/detail") {
         const id = url.searchParams.get("id") ?? "";
         if (!id) {

@@ -17,7 +17,7 @@ import { computeUsage, renderUsageReport } from "./usage.js";
 import { computeAuditReport } from "./audit.js";
 import { syncProjectConfig, renderSyncReport } from "./cfg-sync.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
-import { tagOfKey, withTagHeader } from "./session-label.js";
+import { tagOfKey, withTagHeader } from "../shared/session-label.js";
 import {
   parseSubscribe,
   parseUnsubscribe,
