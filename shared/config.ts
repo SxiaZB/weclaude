@@ -15,13 +15,13 @@ const Bot = z.object({
 const Daemon = z.object({
   host: z.string().default("127.0.0.1"),
   port: z.number().int().min(1).max(65535).default(17890),
-  stateDir: z.string().default("~/.weclaude/state"),
-  logFile: z.string().default("~/.weclaude/daemon.log"),
+  stateDir: z.string().default("~/.wezard/state"),
+  logFile: z.string().default("~/.wezard/daemon.log"),
   logLevel: z.enum(["trace", "debug", "info", "warn", "error"]).default("info"),
   // 工具调用 / 授权详情页 URL。空则用 http://<host>:<port> (回环)。
   // 想让手机 WeCom 也能点开, 需要在反向代理后填外网地址。桌面端用回环即可。
   detailPublicBase: z.string().default(""),
-  // 远端 detail svr (weclaude svr 起的独立服务, chat + cli 共同可达的网络里)。
+  // 远端 detail svr (wezard svr 起的独立服务, chat + cli 共同可达的网络里)。
   // 空则不转发, 详情走本机 :port/detail。非空时:
   //   • 每次 record*() 后 fire-and-forget POST 到 <base>/d, 存到远端 store。
   //   • buildDetailUrl 用 <base> 作为链接根 (chat 端浏览器打开 <base>/detail?id=...)。
@@ -62,11 +62,11 @@ const Mirror = z.object({
   toolUseInlineMaxChars: z.number().int().positive().default(120),
   // Where inbound images/files from WeCom get saved before being pasted into
   // the live TTY. Files persist — claude reads them by absolute path.
-  inboxDir: z.string().default("~/.weclaude/inbox"),
+  inboxDir: z.string().default("~/.wezard/inbox"),
   // Persisted mirror attachments (principal → sessionId/jsonl/tmux). Restored
   // on daemon boot + lazily on first inbound after reload — so reloading the
   // daemon doesn't re-spawn a fresh claude for an already-bound chat.
-  attachmentsFile: z.string().default("~/.weclaude/mirror-attachments.json"),
+  attachmentsFile: z.string().default("~/.wezard/mirror-attachments.json"),
   // Standalone fallback 路径(liveStream 已 closed/dead/capped) 上的防抖聚合窗口
   // (ms)。窗口内同一 attachment 的多个 item 合并为一条 markdown, 抑制连续工具
   // 调用刷屏。liveStream 仍活时不受影响——直接走 typewriter。0 = 关闭。
@@ -123,14 +123,14 @@ const Wrc = z.object({
       codebuddy: z.object({ bin: z.string().optional() }).optional(),
     })
     .default({}),
-  cwd: z.string().default("~/.weclaude/workspace"),
-  sessionMapFile: z.string().default("~/.weclaude/sessions.json"),
+  cwd: z.string().default("~/.wezard/workspace"),
+  sessionMapFile: z.string().default("~/.wezard/sessions.json"),
   extraArgs: z.array(z.string()).default([]),
   mirror: Mirror.default({}),
   // Mirror-only: tmux session name prefix for auto-spawn. Final name is
   // `${prefix}-<short>`. Auto-spawn fires when an authorized inbound finds no
   // mirror attached for that chat — allowFrom IS the authorization.
-  tmuxPrefix: z.string().default("weclaude"),
+  tmuxPrefix: z.string().default("wezard"),
 }).transform((v) => {
   // Resolve the active backend once — honors defaultCli if set, otherwise
   // infers from claudeBin basename (legacy back-compat). Pin the inferred
@@ -154,6 +154,19 @@ const Wrc = z.object({
     v.mirror.projectsDir = backend.projectsDir;
   }
   return v;
+});
+
+// 危险操作名单 (daemon/danger.ts)。命中者强制单次审批: 不吃 auto-window、
+// 不吃 session cache、不参与批量合流、卡上没有「全过」按钮、超时不静默放行。
+// patterns 都是 JS 正则源码串, 大小写不敏感; allowPatterns 优先级最高。
+const Danger = z.object({
+  enabled: z.boolean().default(true),
+  // false = 丢掉内置名单, 只用下面三组自定义规则。
+  builtin: z.boolean().default(true),
+  commandPatterns: z.array(z.string()).default([]),
+  toolPatterns: z.array(z.string()).default([]),
+  pathPatterns: z.array(z.string()).default([]),
+  allowPatterns: z.array(z.string()).default([]),
 });
 
 const Approval = z.object({
@@ -193,14 +206,14 @@ const Sync = z.object({
   targets: z.array(SyncTarget).default([]),
 });
 
-// 独立 detail 中转服务 (weclaude svr) 的默认参数。CLI 参数 (--host/--port/…) 仍可覆盖,
+// 独立 detail 中转服务 (wezard svr) 的默认参数。CLI 参数 (--host/--port/…) 仍可覆盖,
 // 空则退回硬编码默认 (0.0.0.0:17891)。放在 top-level 而不是塞进 daemon: svr 是独立进程,
 // 与 daemon 生命周期解耦。
 const Svr = z.object({
   host: z.string().default("0.0.0.0"),
   port: z.number().int().min(1).max(65535).default(17891),
-  stateDir: z.string().default("~/.weclaude/svr"),
-  tokenFile: z.string().default("~/.weclaude/svr-token"),
+  stateDir: z.string().default("~/.wezard/svr"),
+  tokenFile: z.string().default("~/.wezard/svr-token"),
   token: z.string().default(""),
   logLevel: z.enum(["trace", "debug", "info", "warn", "error"]).default("info"),
 });
@@ -236,10 +249,10 @@ export type Config = z.infer<typeof ConfigSchema>;
 
 // ── Loader ──────────────────────────────────────────────────────────
 const DEFAULT_CONFIG_PATHS = [
-  "~/.weclaude/config.jsonc",
-  "~/.weclaude/config.json",
+  "~/.wezard/config.jsonc",
+  "~/.wezard/config.json",
 ];
-const SECRETS_PATH = "~/.weclaude/secrets.json";
+const SECRETS_PATH = "~/.wezard/secrets.json";
 
 const readJsoncIfExists = (p: string): unknown | undefined => {
   const abs = expandHome(p);
@@ -261,10 +274,10 @@ const deepMerge = <T extends Record<string, unknown>>(a: T, b: Partial<T>): T =>
   return out as T;
 };
 
-/** Resolve config path: explicit > $WECLAUDE_CONFIG > defaults. */
+/** Resolve config path: explicit > $WEZARD_CONFIG > defaults. */
 const resolveConfigPath = (explicit?: string): string | undefined => {
   if (explicit) return explicit;
-  if (process.env.WECLAUDE_CONFIG) return process.env.WECLAUDE_CONFIG;
+  if (process.env.WEZARD_CONFIG) return process.env.WEZARD_CONFIG;
   for (const p of DEFAULT_CONFIG_PATHS) {
     if (existsSync(expandHome(p))) return p;
   }
@@ -280,7 +293,7 @@ export const loadConfig = (explicitPath?: string): LoadResult => {
   const sourcePath = resolveConfigPath(explicitPath);
   if (!sourcePath) {
     throw new Error(
-      `weclaude config not found. Create ~/.weclaude/config.jsonc (see config.example.jsonc) or set $WECLAUDE_CONFIG.`,
+      `wezard config not found. Create ~/.wezard/config.jsonc (see config.example.jsonc) or set $WEZARD_CONFIG.`,
     );
   }
   const base = (readJsoncIfExists(sourcePath) ?? {}) as Record<string, unknown>;
@@ -292,7 +305,7 @@ export const loadConfig = (explicitPath?: string): LoadResult => {
     const issues = parsed.error.issues
       .map((i) => `  - ${i.path.join(".") || "<root>"}: ${i.message}`)
       .join("\n");
-    throw new Error(`weclaude config invalid (${sourcePath}):\n${issues}`);
+    throw new Error(`wezard config invalid (${sourcePath}):\n${issues}`);
   }
   return { config: parsed.data, sourcePath: expandHome(sourcePath) };
 };

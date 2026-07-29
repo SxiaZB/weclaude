@@ -756,7 +756,7 @@ const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flu
     return {
       decision: "deny",
       reason:
-        "✅ 用户已在企业微信批准此计划。这不是拒绝——ExitPlanMode 返回 deny 只是 weclaude 的远程批准信号。请视为计划已通过,立即开始执行计划内容,不要再次调用 ExitPlanMode,也不要重新规划。",
+        "✅ 用户已在企业微信批准此计划。这不是拒绝——ExitPlanMode 返回 deny 只是 wezard 的远程批准信号。请视为计划已通过,立即开始执行计划内容,不要再次调用 ExitPlanMode,也不要重新规划。",
     };
   }
   if (raw === `${PLAN_PICKED_PREFIX}revise`) {

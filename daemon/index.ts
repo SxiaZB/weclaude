@@ -41,7 +41,7 @@ import {
 // vanishes. Mirror anything fatal to stderr too so launchd's stderr.log captures it.
 const fatalExit = (msg: string, extra?: Record<string, unknown>): never => {
   // eslint-disable-next-line no-console
-  console.error(`[weclaude-daemon] FATAL: ${msg}`, extra ?? "");
+  console.error(`[wezard-daemon] FATAL: ${msg}`, extra ?? "");
   process.exit(1);
 };
 
@@ -50,7 +50,7 @@ const main = async (): Promise<void> => {
   const log = makeLogger({
     logFile: cfg.daemon.logFile,
     logLevel: cfg.daemon.logLevel,
-    name: "weclaude-daemon",
+    name: "wezard-daemon",
   });
   log.info({ sourcePath, pid: process.pid }, "daemon start");
 
@@ -63,7 +63,7 @@ const main = async (): Promise<void> => {
   log.info({ primary: primary.name, bin: primary.bin, backends: backends.map((b) => b.name) }, "cli backends bound");
 
   // Restore auto-approve windows persisted across daemon restarts —
-  // otherwise a `weclaude reload` silently drops the user's "10min" choice.
+  // otherwise a `wezard reload` silently drops the user's "10min" choice.
   initAutoWindowPersistence(cfg.daemon.stateDir);
   // Replay tool/approval detail records so reload doesn't lose click-to-detail
   // links from messages already on the user's WeCom timeline.
@@ -147,7 +147,7 @@ const main = async (): Promise<void> => {
     const bridge = makeWedocBridge({
       client: ws.client,
       log: wedocLog,
-      pluginVersion: "weclaude-0.1",
+      pluginVersion: "wezard-0.1",
       cacheTtlMs: 30 * 60_000,
       configFetchTimeoutMs: 15_000,
       requestTimeoutMs: 30_000,
@@ -221,7 +221,7 @@ const main = async (): Promise<void> => {
       const r = m.attach({ sessionId: body.sessionId, jsonlPath: body.jsonlPath, target: body.target, tmuxPane: body.tmuxPane, tmuxSession: body.tmuxSession });
       json(res, r.ok ? 200 : 400, r);
     });
-    // Manual auto-spawn trigger — used by `weclaude init` to materialize a
+    // Manual auto-spawn trigger — used by `wezard init` to materialize a
     // tmux+claude pane immediately after claim, instead of waiting for the
     // first inbound. Body: { target?: "user:xxx" | "chat:xxx" }. Falls back
     // to cfg.defaultChat. Same code path as the inbound auto-spawn so any
@@ -311,7 +311,7 @@ const main = async (): Promise<void> => {
         ? { ok: true, sessionId: r.sessionId, target, cwd: r.cwd, cli: r.cli, tmuxSession: r.tmuxSession, tmuxPane: r.tmuxPane }
         : { ok: false, reason: att.reason });
     });
-    // Frame-less inject — used by `weclaude init` to fire a demo prompt right
+    // Frame-less inject — used by `wezard init` to fire a demo prompt right
     // after /mirror/spawn so first-time users see the full PreToolUse → card
     // → mirror loop without needing to type in WeCom.
     http.register("POST /mirror/inject", async (req, res) => {
@@ -538,6 +538,6 @@ const main = async (): Promise<void> => {
 
 main().catch((e) => {
   // eslint-disable-next-line no-console
-  console.error("[weclaude-daemon] fatal:", e);
+  console.error("[wezard-daemon] fatal:", e);
   process.exit(1);
 });

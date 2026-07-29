@@ -1,7 +1,7 @@
 ---
 description: WeCom remote control — mirror current Claude session to WeCom
-allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/cli/weclaude.sh:*)
+allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/cli/wezard.sh:*)
 argument-hint: [user:<userid>|chat:<chatid>]
 ---
 
-!`${CLAUDE_PLUGIN_ROOT}/cli/weclaude.sh mirror $ARGUMENTS`
+!`${CLAUDE_PLUGIN_ROOT}/cli/wezard.sh mirror $ARGUMENTS`

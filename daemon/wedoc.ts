@@ -13,9 +13,9 @@ import type { Logger } from "pino";
 
 const MCP_GET_CONFIG_CMD = "aibot_get_mcp_config";
 const PROTOCOL_VERSION = "2025-03-26";
-const CLIENT_INFO = { name: "weclaude-wedoc", version: "0.1.0" } as const;
+const CLIENT_INFO = { name: "wezard-wedoc", version: "0.1.0" } as const;
 const USERID_HEADER = "x-openclaw-wecom-userid";
-const USER_AGENT = "weclaude-wedoc/0.1";
+const USER_AGENT = "wezard-wedoc/0.1";
 
 interface McpSession {
   url: string;

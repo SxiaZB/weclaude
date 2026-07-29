@@ -200,7 +200,7 @@ const runOne = async (args: RunArgs): Promise<void> => {
         log.error({ code, spawnErr: spawnError?.message, stderrTail: stderrTail.slice(-500) }, "claude failure");
         const fallback = acc
           ? `${acc}\n\n[${reason}]`
-          : `[weclaude] ${reason}\n${stderrTail.slice(-500)}`;
+          : `[wezard] ${reason}\n${stderrTail.slice(-500)}`;
         acc = fallback;
       }
       await sendFlush(true);

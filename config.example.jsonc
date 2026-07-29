@@ -1,5 +1,5 @@
-// Declarative config for weclaude. Copy to ~/.weclaude/config.jsonc and edit.
-// All paths support `~`. Secrets (botId/secret) can also live in ~/.weclaude/secrets.json
+// Declarative config for wezard. Copy to ~/.wezard/config.jsonc and edit.
+// All paths support `~`. Secrets (botId/secret) can also live in ~/.wezard/secrets.json
 // (same shape, deep-merged on top — keep secrets out of dotfile repos).
 {
   "$schema": "./schema.json",
@@ -19,8 +19,8 @@
   "daemon": {
     "host": "127.0.0.1",
     "port": 17890,
-    "stateDir": "~/.weclaude/state",
-    "logFile": "~/.weclaude/daemon.log",
+    "stateDir": "~/.wezard/state",
+    "logFile": "~/.wezard/daemon.log",
     "logLevel": "info"           // trace|debug|info|warn|error
   },
 
@@ -43,7 +43,7 @@
     //   "codebuddy": { "bin": "/usr/local/bin/codebuddy" }
     // },
     "cwd": "~",                  // workdir (mirror: must match the running claude's cwd)
-    "sessionMapFile": "~/.weclaude/sessions.json",
+    "sessionMapFile": "~/.wezard/sessions.json",
     "extraArgs": [],             // appended to `claude -p`
     "mirror": {
       // Pin a session id; empty → auto-pick latest .jsonl mtime under
@@ -73,7 +73,7 @@
   },
 
   // ── claude / codebuddy wrapper sync ───────────────────────────────
-  // `weclaude sync` writes hooks/MCP/permissions into every target settings.json
+  // `wezard sync` writes hooks/MCP/permissions into every target settings.json
   // listed below. Multi-CLI setups (claude + codebuddy 同时装) 列多项即可。
   // kind: "claude" (含 claude-internal 等 fork) | "codebuddy"
   //   • claude-internal 通过 settingsPath: "~/.claude-internal/settings.json" 表达
@@ -90,13 +90,13 @@
     ]
   },
 
-  // ── Standalone detail relay (weclaude svr) ────────────────────────
-  // `weclaude svr` 读这里作为默认参数, CLI --host/--port 仍可覆盖。省略整段等于
+  // ── Standalone detail relay (wezard svr) ────────────────────────
+  // `wezard svr` 读这里作为默认参数, CLI --host/--port 仍可覆盖。省略整段等于
   // 用硬编码兜底 (0.0.0.0:17891)。改到 80 让详情页 URL 用标准端口 (需 root)。
   "svr": {
     "host": "0.0.0.0",
     "port": 17891,
-    "stateDir": "~/.weclaude/svr",
-    "tokenFile": "~/.weclaude/svr-token"
+    "stateDir": "~/.wezard/svr",
+    "tokenFile": "~/.wezard/svr-token"
   }
 }

@@ -6,7 +6,7 @@
 // one CLI is invisible to the other. This module folds them back together.
 //
 // Merge is a real 3-way merge, not a copy: `git merge-file` against a base
-// snapshot of the last synced content (`~/.weclaude/cfgsync/<project>/base/`).
+// snapshot of the last synced content (`~/.wezard/cfgsync/<project>/base/`).
 // Both sides' independent edits survive; only genuinely overlapping edits
 // conflict, and those files are reported and left untouched.
 //
@@ -29,7 +29,7 @@ import { activeBackends, type CliBackend, type CliBackendName } from "../shared/
 
 // Subdirectories synced under each backend's project config dir. settings.json
 // is excluded on purpose: hook paths, plugin roots and MCP entries are per-CLI,
-// and weclaude's own `cli/sync.ts` owns the hook block inside them.
+// and wezard's own `cli/sync.ts` owns the hook block inside them.
 const SUBDIRS = ["skills", "commands", "agents"] as const;
 
 // Logical key for the per-CLI memory file. `CLAUDE.md` and `CODEBUDDY.md` are
@@ -39,7 +39,7 @@ const MEMORY_KEY = "MEMORY.md";
 
 const MAX_BYTES = 512 * 1024;
 
-const CFGSYNC_ROOT = "~/.weclaude/cfgsync";
+const CFGSYNC_ROOT = "~/.wezard/cfgsync";
 
 interface ProjectRoot {
   name: CliBackendName;
@@ -299,7 +299,7 @@ const ICON: Record<ItemStatus, string> = {
 
 export const renderSyncReport = (r: SyncReport): string => {
   if (r.roots.length < 2) {
-    return `[weclaude] /cfgsync: 本项目只发现 ${r.roots.length} 个 CLI 配置树 (${r.roots.join(", ") || "无"}),无需同步。`;
+    return `[wezard] /cfgsync: 本项目只发现 ${r.roots.length} 个 CLI 配置树 (${r.roots.join(", ") || "无"}),无需同步。`;
   }
   const changed = r.items.filter((i) => i.status !== "same" && i.status !== "skip");
   const head = `📐 项目配置同步 \`${r.cwd}\`\nCLI: ${r.roots.join(" ⇄ ")}`;

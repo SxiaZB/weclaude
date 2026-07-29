@@ -458,8 +458,10 @@ type RenderItem =
   | { kind: "goal_start"; condition: string }
   // Skill stdout (e.g. /model). Always emitted as a standalone bubble — bypasses
   // deferred-state filtering so the user sees /model output even when no
-  // assistant turn is active.
-  | { kind: "skill_output"; body: string }
+  // assistant turn is active. `quiet` 例外: subagent/后台任务完成通知 —— 主 agent
+  // 随后自己会把结论说进本轮答复里, 单独再推一条只是重复噪声。只记进 turn/detail,
+  // 不发气泡。
+  | { kind: "skill_output"; body: string; quiet?: boolean }
   | {
       kind: "tool_use";
       body: string;
@@ -592,10 +594,10 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
       }
 
       // Background task completion — strip the raw tag soup and render
-      // a single styled line.
+      // a single styled line. quiet: 这是 subagent 的回执, 不单独推给聊天。
       const taskMatch = c.match(TASK_NOTIF_RE);
       if (taskMatch && taskMatch[1]) {
-        out.push({ kind: "skill_output", body: renderTaskNotification(taskMatch[1]) });
+        out.push({ kind: "skill_output", body: renderTaskNotification(taskMatch[1]), quiet: true });
         return out;
       }
 
@@ -1400,7 +1402,7 @@ export interface AttachArgs {
   target?: string; // optional override; falls back to cfg.wrc.mirror.pushChat || cfg.defaultChat
   /** tmux pane (e.g. `%5`); usually auto-discovered from caller's $TMUX_PANE. Empty → spawn-mode inject. */
   tmuxPane?: string;
-  /** tmux session name (e.g. `weclaude-xxx`). Persisted so a reload can re-derive a fresh paneId for the same session. */
+  /** tmux session name (e.g. `wezard-xxx`). Persisted so a reload can re-derive a fresh paneId for the same session. */
   tmuxSession?: string;
   /** Cwd the live pane is running in. Persisted so /pwd can show truth and
    *  /clear can detect mismatch. Empty → cfg.wrc.cwd. */
@@ -1457,7 +1459,7 @@ export interface MirrorBridge {
     expect?: { toolName: string; toolInput: unknown },
   ) => Promise<void>;
   /** Inject text into an attached mirror without an originating WeCom frame.
-   *  Used by `weclaude init` to fire a demo prompt right after auto-spawn so
+   *  Used by `wezard init` to fire a demo prompt right after auto-spawn so
    *  the user sees the full PreToolUse → approval card → assistant mirror
    *  loop end-to-end. Skips the live-stream/replyStream machinery — the tail
    *  pushes assistant output via the standalone path. */
@@ -2047,7 +2049,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // Skill outputs (e.g. /model) bypass deferred filtering — emit directly
     // as a standalone bubble so the user sees the result immediately.
     if (item.kind === "skill_output") {
-      enqueueStandalone(a, item.body);
+      if (!item.quiet) enqueueStandalone(a, item.body);
       return;
     }
     const wasEmpty = out.buf.length === 0;
@@ -2256,8 +2258,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
     if (item.kind === "skill_output") {
       recordTurnItem(turnId, { t: "text", body: item.body, ts: now });
+      // quiet (subagent 回执): 只留在 turn/detail 页, 不占一条聊天消息。
+      if (item.quiet) return;
       // slash 命令 (/context…) 的 skill_output 即本轮答案 (无 final text 收口) —— 写进
-      // loading 气泡。非 slash 场景的 skill_output (task 通知等) 是中间反馈, 照旧 standalone。
+      // loading 气泡。非 slash 场景的 skill_output 是中间反馈, 照旧 standalone。
       if (a.briefIsSlash && !a.briefHadTool && a.briefBubble && !a.briefBubble.done) {
         void finishBriefBubble(a, item.body);
       } else {
@@ -2295,7 +2299,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // chat with hundreds of tool bubbles. turn_end = the goal auto-cleared and the
   // model finally stopped → leave goal mode; normal brief resumes next turn.
   const handleGoalItem = (a: AttachState, item: RenderItem): void => {
-    if (item.kind === "text" || item.kind === "skill_output") { enqueueStandalone(a, item.body); return; }
+    if (item.kind === "text" || item.kind === "skill_output") {
+      if (item.kind !== "skill_output" || !item.quiet) enqueueStandalone(a, item.body);
+      return;
+    }
     if (item.kind === "turn_end") {
       a.goalActive = false;
       log.info({ sessionId: a.sessionId, target: a.target }, "goal: cleared (turn ended)");
@@ -2400,7 +2407,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // Skill outputs (e.g. /model) always emit as standalone — never append to
     // an active stream so the result is independently visible.
     if (item.kind === "skill_output") {
-      enqueueStandalone(a, item.body);
+      if (!item.quiet) enqueueStandalone(a, item.body);
       return;
     }
     // Assistant turn truly ended (stop_reason terminal). Finalize the live
@@ -2612,7 +2619,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // Prefer the stored pane id and validate via display-message. Pane ids
     // (`%N`) are monotonic per tmux server lifetime, so they're stable across
     // daemon reloads as long as the tmux server didn't restart. With the
-    // shared `weclaude` session hosting many chats, listing panes by session
+    // shared `wezard` session hosting many chats, listing panes by session
     // name would mis-route to whichever window happens to be first — never
     // do that. If the stored pane is dead, leave tmuxPane empty and let
     // dispatch's respawn check reincarnate via `claude --resume <sid>`.
@@ -3520,7 +3527,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       if (!(await tmuxPaneAlive(pane))) return { ok: false, reason: "tmux pane no longer alive — the session needs /new or a respawn" };
       // Only clients already attached to the pane's OWN session are candidates:
       // switching a client that sits on an unrelated session would yank the
-      // user's other terminal window into weclaude. Most-recently-active wins —
+      // user's other terminal window into wezard. Most-recently-active wins —
       // switch-client with no -c is ambiguous under multiple clients.
       const s = await tmuxRun(["display-message", "-p", "-t", pane, "#{session_name}"]);
       const sess = s.stdout.trim() || cfg.wrc.tmuxPrefix;
@@ -3565,7 +3572,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           await client.replyStream(
             frame,
             streamId,
-            withSessionTag(principal, "[weclaude] wecom remote control not attached — run `/wrc` inside the target Claude session"),
+            withSessionTag(principal, "[wezard] wecom remote control not attached — run `/wrc` inside the target Claude session"),
             true,
           );
         } catch {
@@ -3733,7 +3740,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // Inject "succeeded" but the input box never cleared — the target
         // session may be busy / not consuming input (long task, full context).
         // Hint the user once so a silently-dropped message isn't mistaken for a
-        // weclaude bug. Skip on the /clear path (armMigration), which has its
+        // wezard bug. Skip on the /clear path (armMigration), which has its
         // own "cleared" feedback below.
         //
         // OFF by default: the clear-check has a structural false-positive (the
@@ -3742,8 +3749,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // case this fires on essentially every message even though it landed
         // fine — pure noise. A genuinely dropped message still surfaces as the
         // `[mirror] ✗` hard failure above. Opt back in with
-        // WECLAUDE_WARN_UNCERTAIN_INJECT=1 if you want the (noisy) heads-up.
-        if (r.uncertain && !armMigration && process.env.WECLAUDE_WARN_UNCERTAIN_INJECT === "1") {
+        // WEZARD_WARN_UNCERTAIN_INJECT=1 if you want the (noisy) heads-up.
+        if (r.uncertain && !armMigration && process.env.WEZARD_WARN_UNCERTAIN_INJECT === "1") {
           sendStandalone(a, `[mirror] ⚠️ 消息已发送,但目标会话似乎正忙或未响应(输入框未清空),可能未被处理。可稍后重试,或用 \`/sessions\` 切到其它会话。`);
         }
         // Follow a user-initiated same-dir fork (/clear or manual restart in the

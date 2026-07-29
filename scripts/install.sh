@@ -5,7 +5,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 NODE="$(command -v node)"
 HOME_DIR="$HOME"
-LABEL="com.weclaude.daemon"
+LABEL="com.wezard.daemon"
 
 [[ -x "$NODE" ]] || { echo "node not found in PATH"; exit 1; }
 
@@ -15,7 +15,7 @@ if [[ ! -f "$REPO/dist/daemon/index.js" ]]; then
   (cd "$REPO" && npm install --silent && npx tsc -p tsconfig.json)
 fi
 
-mkdir -p "$HOME_DIR/.weclaude"
+mkdir -p "$HOME_DIR/.wezard"
 
 OS="$(uname -s)"
 case "$OS" in
@@ -56,18 +56,18 @@ case "$OS" in
   Linux)
     UNIT_DIR="$HOME_DIR/.config/systemd/user"
     mkdir -p "$UNIT_DIR"
-    UNIT_DST="$UNIT_DIR/weclaude.service"
+    UNIT_DST="$UNIT_DIR/wezard.service"
     sed \
       -e "s|__NODE__|$NODE|g" \
       -e "s|__REPO__|$REPO|g" \
       -e "s|__HOME__|$HOME_DIR|g" \
-      "$REPO/systemd/weclaude.service.template" > "$UNIT_DST"
+      "$REPO/systemd/wezard.service.template" > "$UNIT_DST"
     systemctl --user daemon-reload
-    systemctl --user enable --now weclaude.service
+    systemctl --user enable --now wezard.service
     echo "[install] systemd unit enabled: $UNIT_DST"
     ;;
   *)
     echo "unsupported OS: $OS"; exit 1 ;;
 esac
 
-echo "[install] done. Logs at $HOME_DIR/.weclaude/daemon.{stdout,stderr,log}"
+echo "[install] done. Logs at $HOME_DIR/.wezard/daemon.{stdout,stderr,log}"

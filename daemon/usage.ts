@@ -71,7 +71,7 @@ const BLOCK_MS = 5 * HOUR_MS;
 const DAY_MS = 24 * HOUR_MS;
 
 // Rough per-model pricing (USD per 1M tokens). Kept intentionally small — only
-// covers the models likely to show up on weclaude users' machines. Unknown
+// covers the models likely to show up on wezard users' machines. Unknown
 // models fall back to 0 (token counts still shown, just no cost line).
 // Prices derived from ccusage's LiteLLM pricing at time of writing (Opus 4.7,
 // Sonnet 4.6, Haiku 4.5). Drift over time is expected — accuracy here matters
@@ -363,7 +363,7 @@ const fmtLocalDate = (ts: number): string => {
 };
 
 export const renderUsageReport = (r: UsageReport): string => {
-  const out: string[] = ["[weclaude] 📊 Usage 概览"];
+  const out: string[] = ["[wezard] 📊 Usage 概览"];
 
   if (r.active) {
     const b = r.active;

@@ -1,7 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "mcp__plugin_weclaude_wecom__send_card",
+      "mcp__plugin_wezard_wecom__send_card",
       "Bash(command -v jq)",
       "Bash(curl -sS -H 'Content-Type: application/json' -d '{\"session_id\":\"test\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"echo hi\"},\"cwd\":\"/tmp\",\"transcript_tail\":\"\"}' http://127.0.0.1:17890/approve --max-time 10)",
       "Bash(curl -sS http://127.0.0.1:17890/status)",

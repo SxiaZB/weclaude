@@ -1,4 +1,4 @@
-// Slash-command entry: `weclaude audit [tag]`.
+// Slash-command entry: `wezard audit [tag]`.
 //   - With a tag: ask the daemon for the newest-by-mtime mirror whose target
 //     carries `#<tag>` and audit THAT session (regardless of which CLI/pane
 //     the command was fired from). Fails hard when the daemon is down or no
@@ -14,7 +14,7 @@ import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import { computeAuditReport } from "../daemon/audit.js";
 
-const DAEMON_BASE = process.env.WECLAUDE_DAEMON_BASE || "http://127.0.0.1:17890";
+const DAEMON_BASE = process.env.WEZARD_DAEMON_BASE || "http://127.0.0.1:17890";
 
 const PROJECT_BASES = [
   join(homedir(), ".claude-internal", "projects"),

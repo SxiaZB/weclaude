@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// `weclaude init` — interactive onboarding for new users.
+// `wezard init` — interactive onboarding for new users.
 // Flow:
 //   1. Prompt creds + agent kind + hook toggle.
-//   2. Write ~/.weclaude/config.jsonc + secrets.json (split secrets).
-//   3. Build (if needed), run `weclaude sync` against chosen agent settings.json,
+//   2. Write ~/.wezard/config.jsonc + secrets.json (split secrets).
+//   3. Build (if needed), run `wezard sync` against chosen agent settings.json,
 //      install resident daemon.
 //   4. Arm bootstrap claim. Wait for the user to send a magic phrase in IM.
 //      That message bypasses allowFrom, sets defaultChat, and adds the sender.
@@ -20,8 +20,8 @@ import { expandHome } from "../shared/paths.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO = pathResolve(here, "..", "..");
 
-const CONFIG = "~/.weclaude/config.jsonc";
-const SECRETS = "~/.weclaude/secrets.json";
+const CONFIG = "~/.wezard/config.jsonc";
+const SECRETS = "~/.wezard/secrets.json";
 const CLAIM_PHRASE = "将本对话设置为默认会话";
 
 // ── Pretty output (no ink — keep deps light) ─────────────────────────
@@ -119,7 +119,7 @@ const installDaemon = (): void => {
 };
 
 // Register the local repo as a Claude Code marketplace and install the
-// `weclaude` plugin from it. This is what wires up `hooks/hooks.json` (so
+// `wezard` plugin from it. This is what wires up `hooks/hooks.json` (so
 // `${CLAUDE_PLUGIN_ROOT}` resolves) + `commands/wrc.md` + the MCP server
 // declared in `.claude-plugin/plugin.json`. Idempotent: marketplace add
 // re-uses the existing entry, install upgrades in place.
@@ -144,12 +144,12 @@ const installPlugin = (claudeBin: string): void => {
       `  手动: ${claudeBin} plugin marketplace add ${REPO}`,
     );
   }
-  const i = spawnSync(claudeBin, ["plugin", "install", "weclaude@weclaude-local", "--scope", "user"], { stdio: "inherit" });
+  const i = spawnSync(claudeBin, ["plugin", "install", "wezard@wezard-local", "--scope", "user"], { stdio: "inherit" });
   if (i.status !== 0) {
     throw new Error(
       `plugin install 失败 (${describeSpawn(i)}) — hook 无法注册。\n` +
       `  常见原因: ${claudeBin} 版本过旧,不支持当前插件源类型 — 请先升级 ${claudeBin} 后重试 init。\n` +
-      `  手动: ${claudeBin} plugin install weclaude@weclaude-local --scope user`,
+      `  手动: ${claudeBin} plugin install wezard@wezard-local --scope user`,
     );
   }
 };
@@ -170,7 +170,7 @@ const waitDaemonReady = async (timeoutMs: number): Promise<void> => {
 
 // ── Main flow ────────────────────────────────────────────────────────
 const main = async (): Promise<void> => {
-  log(c.bold("\nweclaude · 新用户引导\n"));
+  log(c.bold("\nwezard · 新用户引导\n"));
   log(c.dim("  目标：3 步内完成 → IM 授权转发 + 远程 CC 控制可用。\n"));
 
   if (existsSync(expandHome(CONFIG))) {
@@ -252,7 +252,7 @@ const main = async (): Promise<void> => {
     { path: ["wrc", "mode"], value: wrcMode },
     { path: ["wrc", "claudeBin"], value: claudeBin },
     { path: ["wrc", "defaultCli"], value: backendNameFor(primary) },
-    { path: ["wrc", "cwd"], value: "~/.weclaude/workspace" },
+    { path: ["wrc", "cwd"], value: "~/.wezard/workspace" },
     { path: ["wrc", "allowFrom"], value: [] },
     { path: ["approval", "enabled"], value: enableHook },
     { path: ["approval", "matcher"], value: ".*" },
@@ -299,7 +299,7 @@ const main = async (): Promise<void> => {
   // ── Step 3: spin up mirror pane ────────────────────────────────
   step(3, "拉起 mirror 会话");
   if (!enableHook || wrcMode !== "mirror") {
-    log(c.green("\n✅ 引导完成。后续可用 `weclaude status` / `weclaude logs -f` 观察。"));
+    log(c.green("\n✅ 引导完成。后续可用 `wezard status` / `wezard logs -f` 观察。"));
     return;
   }
   // Mirror 路径:拉起 tmux+claude pane,然后让用户在 WeCom 发首条消息。
@@ -311,14 +311,14 @@ const main = async (): Promise<void> => {
   };
   if (!r.ok) {
     log(c.red(`  ✗ /mirror/spawn 失败: ${r.reason ?? "unknown"}`));
-    log(c.yellow("  可手动: tmux new-session -s weclaude 后跑 claude;或在 WeCom 发任意消息触发 auto-spawn。"));
+    log(c.yellow("  可手动: tmux new-session -s wezard 后跑 claude;或在 WeCom 发任意消息触发 auto-spawn。"));
     return;
   }
   log(c.green(`  ✓ tmux session=${c.bold(r.tmuxSession ?? "")} pane=${r.tmuxPane ?? ""} sid=${r.sessionId ?? ""}`));
-  log(c.dim(`  附加: tmux attach -t ${r.tmuxSession ?? "weclaude"}`));
+  log(c.dim(`  附加: tmux attach -t ${r.tmuxSession ?? "wezard"}`));
   log(`\n  ${c.bold("→ 现在去 WeCom 给机器人发一条消息(比如 \"hi\"):")}`);
   log(c.dim("    inbound → openStream → 注入 tmux pane → 输出回流为打字机气泡"));
-  log(c.green("\n✅ 引导完成。后续可用 `weclaude status` / `weclaude logs -f` 观察。"));
+  log(c.green("\n✅ 引导完成。后续可用 `wezard status` / `wezard logs -f` 观察。"));
 };
 
 const pollClaim = async (timeoutMs: number): Promise<string | undefined> => {
@@ -337,7 +337,7 @@ const pollClaim = async (timeoutMs: number): Promise<string | undefined> => {
 
 main().catch((e) => {
   // eslint-disable-next-line no-console
-  console.error(c.red(`\n[weclaude-init] ${(e as Error).message}`));
+  console.error(c.red(`\n[wezard-init] ${(e as Error).message}`));
   process.exit(1);
 });
 

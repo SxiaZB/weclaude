@@ -5,7 +5,7 @@
 // no human-in-the-loop `/wrc` needed.
 //
 // Layout: ONE shared tmux session named `cfg.wrc.tmuxPrefix` (default
-// `weclaude`); each chat gets its own window inside it. The pane id (`%N`)
+// `wezard`); each chat gets its own window inside it. The pane id (`%N`)
 // uniquely identifies a chat's claude process — pane ids are monotonic per
 // tmux server lifetime, so they're safe to persist and re-validate via
 // `display-message -t %N`. Window names are cosmetic (sanitized principal id;
@@ -13,7 +13,7 @@
 //
 // Pipeline:
 //   uuid = randomUUID                                       (deterministic session)
-//   tmux has-session -t weclaude  → create or reuse
+//   tmux has-session -t wezard  → create or reuse
 //   tmux new-window/new-session -P -F '#{pane_id}' …        (→ paneId)
 //   tmux send-keys -t %paneId "claudeBin --session-id <uuid> …" Enter
 //
@@ -214,7 +214,7 @@ export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, c
   if (!probe.ok) return { ok: false, reason: `tmux not available: ${probe.stderr.trim() || probe.code}` };
 
   // Ensure cwd / projectDir exist (tmux `new-session -c` fails if cwd missing;
-  // default `~/.weclaude/workspace` often hasn't been touched yet). Do NOT
+  // default `~/.wezard/workspace` often hasn't been touched yet). Do NOT
   // pre-create the jsonl: `claude --session-id <uuid>` refuses to start when
   // the transcript file already exists ("session id is already in use"). We
   // poll for it after spawn instead.
@@ -245,8 +245,8 @@ export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, c
   const has = await runTmux(["has-session", "-t", tmuxName]);
   const created = has.code === 0
     // `${tmuxName}:` (trailing colon) forces session-only resolution → next free
-    // window index. Bare `-t weclaude` is ambiguous: if a *window* is also named
-    // `weclaude`, tmux matches it and tries to reuse its index → "index N in use".
+    // window index. Bare `-t wezard` is ambiguous: if a *window* is also named
+    // `wezard`, tmux matches it and tries to reuse its index → "index N in use".
     ? await runTmux(["new-window", "-d", "-t", `${tmuxName}:`, "-n", winName, "-c", cwd, ...paneEnv, "-P", "-F", "#{pane_id}"])
     : await runTmux(["new-session", "-d", "-s", tmuxName, "-n", winName, "-c", cwd, ...paneEnv, "-P", "-F", "#{pane_id}"]);
   if (!created.ok) {

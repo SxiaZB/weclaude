@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// weclaude svr — 独立的 detail 中转服务。部署到 chat + cli 都可达的网络机器上,
+// wezard svr — 独立的 detail 中转服务。部署到 chat + cli 都可达的网络机器上,
 // cli/daemon 端把 tool/approval 详情 POST 过来, chat 用户点卡片链接直连本机浏览。
 //
 // 只有两条业务路由:
@@ -36,8 +36,8 @@ const buildDefaults = (): Args => {
   const fallback: Args = {
     host: "0.0.0.0",
     port: 17891,
-    stateDir: "~/.weclaude/svr",
-    tokenFile: "~/.weclaude/svr-token",
+    stateDir: "~/.wezard/svr",
+    tokenFile: "~/.wezard/svr-token",
     logLevel: "info",
   };
   try {
@@ -78,15 +78,15 @@ const parseArgs = (argv: readonly string[]): Args => {
 
 const printHelp = (): void => {
   // eslint-disable-next-line no-console
-  console.log(`weclaude svr — standalone detail relay
+  console.log(`wezard svr — standalone detail relay
 
-Defaults come from ~/.weclaude/config.jsonc (svr.*) when present; CLI overrides.
+Defaults come from ~/.wezard/config.jsonc (svr.*) when present; CLI overrides.
 
   --host <ip>        bind address (default 0.0.0.0)
   --port <n>         listen port  (default 17891)
-  --state <dir>      state dir    (default ~/.weclaude/svr)
+  --state <dir>      state dir    (default ~/.wezard/svr)
   --token <t>        bearer token (default: generate + persist to --token-file)
-  --token-file <p>   token persist path (default ~/.weclaude/svr-token)
+  --token-file <p>   token persist path (default ~/.wezard/svr-token)
   --log-level <lvl>  pino level   (default info)
 `);
 };
@@ -127,7 +127,7 @@ const isDetailRecord = (v: unknown): v is DetailRecord => {
 
 const main = async (): Promise<void> => {
   const args = parseArgs(process.argv.slice(2));
-  const log = pino({ level: args.logLevel, name: "weclaude-svr" });
+  const log = pino({ level: args.logLevel, name: "wezard-svr" });
   const stateDir = expandHome(args.stateDir);
   mkdirSync(stateDir, { recursive: true });
   const token = loadOrCreateToken(args.token, args.tokenFile);
@@ -197,13 +197,13 @@ const main = async (): Promise<void> => {
     const displayHost = resolvePublicHost(args.host);
     const base = `http://${displayHost}:${args.port}`;
     // eslint-disable-next-line no-console
-    console.log(`[weclaude-svr] listening on ${args.host}:${args.port}`);
+    console.log(`[wezard-svr] listening on ${args.host}:${args.port}`);
     // eslint-disable-next-line no-console
-    console.log(`[weclaude-svr] base URL: ${base}`);
+    console.log(`[wezard-svr] base URL: ${base}`);
     // eslint-disable-next-line no-console
-    console.log(`[weclaude-svr] token:    ${token}`);
+    console.log(`[wezard-svr] token:    ${token}`);
     // eslint-disable-next-line no-console
-    console.log(`\nAdd to ~/.weclaude/config.jsonc on every daemon host:
+    console.log(`\nAdd to ~/.wezard/config.jsonc on every daemon host:
   "daemon": {
     "detailRemoteBase":  "${base}",
     "detailRemoteToken": "${token}"
@@ -222,6 +222,6 @@ const main = async (): Promise<void> => {
 
 main().catch((e) => {
   // eslint-disable-next-line no-console
-  console.error("[weclaude-svr] fatal:", e);
+  console.error("[wezard-svr] fatal:", e);
   process.exit(1);
 });

@@ -164,7 +164,7 @@ const headingFor = (label: string): string => {
 };
 
 export const renderQuotaReport = (r: QuotaReport): string => {
-  const out: string[] = ["[weclaude] 📊 真实额度 · Claude Code /usage"];
+  const out: string[] = ["[wezard] 📊 真实额度 · Claude Code /usage"];
 
   for (const l of r.limits) {
     out.push("", headingFor(l.label), `  ${bar20(l.pct)} **${l.pct}%**`);

@@ -1,5 +1,5 @@
 // Bootstrap claim mode. Lets the very first IM message ("magic phrase" sent by
-// the user during `weclaude init`) bypass `allowFrom`, set defaultChat, and add the
+// the user during `wezard init`) bypass `allowFrom`, set defaultChat, and add the
 // sender to allowFrom. After consume, claim is cleared — normal allowFrom
 // gating resumes. Single-shot; no concurrency story needed.
 import type { WSClient } from "@wecom/aibot-node-sdk";
@@ -96,7 +96,7 @@ export const ackClaim = async (
       markdown: {
         content:
           "✅ **已设为默认会话**\n\n" +
-          "你已被加入 `allowFrom`。接下来 `weclaude init` 会触发一个真实授权演示——留意按钮卡片。",
+          "你已被加入 `allowFrom`。接下来 `wezard init` 会触发一个真实授权演示——留意按钮卡片。",
       },
     });
   } catch (e) {
@@ -122,7 +122,7 @@ export const ackAutoClaim = async (
         content:
           "🛡️ **已自动设为超级管理员**\n\n" +
           `首位单聊用户 \`${principal}\` 被写入 \`defaultChat\` 与 \`wrc.allowFrom\`，` +
-          "后续无需再手动授权。如要再添加成员，请编辑 `~/.weclaude/config.jsonc`。",
+          "后续无需再手动授权。如要再添加成员，请编辑 `~/.wezard/config.jsonc`。",
       },
     });
   } catch (e) {

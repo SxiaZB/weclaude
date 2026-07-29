@@ -1,4 +1,4 @@
-// MCP server `weclaude`. Stdio transport. Single tool `wrc` = "wecom remote
+// MCP server `wezard`. Stdio transport. Single tool `wrc` = "wecom remote
 // control": attaches the *current* Claude session for WeCom mirror — session
 // resolved via CLAUDE_CODE_SESSION_ID env (Claude Code populates this for
 // every child process), so multiple windows can each /wrc without trampling.
@@ -10,7 +10,7 @@ import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
 
-const DAEMON_BASE = process.env.WECLAUDE_DAEMON_BASE ?? "http://127.0.0.1:17890";
+const DAEMON_BASE = process.env.WEZARD_DAEMON_BASE ?? "http://127.0.0.1:17890";
 
 const ok = (data: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(data) }],
@@ -97,7 +97,7 @@ const detectTmuxSession = (): Promise<string | undefined> =>
   });
 
 const server = new McpServer(
-  { name: "weclaude", version: "0.0.1" },
+  { name: "wezard", version: "0.0.1" },
   { capabilities: { tools: {} } },
 );
 
@@ -299,7 +299,7 @@ server.registerTool(
   {
     title: "Switch WeCom mirror to another Claude session",
     description:
-      "Re-point the WeCom mirror at a different already-running Claude session, so the user's IM chat starts mirroring (and injecting into) that session instead. Call this when the user picks a session to switch to — e.g. '切到 weclaude 那个', '镜像第2个', '换到 🦊 那个会话'. First call list_claude_sessions to resolve the user's natural-language reference (emoji / directory / topic) to a concrete sessionId, then pass that sessionId here.",
+      "Re-point the WeCom mirror at a different already-running Claude session, so the user's IM chat starts mirroring (and injecting into) that session instead. Call this when the user picks a session to switch to — e.g. '切到 wezard 那个', '镜像第2个', '换到 🦊 那个会话'. First call list_claude_sessions to resolve the user's natural-language reference (emoji / directory / topic) to a concrete sessionId, then pass that sessionId here.",
     inputSchema: {
       sessionId: z.string().describe("The target session's sessionId (a UUID), as returned by list_claude_sessions."),
     },

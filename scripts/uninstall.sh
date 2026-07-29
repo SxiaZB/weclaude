@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -uo pipefail
-LABEL="com.weclaude.daemon"
+LABEL="com.wezard.daemon"
 HOME_DIR="$HOME"
 OS="$(uname -s)"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Best-effort: drop the Claude Code plugin + marketplace registration installed
-# by `weclaude init`. Tries both `claude` and `claude-internal` since either
+# by `wezard init`. Tries both `claude` and `claude-internal` since either
 # could have been used at install time. All failures are non-fatal — uninstall
 # must keep going even if claude binaries are gone.
 for bin in claude claude-internal; do
   command -v "$bin" >/dev/null 2>&1 || continue
-  "$bin" plugin uninstall weclaude@weclaude-local 2>/dev/null && \
+  "$bin" plugin uninstall wezard@wezard-local 2>/dev/null && \
     echo "[uninstall] $bin: plugin uninstalled" || true
   "$bin" plugin marketplace remove "$REPO" 2>/dev/null && \
     echo "[uninstall] $bin: marketplace removed" || true
@@ -31,9 +31,9 @@ case "$OS" in
     pkill -f "dist/daemon/index.js" 2>/dev/null || true
     ;;
   Linux)
-    UNIT="$HOME_DIR/.config/systemd/user/weclaude.service"
+    UNIT="$HOME_DIR/.config/systemd/user/wezard.service"
     if [[ -f "$UNIT" ]]; then
-      systemctl --user disable --now weclaude.service 2>/dev/null || true
+      systemctl --user disable --now wezard.service 2>/dev/null || true
       rm -f "$UNIT"
       systemctl --user daemon-reload
       echo "[uninstall] removed $UNIT"

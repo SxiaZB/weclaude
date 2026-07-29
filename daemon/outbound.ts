@@ -1,4 +1,4 @@
-// Outbound message handler for /message endpoint (used by `weclaude send` & MCP).
+// Outbound message handler for /message endpoint (used by `wezard send` & MCP).
 import type { WSClient } from "@wecom/aibot-node-sdk";
 import type { Logger } from "pino";
 import type { Handler } from "./http.js";

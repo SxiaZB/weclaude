@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# weclaude CLI — talks to local weclaude daemon over HTTP and toggles launchd/systemd.
+# wezard CLI — talks to local wezard daemon over HTTP and toggles launchd/systemd.
 set -uo pipefail
 
-DAEMON_BASE="${WECLAUDE_DAEMON_BASE:-http://127.0.0.1:17890}"
-LABEL="com.weclaude.daemon"
+DAEMON_BASE="${WEZARD_DAEMON_BASE:-http://127.0.0.1:17890}"
+LABEL="com.wezard.daemon"
 HOME_DIR="$HOME"
 OS="$(uname -s)"
 
 # Resolve symlinks so REPO_ROOT points at the real package dir even when this
-# script is invoked via the npm-installed bin symlink (e.g. ~/.npm-global/bin/weclaude).
+# script is invoked via the npm-installed bin symlink (e.g. ~/.npm-global/bin/wezard).
 # macOS ships BSD readlink without -f, so chase the chain by hand.
 self="${BASH_SOURCE[0]}"
 while [[ -L "$self" ]]; do
@@ -24,8 +24,10 @@ shift || true
 
 usage() {
   cat <<'EOF'
-weclaude <subcommand>
+wezard <subcommand>
   init                 interactive onboarding (write config, install daemon, claim default chat, run demo)
+  migrate              upgrade an existing weclaude install (state + daemon + plugin + settings.json)
+                       flags: --dry-run --force --purge -y
   status               daemon health + connection state
   start                load resident daemon (launchd/systemd)
   stop                 unload resident daemon
@@ -42,8 +44,8 @@ weclaude <subcommand>
   unsync                 remove our entries from sync.targets settings.json
   audit [tag]            token/cost breakdown for current Claude session (main + subagents)
   uninstall              full teardown: stop daemon + unsync + plugin uninstall + remove daemon (run before `npm uninstall -g`)
-                         add `--purge` to also delete ~/.weclaude state
-  version                print weclaude version
+                         add `--purge` to also delete ~/.wezard state
+  version                print wezard version
   help
 EOF
 }
@@ -51,37 +53,40 @@ EOF
 http_get() { curl -sS --max-time 5 "$DAEMON_BASE$1"; }
 http_post() { curl -sS --max-time 5 -X POST -H 'content-type: application/json' -d "${2:-{\}}" "$DAEMON_BASE$1"; }
 
+# Run a dist/ entry script, building first when we're sitting in a dev checkout.
+# npm installs ship dist/ in the tarball, so a missing script there means a
+# broken install — fail loudly instead of invoking tsc against no tsconfig.
+exec_node() {
+  local rel="$1"; shift
+  local script="$REPO_ROOT/$rel"
+  if [[ ! -f "$script" ]]; then
+    if [[ -f "$REPO_ROOT/tsconfig.json" ]]; then
+      echo "[wezard] building..."
+      (cd "$REPO_ROOT" && npm install --silent && npx tsc -p tsconfig.json) || { echo "build failed"; exit 1; }
+    else
+      echo "[wezard] missing $script — try 'npm install -g wezard' to reinstall" >&2
+      exit 1
+    fi
+  fi
+  exec "$(command -v node)" "$script" "$@"
+}
+
 svc_load() {
   case "$OS" in
     Darwin) launchctl load -w "$HOME_DIR/Library/LaunchAgents/${LABEL}.plist" ;;
-    Linux)  systemctl --user start weclaude.service ;;
+    Linux)  systemctl --user start wezard.service ;;
   esac
 }
 svc_unload() {
   case "$OS" in
     Darwin) launchctl unload "$HOME_DIR/Library/LaunchAgents/${LABEL}.plist" ;;
-    Linux)  systemctl --user stop weclaude.service ;;
+    Linux)  systemctl --user stop wezard.service ;;
   esac
 }
 
 case "$cmd" in
-  init)
-    NODE_BIN="$(command -v node)"
-    SCRIPT="$REPO_ROOT/dist/cli/init.js"
-    if [[ ! -f "$SCRIPT" ]]; then
-      # Dev repo: tsconfig.json present → build. npm install: tarball ships dist/,
-      # so a missing init.js means a broken install — fail clearly instead of
-      # invoking tsc against a non-existent tsconfig.
-      if [[ -f "$REPO_ROOT/tsconfig.json" ]]; then
-        echo "[weclaude init] building..."
-        (cd "$REPO_ROOT" && npm install --silent && npx tsc -p tsconfig.json) || { echo "build failed"; exit 1; }
-      else
-        echo "[weclaude init] missing $SCRIPT — try 'npm install -g weclaude' to reinstall" >&2
-        exit 1
-      fi
-    fi
-    exec "$NODE_BIN" "$SCRIPT" "$@"
-    ;;
+  init)    exec_node dist/cli/init.js "$@" ;;
+  migrate) exec_node dist/cli/migrate.js "$@" ;;
   status)
     if ! out=$(http_get /status 2>/dev/null); then
       echo "daemon: down ($DAEMON_BASE)"
@@ -97,14 +102,14 @@ case "$cmd" in
     http_post /shutdown >/dev/null 2>&1 || true
     case "$OS" in
       Darwin) launchctl kickstart -k "gui/$(id -u)/${LABEL}" >/dev/null && echo "daemon: reloaded" ;;
-      Linux)  systemctl --user restart weclaude.service && echo "daemon: reloaded" ;;
+      Linux)  systemctl --user restart wezard.service && echo "daemon: reloaded" ;;
     esac
     ;;
   send)
     chat="${1:-}"; shift || true
     text="${*:-}"
     if [[ -z "$chat" || -z "$text" ]]; then
-      echo "usage: weclaude send <chat> <text>"; exit 1
+      echo "usage: wezard send <chat> <text>"; exit 1
     fi
     body=$(jq -nc --arg c "$chat" --arg t "$text" '{chat:$c,text:$t}')
     http_post /message "$body"
@@ -118,14 +123,14 @@ case "$cmd" in
     ;;
   logs)
     log_path=$(http_get /status 2>/dev/null | jq -r '.logFile // empty' 2>/dev/null || true)
-    log_path="${log_path:-$HOME_DIR/.weclaude/daemon.log}"
+    log_path="${log_path:-$HOME_DIR/.wezard/daemon.log}"
     if [[ "${1:-}" == "-f" ]]; then tail -f "$log_path"; else tail -n 100 "$log_path"; fi
     ;;
   config-path) http_get /status | jq -r '.sourcePath // empty' ;;
   uninstall)
     # Order matters: stop the daemon FIRST so it can't rewrite settings/lock
     # files mid-teardown; then strip MCP/env from agent settings; then remove
-    # the plist/unit + Claude plugin registration. State at ~/.weclaude is
+    # the plist/unit + Claude plugin registration. State at ~/.wezard is
     # preserved unless `--purge` is given.
     purge=0
     [[ "${1:-}" == "--purge" ]] && purge=1
@@ -134,14 +139,14 @@ case "$cmd" in
     SYNC_SCRIPT="$REPO_ROOT/dist/cli/sync.js"
     [[ -f "$SYNC_SCRIPT" ]] && "$NODE_BIN" "$SYNC_SCRIPT" --remove || true
     bash "$REPO_ROOT/scripts/uninstall.sh"
-    rm -f "$HOME_DIR/.weclaude/sync.lock.json"
+    rm -f "$HOME_DIR/.wezard/sync.lock.json"
     if (( purge )); then
-      rm -rf "$HOME_DIR/.weclaude"
-      echo "[weclaude] state purged (~/.weclaude removed)"
+      rm -rf "$HOME_DIR/.wezard"
+      echo "[wezard] state purged (~/.wezard removed)"
     else
-      echo "[weclaude] cleaned. state kept at ~/.weclaude — remove with 'weclaude uninstall --purge' or 'rm -rf ~/.weclaude'"
+      echo "[wezard] cleaned. state kept at ~/.wezard — remove with 'wezard uninstall --purge' or 'rm -rf ~/.wezard'"
     fi
-    echo "[weclaude] safe to 'npm uninstall -g weclaude' now"
+    echo "[wezard] safe to 'npm uninstall -g wezard' now"
     ;;
   mirror)
     cwd="${CLAUDE_PROJECT_DIR:-${CODEBUDDY_PROJECT_DIR:-$(pwd)}}"
