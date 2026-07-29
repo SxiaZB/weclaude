@@ -105,13 +105,20 @@ const prefixLines = (s: string, prefix: string): string =>
 // Flat key:val summary for unknown tools — never dump raw JSON.
 const UNKNOWN_VAL_LEN = 140;
 const UNKNOWN_TOTAL_LEN = 480;
-const summarizeUnknown = (i: Record<string, unknown>): string => {
+// Path values (Glob target_directory, open_result_view target_file, …) get
+// cwd/home-collapsed first, then LEFT-truncated — the filename is the
+// informative tail; right-truncation cuts it off mid-path.
+const TRUNC_LEFT = (s: string, n: number): string =>
+  s.length > n ? `…${s.slice(s.length - (n - 1))}` : s;
+const summarizeUnknown = (i: Record<string, unknown>, cwd: string): string => {
   const lines: string[] = [];
   let total = 0;
   for (const [k, v] of Object.entries(i)) {
     if (total >= UNKNOWN_TOTAL_LEN) { lines.push("…"); break; }
     const s = typeof v === "string" ? v : JSON.stringify(v);
-    const line = `${k}: ${TRUNC(oneLine(s), UNKNOWN_VAL_LEN)}`;
+    const isPath = typeof v === "string" && v.startsWith("/");
+    const shown = isPath ? TRUNC_LEFT(relToCwd(v, cwd), UNKNOWN_VAL_LEN) : TRUNC(oneLine(s), UNKNOWN_VAL_LEN);
+    const line = `${k}: ${shown}`;
     lines.push(line);
     total += line.length;
   }
@@ -177,7 +184,7 @@ const renderInput = (
     const head = [sa, desc].filter(Boolean).join(": ");
     return { body: TRUNC(prompt, QUOTE_MAX), desc: head || undefined };
   }
-  return { body: summarizeUnknown(i) };
+  return { body: summarizeUnknown(i, cwd) };
 };
 
 const quoteArea = (text: string): TemplateCard["quote_area"] =>
