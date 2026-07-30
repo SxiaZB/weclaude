@@ -83,6 +83,10 @@ const Mirror = z.object({
   // 没等到的话 drain 抓空, 卡先到、思考过程后到。轮询步进 50ms。0 = 关闭等待,
   // 仅做一次同步 drain (旧行为)。
   flushBeforeCardWaitMs: z.number().int().nonnegative().default(800),
+  // codebuddy 对 AskUserQuestion 不在提问时触发 PreToolUse hook (先弹本地面板),
+  // mirror 从 jsonl 提前探测到 function_call 后直接下发 vote 卡。该卡与本地面板
+  // 竞争 — 面板本就无限期阻塞 turn, 卡对齐 longPollSec 的 12h; 本地先答会作废它。
+  askqVoteTimeoutSec: z.number().int().positive().default(43200),
   // 发卡前从活着的 tmux pane 抠出「为什么发这张卡」的 assistant 前言并先推一条。
   // 必要性: Claude Code 把以 tool_use 收尾的整个 turn 攒着, 等工具 resolve 才 flush
   // 到 jsonl —— 而工具正卡在这张授权卡上, 于是前言在发卡时点既不在 jsonl 也不在

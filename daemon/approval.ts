@@ -8,8 +8,9 @@ import type {
   TemplateCardEventData,
 } from "@wecom/aibot-node-sdk";
 import type { Logger } from "pino";
+import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import type { Config } from "../shared/config.js";
-import { createPending, getPending, getResolvedSnapshot, resolvePending, resolvePendingsByChat, failPending, type Decision } from "./pending.js";
+import { createPending, getPending, getResolvedSnapshot, resolvePending, resolvePendingsByChat, failPending, stashResolved, type Decision } from "./pending.js";
 import {
   cacheGet,
   cachePut,
@@ -518,15 +519,15 @@ const decodeAskqKey = (
 const decodeAskqNoopKey = (key: string): string | undefined =>
   key.startsWith(ASKQ_NOOP_PREFIX) ? key.slice(ASKQ_NOOP_PREFIX.length) : undefined;
 
-interface AskqOption { label: string; description?: string }
-interface AskqQuestion {
+export interface AskqOption { label: string; description?: string }
+export interface AskqQuestion {
   question: string;
   header: string;
   multiSelect: boolean;
   options: AskqOption[];
 }
 
-const parseAskqInput = (i: unknown): AskqQuestion[] | undefined => {
+export const parseAskqInput = (i: unknown): AskqQuestion[] | undefined => {
   if (!i || typeof i !== "object") return undefined;
   const qs = (i as { questions?: unknown }).questions;
   if (!Array.isArray(qs)) return undefined;
@@ -557,7 +558,7 @@ const askqLabel = (idx: number): string => ASKQ_LETTERS[idx] ?? String(idx + 1);
 
 // vote_interaction 只支持 card_type/source/main_title/checkbox/submit_button/task_id,
 // sub_title_text/quote_area 等会被静默吞掉 → 题目和选项必须走前置 markdown 消息。
-const buildAskqMarkdown = (q: AskqQuestion, prefix = ""): string => {
+export const buildAskqMarkdown = (q: AskqQuestion, prefix = ""): string => {
   const title = q.question || q.header || "请选择";
   const head = `**🤔 ${prefix}${title}**`;
   const opts = q.options.map((o, idx) => {
@@ -567,7 +568,7 @@ const buildAskqMarkdown = (q: AskqQuestion, prefix = ""): string => {
   return [head, "", ...opts].join("\n");
 };
 
-const buildAskqCard = (reqId: string, q: AskqQuestion, transcriptTail: string, approver?: string): TemplateCard => {
+export const buildAskqCard = (reqId: string, q: AskqQuestion, transcriptTail: string, approver?: string): TemplateCard => {
   const tail = oneLine(transcriptTail).trim();
   return {
     card_type: "vote_interaction",
@@ -650,6 +651,51 @@ const parsePlanInput = (i: unknown): string => {
   return typeof p === "string" ? p : "";
 };
 
+// CodeBuddy 的 ExitPlanMode 不带 plan 正文 (arguments=="{}"); plan 写在
+// ~/.codebuddy/plans/<slug>.md (plan mode 系统消息指定, 模型用 Write/Edit 逐步
+// 成型)。从 transcript 尾部倒查最后一次指向 plans 目录的 file_path, 再读文件
+// 取最新内容。arguments 是转义后的内嵌 JSON 串 (\"file_path\":\"...\") 且嵌着
+// 整份 plan (单行可能数百 KB), 用正则抠路径 (\\? 兼容转义/未转义), 不做 parse。
+const PLAN_PATH_RE = /\\?"file_path\\?"\s*:\s*\\?"([^"\\]*\/\.codebuddy\/plans\/[^"\\]+\.md)\\?"/;
+const TRANSCRIPT_TAIL_BYTES = 256 * 1024;
+const PLAN_FILE_CAP = 64 * 1024;
+
+const tailText = (p: string, bytes: number): string => {
+  const fd = openSync(p, "r");
+  try {
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - bytes);
+    const buf = Buffer.alloc(size - start);
+    readSync(fd, buf, 0, buf.length, start);
+    return buf.toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+};
+
+const planPathFromTranscript = (transcriptPath: string): string | undefined => {
+  const lines = tailText(transcriptPath, TRANSCRIPT_TAIL_BYTES).split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = PLAN_PATH_RE.exec(lines[i]!);
+    if (m) return m[1];
+  }
+  return undefined;
+};
+
+// tool_input.plan (Claude) → transcript 定位 plans 文件 (CodeBuddy) → ""。
+const resolvePlanText = (toolInput: unknown, transcriptPath?: string): string => {
+  const direct = parsePlanInput(toolInput);
+  if (direct) return direct;
+  if (!transcriptPath) return "";
+  try {
+    const p = planPathFromTranscript(transcriptPath);
+    if (!p) return "";
+    return readFileSync(p, "utf8").slice(0, PLAN_FILE_CAP);
+  } catch {
+    return "";
+  }
+};
+
 const PLAN_TITLE_MAX = 26;
 const PLAN_PREVIEW_LINES = 25;
 const PLAN_PREVIEW_CHARS = 1500;
@@ -664,7 +710,7 @@ const buildPlanMarkdown = (plan: string): string => {
   return `**📋 计划待审批**\n\n${body}`;
 };
 
-const buildPlanCard = (reqId: string, _sessionId: string, cwd: string, transcriptTail: string, approver: string): TemplateCard => {
+const buildPlanCard = (reqId: string, _sessionId: string, cwd: string, transcriptTail: string, approver: string, hasPlan: boolean): TemplateCard => {
   const tail = oneLine(transcriptTail).trim();
   const tag = emojiFor(approver);
   const dir = dirName(cwd);
@@ -672,7 +718,9 @@ const buildPlanCard = (reqId: string, _sessionId: string, cwd: string, transcrip
     card_type: "button_interaction",
     source: buildSource(tail),
     main_title: { title: TRUNC(`📋 计划审批 · ${tag}${dir}/`, PLAN_TITLE_MAX + 12) },
-    sub_title_text: "审阅上方计划后选择:同意开始执行,或让 Claude 继续完善。",
+    sub_title_text: hasPlan
+      ? "审阅上方计划后选择:同意开始执行,或让 Claude 继续完善。"
+      : "完整计划见 CLI。选择:同意开始执行,或继续完善。",
     task_id: reqId,
     button_list: [
       { text: "✏️ 继续改", style: 4, key: encodePlanKey(reqId, "revise") },
@@ -710,6 +758,8 @@ interface PlanHandleArgs {
 }
 
 const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flushBeforeCard }: PlanHandleArgs): Promise<ApproveResp> => {
+  // 此分支只服务 Claude 家族 (hook 即时触发, tool_input.plan 带正文)。
+  // codebuddy 的 ExitPlanMode 不过 hook → 见 runMirrorPlanFlow。
   const plan = parsePlanInput(body.tool_input);
   if (!plan) return { decision: "ask", reason: "plan_unparsable" };
 
@@ -742,17 +792,19 @@ const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flu
     try { await flushBeforeCard?.(body.session_id, { toolName: "ExitPlanMode", toolInput: body.tool_input }); } catch (e) {
       log.warn({ err: (e as Error).message }, "plan flushBeforeCard failed; sending card anyway");
     }
-    try {
-      await client.sendMessage(target, {
-        msgtype: "markdown",
-        markdown: { content: withTagHeader(approver, buildPlanMarkdown(plan)) },
-      });
-    } catch (e) {
-      log.warn({ err: (e as Error).message }, "plan markdown prelude send failed");
+    if (plan) {
+      try {
+        await client.sendMessage(target, {
+          msgtype: "markdown",
+          markdown: { content: withTagHeader(approver, buildPlanMarkdown(plan)) },
+        });
+      } catch (e) {
+        log.warn({ err: (e as Error).message }, "plan markdown prelude send failed");
+      }
     }
     await client.sendMessage(target, {
       msgtype: "template_card",
-      template_card: buildPlanCard(reqId, body.session_id, body.cwd ?? "", body.transcript_tail ?? "", approver),
+      template_card: buildPlanCard(reqId, body.session_id, body.cwd ?? "", body.transcript_tail ?? "", approver, true),
     });
     log.info({ reqId, approver }, "plan card sent");
   } catch (e) {
@@ -797,14 +849,14 @@ interface AskqHandleArgs {
   clientGone?: Promise<"client_gone">;
 }
 
-type AskqAnswer =
+export type AskqAnswer =
   | { kind: "cli" }
   | { kind: "chat" }
   | { kind: "empty" }
   | { kind: "picked"; labels: string };
 
 // raw 是 click 事件 listener 塞回 pending 的字符串编码 (cli / chat / picked:i,j)。
-const interpretAskqRaw = (raw: string, q: AskqQuestion): AskqAnswer => {
+export const interpretAskqRaw = (raw: string, q: AskqQuestion): AskqAnswer => {
   if (raw === "cli") return { kind: "cli" };
   if (raw === "chat") return { kind: "chat" };
   if (raw.startsWith(ASKQ_PICKED_PREFIX)) {
@@ -818,9 +870,356 @@ const interpretAskqRaw = (raw: string, q: AskqQuestion): AskqAnswer => {
   return { kind: "empty" };
 };
 
+// ── mirror 驱动 vote 卡 (codebuddy 无即时 hook) 的 hook↔mirror 协调槽 ──────
+// codebuddy 对 AskUserQuestion 不在提问时触发 PreToolUse — 先弹本地面板, hook
+// 只在面板被提交后才到达 (实测可延迟数小时)。mirror 从 jsonl 提前看到
+// function_call 直接发卡; 用户点选后答案记进本槽, mirror 注入一段触发文本提交
+// 本地面板; hook 随后到达时: 有 reason → deny 覆盖(与 claude 路径同产物), 无记录
+// → allow 让本地答案生效并作废挂着的 vote 卡 (resolvePending "moot")。
+// TTL 兜底: 注入失败/hook 不至时槽位不永久阻塞同 session 的下一次提问。
+interface MirrorAskqSlot { reqId?: string; reason?: string; at: number }
+const mirrorAskqSlots = new Map<string, MirrorAskqSlot>();
+const MIRROR_ASKQ_SLOT_TTL_MS = 30 * 60_000;
+const freshSlot = (sessionId: string): MirrorAskqSlot | undefined => {
+  const s = mirrorAskqSlots.get(sessionId);
+  if (!s) return undefined;
+  if (Date.now() - s.at > MIRROR_ASKQ_SLOT_TTL_MS) {
+    mirrorAskqSlots.delete(sessionId);
+    return undefined;
+  }
+  return s;
+};
+export const hasMirrorAskq = (sessionId: string): boolean => freshSlot(sessionId) !== undefined;
+
+// ── 面板按键驱动 (codebuddy 本地面板的确定性提交协议) ──────────────────────
+// 逆向自 codebuddy TUI 的 AskUserQuestion 组件: 每题光标初始 0 (第一个选项),
+// ↑↓/j/k 移动; 单选选项上 Enter = 提交该选项 label 并自动前进下一题; 多选
+// Enter = 切换选中, 须把光标落到 N+1 行 (「下一题」行) 按 Enter 才前进; 自定义
+// 文本在第 N 行。全部题答完进提交页 (光标 0 = "1. Submit answers"), Enter 收工。
+// 序列开头 Up 连发把光标钳到 0, 吸收用户误触造成的漂移。
+export type AskqDriveAction = { kind: "keys"; keys: string[] } | { kind: "text"; text: string };
+
+export const buildAskqDriveActions = (questions: AskqQuestion[], picks: number[][]): AskqDriveAction[] => {
+  const maxOpts = questions.reduce((m, q) => Math.max(m, q.options.length), 0);
+  const acts: AskqDriveAction[] = [{ kind: "keys", keys: Array<string>(maxOpts + 3).fill("Up") }];
+  questions.forEach((q, i) => {
+    const N = q.options.length;
+    const picked = (picks[i] ?? []).filter((n) => Number.isInteger(n) && n >= 0 && n < N).sort((a, b) => a - b);
+    if (!q.multiSelect) {
+      const n = picked[0] ?? 0;
+      acts.push({ kind: "keys", keys: [...Array<string>(n).fill("Down"), "Enter"] });
+      return;
+    }
+    const keys: string[] = [];
+    let cur = 0;
+    for (const n of picked) {
+      keys.push(...Array<string>(n - cur).fill("Down"), "Enter");
+      cur = n;
+    }
+    // 多选的前进行在第 N+1 位 (0..N-1 选项, N 自定义行, N+1 下一题行)。
+    keys.push(...Array<string>(N + 1 - cur).fill("Down"), "Enter");
+    acts.push({ kind: "keys", keys });
+  });
+  // 提交页光标初始 0 = "1. Submit answers"。
+  acts.push({ kind: "keys", keys: ["Enter"] });
+  return acts;
+};
+
+// 「聊聊这个」: 光标钳 0 后落到第 N 行 (自定义文本行), 贴入引导语提交 — 自由文本
+// 答案本身即语义完整 (hook 若触发, deny+reason 会再覆盖成同款文案)。
+export const buildAskqChatDriveActions = (q: AskqQuestion): AskqDriveAction[] => [
+  { kind: "keys", keys: [...Array<string>(q.options.length + 3).fill("Up"), ...Array<string>(q.options.length).fill("Down")] },
+  { kind: "text", text: "先不回答，我想和你讨论一下这个问题" },
+  { kind: "keys", keys: ["Enter"] },
+];
+
+// 多问题: 逐题顺序发卡 → 收答 → 下一题。任一题选「CLI」整体转 CLI,选「聊聊」
+// 整体转讨论; 全部答完合并成单个 deny+reason 注入。卡不会一次性轰炸 N 张。
+interface MirrorAskqFlowArgs {
+  log: Logger;
+  client: WSClient;
+  sessionId: string;
+  /** mirror 附件的 target (可带 #tag) — 卡片/前奏都发到这一聊天。 */
+  chatKey: string;
+  toolInput: unknown;
+  voteTimeoutMs: number;
+  /** 按 buildAskqDriveActions 的序列驱动本地面板 (send-keys / 贴文本)。 */
+  drive: (acts: AskqDriveAction[]) => Promise<{ ok: boolean; reason?: string }>;
+}
+
+export const runMirrorAskqFlow = async ({ log, client, sessionId, chatKey, toolInput, voteTimeoutMs, drive }: MirrorAskqFlowArgs): Promise<void> => {
+  const questions = parseAskqInput(toolInput);
+  if (!questions || questions.length === 0) return;
+  if (questions.some((q) => q.options.length === 0)) return;
+  if (!client.isConnected) return;
+
+  const target = targetChatId(chatKey);
+  const total = questions.length;
+  const answers: string[] = [];
+  const picks: number[][] = [];
+  const flowStart = Date.now();
+  const note = async (content: string): Promise<void> => {
+    try {
+      await client.sendMessage(target, { msgtype: "markdown", markdown: { content: withTagHeader(chatKey, content) } });
+    } catch { /* best-effort */ }
+  };
+
+  for (let i = 0; i < total; i++) {
+    const q = questions[i]!;
+    // 剩余预算: N 题共享一份 voteTimeoutSec, 语义同 hook 流的 longPollSec 分摊。
+    const remainMs = voteTimeoutMs - (Date.now() - flowStart);
+    if (remainMs < 10_000) {
+      mirrorAskqSlots.delete(sessionId);
+      await note("⌛ 问题卡已超时，请在 CLI 中作答。");
+      return;
+    }
+    // meta 形状与 hook 流一致: click listener 用 toolInput(单题 wrapper)/chatKey
+    // 渲染 resolved 卡, 监听侧零改动。
+    const { reqId, promise } = createPending({
+      meta: {
+        kind: "generic",
+        createdAt: Date.now(),
+        toolName: "AskUserQuestion",
+        toolInput: { questions: [q] },
+        sessionId,
+        chatKey,
+        transcriptTail: "",
+      },
+      timeoutMs: remainMs,
+    });
+    mirrorAskqSlots.set(sessionId, { reqId, at: Date.now() });
+
+    const prefix = total > 1 ? `(${i + 1}/${total}) ` : "";
+    try {
+      try {
+        await client.sendMessage(target, {
+          msgtype: "markdown",
+          markdown: { content: withTagHeader(chatKey, buildAskqMarkdown(q, prefix)) },
+        });
+      } catch (e) {
+        log.warn({ err: (e as Error).message }, "mirror askq markdown prelude send failed");
+      }
+      await client.sendMessage(target, {
+        msgtype: "template_card",
+        template_card: buildAskqCard(reqId, q, "", chatKey),
+      });
+      log.info({ reqId, chatKey, idx: i, total }, "mirror askq card sent");
+    } catch (e) {
+      log.error({ err: (e as Error).message }, "mirror askq send failed");
+      resolvePending(reqId, "deny"); // 释放 pending 槽
+      mirrorAskqSlots.delete(sessionId);
+      return;
+    }
+
+    let raw: string;
+    try {
+      raw = (await promise) as unknown as string;
+    } catch {
+      mirrorAskqSlots.delete(sessionId);
+      await note("⌛ 问题卡已超时，请在 CLI 中作答。");
+      return;
+    }
+    // 本地先答, hook 侧作废了这张卡 — 中止整流, 不驱动不覆盖。
+    if (raw === "moot") {
+      log.info({ reqId, sessionId }, "mirror askq mooted by local answer");
+      mirrorAskqSlots.delete(sessionId);
+      return;
+    }
+
+    const ans = interpretAskqRaw(raw, q);
+    // 「去 CLI 处理」/ 空选 → 交还本地面板, 之后 hook 到达走 allow 分支。
+    if (ans.kind === "cli" || ans.kind === "empty") {
+      mirrorAskqSlots.delete(sessionId);
+      return;
+    }
+    if (ans.kind === "chat") {
+      mirrorAskqSlots.set(sessionId, {
+        reason: `Instead of answering "${q.header || q.question}", the user wants to chat about it first. Discuss the question with them before re-asking.`,
+        at: Date.now(),
+      });
+      const r = await drive(buildAskqChatDriveActions(q));
+      if (!r.ok) {
+        log.warn({ sessionId, reason: r.reason }, "mirror askq chat drive failed");
+        await note("⚠️ 已记录，但驱动 CLI 面板失败，请回到 CLI 手动处理。");
+      } else {
+        mirrorAskqSlots.delete(sessionId);
+      }
+      return;
+    }
+    answers.push(`"${q.header || q.question}": ${ans.labels}`);
+    // 按键驱动要的是选项下标, raw 编码 picked:i,j 里直接取 (与 interpret 同源)。
+    picks.push(
+      raw.slice(ASKQ_PICKED_PREFIX.length)
+        .split(",")
+        .map((s) => parseInt(s, 10))
+        .filter((n) => Number.isInteger(n) && n >= 0 && n < q.options.length),
+    );
+  }
+
+  const reason = total === 1
+    ? `User answered ${answers[0]} via WeCom`
+    : `User answered ${total} questions via WeCom — ${answers.join("; ")}`;
+  mirrorAskqSlots.set(sessionId, { reason, at: Date.now() });
+  // 驱动前再确认槽还是自己的: 用户若在收票期间本地答了 (hook 到达会清槽),
+  // 面板已经消失, 按键会落进主输入框 (Down 翻历史 / Enter 误提交) — 必须放弃。
+  if (freshSlot(sessionId)?.reason !== reason) {
+    log.info({ sessionId }, "mirror askq slot lost before drive — local answer won");
+    return;
+  }
+  const acts = buildAskqDriveActions(questions, picks);
+  log.info({ sessionId, acts: acts.length, picks }, "mirror askq drive start");
+  const r = await drive(acts);
+  if (!r.ok) {
+    // 驱动失败: 保留 reason 槽 — 用户手动提交面板时 hook 到达仍以记录答案覆盖。
+    log.warn({ sessionId, reason: r.reason }, "mirror askq drive failed");
+    await note("⚠️ 答案已记录，但驱动 CLI 面板失败，请回到 CLI 手动处理。");
+    return;
+  }
+  log.info({ sessionId }, "mirror askq drive done");
+  // 驱动成功 = 面板已按 WeCom 答案提交, 结果随工具自然落地。清槽放掉后续提问;
+  // hook 若迟到, 无槽 → allow → 本地 (即我们驱动的) 答案原样生效, 语义一致。
+  mirrorAskqSlots.delete(sessionId);
+  // 回执同 hook 流: 答完后 model 进入不可见长 thinking, 先确认答案已落地。
+  await note(total === 1 ? "✅ 已回传，Claude 处理中…" : `✅ ${total} 题已回传，Claude 处理中…`);
+};
+
+// ── mirror 驱动 plan 审批卡 (codebuddy 的 ExitPlanMode 完全不过 hook) ──────
+// 实测 (codebuddy 日志): ExitPlanMode 由 interruption-service 本地对话框直接
+// 裁决, HookExecutor 零调用 — hook 路径对它不存在。mirror 从 jsonl 提前看到
+// function_call → 发计划审批卡; 点选后往活 pane send-keys 直接裁决本地对话框:
+//   ✅ 同意   → Enter  (默认高亮 "1. Yes")
+//   ✏️ 继续改 → Escape (选项 2 标注的快捷键)
+// 本地若先答, function_call_result 落盘 → mirror 调 mootMirrorPlan 作废卡片。
+// 槽位防重: jsonl 重放/tail 重连不会对同一次退出重复发卡。
+interface MirrorPlanSlot { reqId?: string; at: number }
+const mirrorPlanSlots = new Map<string, MirrorPlanSlot>();
+const MIRROR_PLAN_SLOT_TTL_MS = 12 * 3600_000; // 与 approval.longPollSec 对齐
+const freshPlanSlot = (sessionId: string): MirrorPlanSlot | undefined => {
+  const s = mirrorPlanSlots.get(sessionId);
+  if (!s) return undefined;
+  if (Date.now() - s.at > MIRROR_PLAN_SLOT_TTL_MS) {
+    mirrorPlanSlots.delete(sessionId);
+    return undefined;
+  }
+  return s;
+};
+export const hasMirrorPlan = (sessionId: string): boolean => freshPlanSlot(sessionId) !== undefined;
+export const mootMirrorPlan = (sessionId: string): void => {
+  const s = freshPlanSlot(sessionId);
+  if (!s) return;
+  if (s.reqId) resolvePending(s.reqId, "moot" as never);
+  mirrorPlanSlots.delete(sessionId);
+};
+
+interface MirrorPlanFlowArgs {
+  log: Logger;
+  client: WSClient;
+  sessionId: string;
+  /** mirror 附件的 target (可带 #tag) — 卡片/前奏都发到这一聊天。 */
+  chatKey: string;
+  cwd: string;
+  /** 会话 jsonl — 从尾部倒查 ~/.codebuddy/plans/*.md 挖 plan 正文。 */
+  jsonlPath: string;
+  voteTimeoutMs: number;
+  /** 往活 pane 裁决本地对话框: 同意=Enter / 继续改=Escape。 */
+  sendKey: (key: "Enter" | "Escape") => Promise<{ ok: boolean; reason?: string }>;
+}
+
+export const runMirrorPlanFlow = async ({ log, client, sessionId, chatKey, cwd, jsonlPath, voteTimeoutMs, sendKey }: MirrorPlanFlowArgs): Promise<void> => {
+  if (!client.isConnected) return;
+  const target = targetChatId(chatKey);
+  const note = async (content: string): Promise<void> => {
+    try {
+      await client.sendMessage(target, { msgtype: "markdown", markdown: { content: withTagHeader(chatKey, content) } });
+    } catch { /* best-effort */ }
+  };
+
+  const plan = resolvePlanText(undefined, jsonlPath);
+  if (!plan) log.warn({ sessionId }, "mirror plan: plan text not found — card without prelude");
+  const { reqId, promise } = createPending({
+    meta: {
+      kind: "generic",
+      createdAt: Date.now(),
+      toolName: "ExitPlanMode",
+      toolInput: {},
+      cwd,
+      sessionId,
+      chatKey,
+      transcriptTail: "",
+    },
+    timeoutMs: voteTimeoutMs,
+  });
+  mirrorPlanSlots.set(sessionId, { reqId, at: Date.now() });
+
+  try {
+    if (plan) {
+      try {
+        await client.sendMessage(target, {
+          msgtype: "markdown",
+          markdown: { content: withTagHeader(chatKey, buildPlanMarkdown(plan)) },
+        });
+      } catch (e) {
+        log.warn({ err: (e as Error).message }, "mirror plan markdown prelude send failed");
+      }
+    }
+    await client.sendMessage(target, {
+      msgtype: "template_card",
+      template_card: buildPlanCard(reqId, sessionId, cwd, "", chatKey, Boolean(plan)),
+    });
+    log.info({ reqId, chatKey }, "mirror plan card sent");
+  } catch (e) {
+    log.error({ err: (e as Error).message }, "mirror plan send failed");
+    resolvePending(reqId, "deny");
+    mirrorPlanSlots.delete(sessionId);
+    return;
+  }
+
+  let raw: string;
+  try {
+    raw = (await promise) as unknown as string;
+  } catch {
+    mirrorPlanSlots.delete(sessionId);
+    await note("⌛ 计划卡已超时，请在 CLI 中处理。");
+    return;
+  }
+  // 本地先答 (function_call_result 落盘触发的 moot)。
+  if (raw === "moot") {
+    log.info({ reqId, sessionId }, "mirror plan mooted by local answer");
+    mirrorPlanSlots.delete(sessionId);
+    return;
+  }
+
+  const approve = raw === `${PLAN_PICKED_PREFIX}approve`;
+  const r = await sendKey(approve ? "Enter" : "Escape");
+  mirrorPlanSlots.delete(sessionId);
+  if (!r.ok) {
+    log.warn({ sessionId, reason: r.reason }, "mirror plan sendKey failed");
+    await note("⚠️ 已记录选择，但本地对话框按键注入失败，请回到 CLI 手动处理。");
+    return;
+  }
+  log.info({ reqId, sessionId, approve }, "mirror plan resolved via send-keys");
+  await note(approve ? "✅ 已同意，退出 plan mode 开始执行…" : "✏️ 已选择继续完善计划。");
+};
+
 // 多问题: 逐题顺序发卡 → 收答 → 下一题。任一题选「CLI」整体转 CLI,选「聊聊」
 // 整体转讨论; 全部答完合并成单个 deny+reason 注入。卡不会一次性轰炸 N 张。
 const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, flushBeforeCard, clientGone }: AskqHandleArgs): Promise<ApproveResp> => {
+  // ── codebuddy 镜像流去重 ────────────────────────────────────────────────
+  // codebuddy 的 hook 只在本地面板被提交后到达。mirror 早已发过 vote 卡:
+  //   - 槽里有 reason = 面板是被我们的注入提交的 → 用记录的 reason 覆盖, 不再发卡。
+  //   - 无记录 = 用户在本地答的 → allow 让本地答案生效, 并作废挂着的 vote 卡。
+  const slot = freshSlot(body.session_id);
+  if (slot?.reason) {
+    mirrorAskqSlots.delete(body.session_id);
+    log.info({ sessionId: body.session_id }, "askq hook: overriding with mirror-collected answer");
+    return { decision: "deny", reason: slot.reason };
+  }
+  if (body.cli_backend === "codebuddy") {
+    if (slot?.reqId) resolvePending(slot.reqId, "moot" as never);
+    mirrorAskqSlots.delete(body.session_id);
+    return { decision: "allow", reason: "codebuddy_local_panel" };
+  }
+
   const questions = parseAskqInput(body.tool_input);
   if (!questions || questions.length === 0) return { decision: "ask", reason: "askq_unparsable" };
   if (questions.some((q) => q.options.length === 0)) return { decision: "ask", reason: "askq_no_options" };
@@ -954,6 +1353,12 @@ interface ApproveReq {
   tool_input: unknown;
   cwd?: string;
   transcript_tail?: string;
+  /** hook 侧探测到的 CLI 后端 (pre-tool-use.sh 经 CODEBUDDY_* env 判定)。
+   *  codebuddy 的 AskUserQuestion hook 只在本地面板提交后到达 → 走去重分支。 */
+  cli_backend?: string;
+  /** Hook 侧原样透传。ExitPlanMode 在 codebuddy 下用它从 transcript 倒查
+   *  ~/.codebuddy/plans/*.md 挖 plan 正文 (tool_input 里没有)。 */
+  transcript_path?: string;
 }
 
 interface ApproveResp {
@@ -1112,6 +1517,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
           tool_input: toolInput,
           cwd,
           transcript_tail: transcriptTail,
+          cli_backend: body.cli_backend,
         },
       });
       json(res, 200, resp satisfies ApproveResp);
@@ -1132,6 +1538,8 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
           tool_input: toolInput,
           cwd,
           transcript_tail: transcriptTail,
+          cli_backend: body.cli_backend,
+          transcript_path: body.transcript_path,
         },
       });
       json(res, 200, resp satisfies ApproveResp);
@@ -1374,6 +1782,8 @@ export const installApprovalEventListener = (
             ? "chat"
             : `${ASKQ_PICKED_PREFIX}${numericIdxs.join(",")}`;
         const ok = resolvePending(askq.reqId, resolved as never);
+        // 留 resolved 快照: 重复点击已决卡时据此跳过"已失效"重绘 (卡已是终态)。
+        if (ok && meta) stashResolved(askq.reqId, meta, resolved as never);
         log.info({ reqId: askq.reqId, outcome, ok }, "askq event resolved");
         if (q) {
           try {
@@ -1389,6 +1799,21 @@ export const installApprovalEventListener = (
             );
           } catch (e) {
             log.warn({ err: (e as Error).message, reqId: askq.reqId }, "askq updateTemplateCard failed");
+          }
+        } else if (!ok && !getResolvedSnapshot(askq.reqId)) {
+          // 死卡点击 (超时 / 本地先答已作废 / daemon 重启丢 pending): 给终态反馈,
+          // 别让用户对着无反应的卡干瞪眼。有 resolved 快照 = 已决卡的重复点击,
+          // 卡片已是终态, 不重绘。
+          try {
+            await client.updateTemplateCard(frame, {
+              card_type: "button_interaction",
+              main_title: { title: "🤔 问题卡已失效" },
+              sub_title_text: "该卡已超时或已在别处处理，请以最新上下文为准。",
+              task_id: cbTaskId || askq.reqId,
+              button_list: [{ text: "⌛ 已失效", style: 4, key: encodeAskqNoopKey(askq.reqId) }],
+            } as TemplateCard);
+          } catch (e) {
+            log.warn({ err: (e as Error).message, reqId: askq.reqId }, "askq stale-card update failed");
           }
         }
         return;

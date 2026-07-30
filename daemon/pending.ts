@@ -99,7 +99,7 @@ const gcResolved = (): void => {
   }
 };
 
-const stashResolved = (reqId: string, meta: PendingMeta, decision: Decision): void => {
+export const stashResolved = (reqId: string, meta: PendingMeta, decision: Decision): void => {
   resolvedStash.set(reqId, { meta, decision, resolvedAt: Date.now() });
   if (resolvedStash.size > RESOLVED_MAX) gcResolved();
 };

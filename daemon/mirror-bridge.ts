@@ -29,6 +29,7 @@ import {
   type NormalizedTranscriptLine,
 } from "../shared/cli-backends.js";
 import type { MirrorStore } from "./mirror-store.js";
+import { hasMirrorAskq, runMirrorAskqFlow, hasMirrorPlan, mootMirrorPlan, runMirrorPlanFlow } from "./approval.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl, buildChatUrl } from "./detail.js";
 import type { CtxCut, TurnUsage } from "./detail.js";
@@ -2338,6 +2339,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       a.softEnd = setTimeout(() => fireSoftTurnEnd(a), SOFT_TURN_END_MS);
       return;
     }
+    // codebuddy: ExitPlanMode 若被本地先答, result 落盘即作废挂着的计划审批卡
+    // (卡 pending 期间 model 阻塞在本地对话框, 不可能有其它 tool_result)。
+    if (item.kind === "tool_result") mootMirrorPlan(a.sessionId);
     // Record tool_use signatures unconditionally (before any state branching),
     // so flushBeforeCard's poll-drain can detect that the to-be-approved tool
     // is now persisted in the jsonl regardless of DEFERRED/STREAMING/IDLE.
@@ -2350,6 +2354,79 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           const oldest = a.recentToolSigs.keys().next().value;
           if (oldest === undefined) break;
           a.recentToolSigs.delete(oldest);
+        }
+        // codebuddy 的 ExitPlanMode 完全不过 PreToolUse hook (实测: 由
+        // interruption-service 本地对话框裁决, HookExecutor 零调用)。mirror 从
+        // jsonl 看到 function_call → 发计划审批卡; 点选后 send-keys 裁决本地
+        // 对话框 (Enter=同意, 默认高亮 Yes / Escape=选项 2 标注的快捷键)。
+        // claude 系 hook 即时触发, 不走此路 (否则双重发卡)。
+        if (
+          c.name === "ExitPlanMode"
+          && backendForPath(a.jsonlPath).name === "codebuddy"
+          && !hasMirrorPlan(a.sessionId)
+        ) {
+          void runMirrorPlanFlow({
+            log: log.child({ sessionId: a.sessionId }),
+            client,
+            sessionId: a.sessionId,
+            chatKey: a.target,
+            cwd: a.runningCwd,
+            jsonlPath: a.jsonlPath,
+            voteTimeoutMs: cfg.approval.longPollSec * 1000,
+            sendKey: async (key) => {
+              if (!a.tmuxPane) return { ok: false, reason: "no_live_pane" };
+              if (!(await tmuxPaneAlive(a.tmuxPane))) return { ok: false, reason: "pane_dead" };
+              const r = await tmuxRun(["send-keys", "-t", a.tmuxPane, key]);
+              return r.code === 0 ? { ok: true } : { ok: false, reason: `send-keys ${key} failed: ${r.stdout.slice(-200) || r.code}` };
+            },
+          });
+        }
+        // codebuddy 对 AskUserQuestion 不在提问时触发 PreToolUse hook — 先弹本地
+        // 面板, hook 只在面板被提交后才到达 (实测可延迟数小时)。这里从 jsonl 提前
+        // 看到 function_call, 直接驱动 vote 卡让远端可答; 点选后注入一段触发文本
+        // 提交本地面板, hook 到达时以 deny+reason 覆盖答案, 与 claude 路径同产物。
+        // claude 系 hook 即时触发, 不走此路 (否则双重发卡)。
+        if (
+          c.name === "AskUserQuestion"
+          && backendForPath(a.jsonlPath).name === "codebuddy"
+          && !hasMirrorAskq(a.sessionId)
+        ) {
+          void runMirrorAskqFlow({
+            log: log.child({ sessionId: a.sessionId }),
+            client,
+            sessionId: a.sessionId,
+            chatKey: a.target,
+            toolInput: c.input,
+            voteTimeoutMs: cfg.wrc.mirror.askqVoteTimeoutSec * 1000,
+            drive: async (acts) => {
+              // 面板只活在 TTY 里 — 无 pane 无法驱动 (spawn 注入会变成新 prompt)。
+              if (!a.tmuxPane) return { ok: false, reason: "no_live_pane" };
+              if (!(await tmuxPaneAlive(a.tmuxPane))) return { ok: false, reason: "pane_dead" };
+              for (const act of acts) {
+                if (act.kind === "text") {
+                  // 贴文本到自定义输入行: 复用 inject 的 bracketed-paste + Enter。
+                  const r = await inject({
+                    text: act.text,
+                    cfg,
+                    log: log.child({ principal: a.target, sessionId: a.sessionId }),
+                    sessionId: a.sessionId,
+                    jsonlPath: a.jsonlPath,
+                    tmuxTarget: a.tmuxPane,
+                    freshSpawn: false,
+                  });
+                  if (!r.ok) return r;
+                } else {
+                  for (const key of act.keys) {
+                    const r = await tmuxRun(["send-keys", "-t", a.tmuxPane!, key]);
+                    if (r.code !== 0) return { ok: false, reason: `send-keys ${key}: ${r.stdout.slice(-200) || r.code}` };
+                    await sleepMs(120); // 键间距 — 等 TUI 重渲染, 防吞键
+                  }
+                }
+                await sleepMs(300); // 题间/阶段间隔 — 等面板翻页
+              }
+              return { ok: true };
+            },
+          });
         }
       }
     }

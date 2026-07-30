@@ -60,6 +60,14 @@ CWD=$(printf '%s' "$PAYLOAD" | jq -r '.cwd // ""')
 TRANSCRIPT_PATH=$(printf '%s' "$PAYLOAD" | jq -r '.transcript_path // ""')
 PERMISSION_MODE=$(printf '%s' "$PAYLOAD" | jq -r '.permission_mode // ""')
 
+# CLI 后端: 与下方 ExitPlanMode 同款判别 — transcript 落在 ~/.codebuddy/ 即
+# codebuddy。daemon 的 AskUserQuestion 分支据此走去重逻辑 (codebuddy 的 hook
+# 只在本地面板提交后触发, vote 卡由 mirror 提前下发)。
+CLI_BACKEND="claude"
+case "$TRANSCRIPT_PATH" in
+  */.codebuddy/*) CLI_BACKEND="codebuddy" ;;
+esac
+
 # 权限模式短路: 只对用户主动选的"完全跳过"模式放掉, 其它一律走 daemon 发 IM
 # 卡, 让 wezard 远端用户能在 IM 上点决策。
 #   - bypassPermissions: 用户已经主动选了"全跳", emit allow 直接放, 不打 daemon。
@@ -80,6 +88,8 @@ fi
 
 # ExitPlanMode 只是把 plan mode 的产出交给用户确认, 本地 CLI 会再弹一次原生
 # 确认框, 走 IM 审批纯属多此一举, 直接放行。
+# (codebuddy 更不走过这里: 实测它的 ExitPlanMode 完全由 interruption-service
+# 本地裁决, PreToolUse hook 不触发 — IM 侧审批卡由 mirror 从 jsonl 驱动。)
 if [[ "$TOOL_NAME" == "ExitPlanMode" ]]; then
   emit "allow" "ExitPlanMode passthrough"
 fi
@@ -151,7 +161,9 @@ BODY=$(jq -nc \
   --argjson ti "$TOOL_INPUT" \
   --arg cwd "$CWD" \
   --arg tail "$TRANSCRIPT_TAIL" \
-  '{session_id:$sid,tool_name:$tn,tool_input:$ti,cwd:$cwd,transcript_tail:$tail}')
+  --arg tp "$TRANSCRIPT_PATH" \
+  --arg cb "$CLI_BACKEND" \
+  '{session_id:$sid,tool_name:$tn,tool_input:$ti,cwd:$cwd,transcript_tail:$tail,transcript_path:$tp,cli_backend:$cb}')
 
 RESP=$(curl -sS --max-time "$HOOK_TIMEOUT" \
   -H 'Content-Type: application/json' \
