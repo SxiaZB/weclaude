@@ -67,6 +67,14 @@ export interface TurnUsage {
   ctxPeak?: number;
 }
 
+// 上下文断点 —— 本轮开始前上下文发生了什么。渲染成 turn 卡片顶部的断点条,
+// 让"这一轮读不到上一轮"这件事在时间线上可见:
+//   clear  = /clear 清空 (成因确定, 上文全丢)
+//   new    = /new 另起会话 (新 pane / 新 sid)
+//   switch = sessionId 轮换但成因未知 (resume fork / worktree drift / daemon 重启)。
+//            这些路径上下文通常是延续的, 所以只中性地标"换过会话", 不宣称已清空。
+export type CtxCut = "clear" | "new" | "switch";
+
 export interface TurnDetailRecord {
   kind: "turn";
   id: string;
@@ -76,6 +84,7 @@ export interface TurnDetailRecord {
   target?: string;
   sessionId?: string;
   userQuery?: string;  // 触发本轮的用户输入原文 (mirror 侧 dispatch 的 text)
+  cut?: CtxCut;        // 本轮之前的上下文断点; undefined = 与上一轮同一上下文
   items: TurnItem[];
   model?: string;      // 首个见到的 model 名
   modelAlt?: number;   // 与 model 不同的后续行数, 用于渲染 "+N"
@@ -134,6 +143,13 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
       for (let i = 0; i < sorted.length - MAX; i++) store.delete(sorted[i]![0]);
     }
   };
+
+  const lastTurnOf = (target: string): TurnDetailRecord | undefined =>
+    [...store.values()].reduce<TurnDetailRecord | undefined>(
+      (m, r) =>
+        r.kind === "turn" && r.target === target && (!m || r.createdAt > m.createdAt) ? r : m,
+      undefined,
+    );
 
   const persist = (rec: DetailRecord): void => {
     try { appendFileSync(logPath, `${JSON.stringify(rec)}\n`); } catch { /* ignore */ }
@@ -213,9 +229,14 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
     },
     startTurn: (rec) => {
       const now = Date.now();
+      // 断点成因由 caller 给 (它才知道刚注入的是 /clear 还是 /new); 没给就退回观测:
+      // 同 target 的上一轮 sid 与本轮不同 ⇒ 上下文不连续, 至少要标出来。
+      const prev = rec.target ? lastTurnOf(rec.target) : undefined;
+      const rotated = !!prev?.sessionId && !!rec.sessionId && prev.sessionId !== rec.sessionId;
       put({
         kind: "turn",
         ...rec,
+        cut: rec.cut ?? (rotated ? "switch" : undefined),
         createdAt: rec.createdAt ?? now,
         updatedAt: now,
         closed: false,

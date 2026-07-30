@@ -130,6 +130,12 @@ body { overflow: hidden; overscroll-behavior: none }
 .tg-link { margin-left: auto; color: #8c959f; text-decoration: none; font-size: 13px }
 .tg-link:hover { color: #0969da }
 .turn-group .bubbles { margin-top: 0 }
+/* 上下文断点 (/clear、/new、会话轮换): 断点条来自 TURN_CSS, 这里再给整张卡片
+   多留一口气 + 描边, 让"这一轮读不到上一轮"在滚动中一眼可辨。 */
+.turn-group.cut { margin-top: 12px }
+.turn-group.cut-clear, .turn-group.cut-new {
+  border-color: #d4a72c66; box-shadow: 0 1px 2px #1f23280a, 0 0 0 3px #d4a72c14;
+}
 
 /* ── 页脚总账 ───────────────────────────────────────────────────── */
 .statusbar {

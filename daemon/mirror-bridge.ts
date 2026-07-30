@@ -31,7 +31,7 @@ import {
 import type { MirrorStore } from "./mirror-store.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl, buildChatUrl } from "./detail.js";
-import type { TurnUsage } from "./detail.js";
+import type { CtxCut, TurnUsage } from "./detail.js";
 import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
 import { splitMarkdown } from "../shared/md-chunk.js";
 import { randomTip } from "./tips.js";
@@ -1572,6 +1572,9 @@ interface AttachState {
    *  必须用冷启动时序,否则 paste 校验会在 TUI 抓到 pty 之前超时并重贴一次,
    *  两次 paste 最终都落进输入框 = 提示词重复。一次性,由第一次 dispatch 消费。 */
   justSpawned?: boolean;
+  /** 待记账的上下文断点 (`/clear` 注入 / `/new` 铸盘 / 观测到 /clear 轮换)。由下一次
+   *  recordTurnStart 消费一次 —— 断点属于"断点之后的第一轮", 那才是读不到上文的一轮。 */
+  ctxCut?: CtxCut;
   /** Set when `/clear` was injected: the next user prompt will land in a fresh
    *  jsonl with a new sessionId. A watcher polls the project dir to migrate
    *  this attachment onto the new file. Cleared once migration completes or
@@ -2109,9 +2112,16 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // WeCom 侧发起一个 turn: 立刻挂 loading 气泡当 ack, 再决定是马上激活还是排队。
   // 上一 turn 还在跑时绝不能强关它 —— CC 那边新消息也是排队的, 当前轮的后半段还会
   // 继续落盘, 强关会把它们改挂到新 turn 上, 旧 turn 页则提前变「已完成」。
+  // 断点是一次性的: 只归给断点后的第一轮, 之后的轮次上下文又连续了。
+  const consumeCut = (a: AttachState): CtxCut | undefined => {
+    const cut = a.ctxCut;
+    a.ctxCut = undefined;
+    return cut;
+  };
+
   const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string, isSlash = false, userQuery = ""): Promise<void> => {
     const turnId = newTurnId();
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: userQuery.trim() || undefined });
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: userQuery.trim() || undefined, cut: consumeCut(a) });
     // hardTimer 兜底: turn 若无终句 / turn_end 收口 (卡死/漏收), 到点仍收气泡。
     const bubble: BriefBubble = { frame, streamId, hardTimer: undefined as unknown as NodeJS.Timeout, done: false };
     const q: QueuedTurn = { turnId, bubble, isSlash };
@@ -2147,7 +2157,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const turnId = newTurnId();
     const query = a.pendingBriefQuery?.replace(/^> ?/gm, "").trim();
     a.pendingBriefQuery = undefined;
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: query || undefined });
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: query || undefined, cut: consumeCut(a) });
     a.briefTurnId = turnId;
     a.briefBubble = undefined;
     a.briefIsSlash = false;
@@ -2808,6 +2818,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const migrateAttachment = (a: AttachState, newSessionId: string, newJsonlPath: string, startOffset?: number): void => {
     const oldSessionId = a.sessionId;
     const oldJsonlPath = a.jsonlPath;
+    // 迁移是所有会话轮换的唯一漏斗 (注入的 /clear、TUI 里手打的 /clear、resume fork、
+    // worktree drift)。只有目标 jsonl 首条用户行是 /clear 的那种才是真清空 —— fork /
+    // drift 上下文是延续的, 让 store 去推它那条中性的 "switch"。
+    if (jsonlIsPostClearChild(newJsonlPath)) a.ctxCut = "clear";
     a.tail.stop();
     bySessionId.delete(oldSessionId);
     a.sessionId = newSessionId;
@@ -3150,7 +3164,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // 首条注入吃冷时序(injectText 走 /mirror/spawn 时已经硬编码 freshSpawn:true,
     // dispatch 这条隐式建会话的路径此前漏了)。
     const spawned = byTarget.get(target);
-    if (spawned) spawned.justSpawned = true;
+    if (spawned) {
+      spawned.justSpawned = true;
+      // 只有换过 pane 才是断点 —— 首次 /wrc 建会话时 prev 为空, 那不是"不连续", 是开局。
+      if (prev) spawned.ctxCut = "new";
+    }
     // Clear the chat's pendingCwd on the BASE record too — the queued switch
     // has just been consumed by this respawn. Without this, a subsequent /new
     // #other would re-apply the same cd and diverge from user intent.
@@ -3615,6 +3633,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // immediately — capturing baseline post-inject would already include it,
       // and the watcher would never see a "new" candidate (the bug this fixes).
       const preClearBaseline = armMigration ? listJsonls(dirname(a.jsonlPath)) : undefined;
+      // 记下断点, 由下一轮 (第一轮读不到上文的轮次) 领走。/clear 自己不建 turn,
+      // 否则这次清空在 chat 详情里毫无痕迹, 前后两轮看着还是连续的。
+      if (armMigration) a.ctxCut = "clear";
       // Drop any prior turn's outbound deferral state — a new dispatch always
       // supersedes whatever was buffered/awaiting. The old frame is dead by our
       // own choice (we won't write to it anymore); the user might still later

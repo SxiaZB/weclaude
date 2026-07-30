@@ -8,6 +8,7 @@ import { staleAt, turnDone } from "./chat-view.js";
 import type {
   ApprovalDecision,
   ApprovalDetailRecord,
+  CtxCut,
   DetailRecord,
   ToolDetailRecord,
   TurnDetailRecord,
@@ -435,6 +436,15 @@ const TURN_CSS = `
   .tool-result-line .del{color:#cf222e;font-weight:600}
   .tool-result-line .more{color:#8c959f}
   .tool-result-line .run{color:#9a6700}
+  /* ── 上下文断点条 ── */
+  .tg-cut{display:flex;align-items:center;gap:8px;font-size:11px;color:#9a6700;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.3px}
+  .tg-cut::before,.tg-cut::after{content:"";border-top:1px dashed #d4a72c99}
+  .tg-cut::before{flex:0 0 14px}
+  .tg-cut::after{flex:1}
+  .tg-cut .s{opacity:.6}
+  .tg-cut.switch{color:#8c959f}
+  .tg-cut.switch::before,.tg-cut.switch::after{border-top-color:#d0d7de}
 `;
 
 const renderJsonSection = (input: unknown): string =>
@@ -671,6 +681,21 @@ const turnParts = (r: TurnDetailRecord, keyPrefix = "", now = Date.now()): {
   return { items, bodies, done, ageMs: (done ? r.updatedAt : now) - r.createdAt };
 };
 
+const CUT_TEXT: Record<CtxCut, string> = {
+  clear: "上下文已清空 · /clear",
+  new: "新会话 · /new",
+  switch: "会话已轮换",
+};
+
+// 断点条挂在 turn 卡片顶部而不是两卡之间 —— 片段必须始终只有一个根节点, chat.js 的
+// upsertTurn/reconcile 是按 data-key 认领整个 turn-group 的, 多根会让它取错节点。
+const renderCut = (r: TurnDetailRecord): string =>
+  r.cut
+    ? `<div class="tg-cut ${r.cut}"><span class="l">${escHtml(CUT_TEXT[r.cut])}</span>${
+        r.sessionId ? `<span class="s">${escHtml(r.sessionId.slice(0, 8))}</span>` : ""
+      }</div>`
+    : "";
+
 const renderTurnPage = (r: TurnDetailRecord): string => {
   const { items, bodies, done, ageMs } = turnParts(r);
   const statusBadge = done
@@ -800,6 +825,7 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
 <script src="https://unpkg.com/@highlightjs/cdn-assets@11/highlight.min.js"></script>
 </head><body data-closed="${done ? "1" : "0"}"><div class="wrap">
 <header><h1><span class="accent">Turn Details</span></h1>${statusBadge}</header>
+${renderCut(r)}
 ${turnInfo}
 <div class="meta">${metaParts.map(escHtml).join('<span class="sep">·</span>')}</div>
 ${statsCard}
@@ -853,7 +879,7 @@ export const renderTurnGroup = (r: TurnDetailRecord, now = Date.now()): TurnFrag
   </div>`;
   // staleAt 只走 JSON, 绝不进 HTML —— 它跟着 updatedAt 变, 一旦计入 sig, SSE 的
   // "内容没变就不重发" 会彻底失效 (一个 turn 的 HTML 可以是几十 KB)。
-  const body = `<section class="turn-group" data-key="t:${escHtml(r.id)}">${head}<div class="bubbles">${inner}</div></section>`;
+  const body = `<section class="turn-group${r.cut ? ` cut cut-${r.cut}` : ""}" data-key="t:${escHtml(r.id)}">${renderCut(r)}${head}<div class="bubbles">${inner}</div></section>`;
   return {
     id: r.id, html: tagSig(body), sig: hashStr(body),
     createdAt: r.createdAt, updatedAt: r.updatedAt,
