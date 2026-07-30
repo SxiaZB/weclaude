@@ -30,7 +30,6 @@ const CMD_RULES: readonly Rule[] = [
   ["关机/重启", /\b(shutdown|reboot|halt|poweroff)\b/],
   ["服务停用", /\blaunchctl\s+(unload|bootout|remove)\b|\bsystemctl\s+(stop|disable|mask)\b/],
   ["git 强推", /\bgit\b[\s\S]*\bpush\b[\s\S]*(--force|-f\b)/],
-  ["git 推送远端", /\bgit\b[\s\S]*\bpush\b/],
   ["git 丢弃改动", /\bgit\s+(reset\s+--hard|clean\b|checkout\s+--\s|restore\b)/],
   ["git 删分支", /\bgit\s+branch\s+-D\b|\bgit\s+push\b[\s\S]*--delete\b/],
   ["发布包", /\bnpm\s+(publish|unpublish)\b|\byarn\s+publish\b|\bpnpm\s+publish\b/],
