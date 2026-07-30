@@ -15,6 +15,7 @@ import { initDetailPersistence, makeDetailHandler, chatHandlers, configureRemote
 import { initAutoWindowPersistence } from "./session-cache.js";
 import { makeMessageHandler } from "./outbound.js";
 import { makeCardHandler, makeAskHandler, installAskEventListener } from "./ask.js";
+import { drainForReload } from "./pending.js";
 import {
   makeClaimStartHandler,
   makeClaimStatusHandler,
@@ -521,6 +522,9 @@ const main = async (): Promise<void> => {
   const shutdown = async (signal: string): Promise<void> => {
     log.info({ signal }, "shutdown signal");
     scheduler.stop();
+    // 同 POST /shutdown: 先把挂着的审批长轮询了结成「稍后续接」, 再关连接。
+    log.info(drainForReload(), "pending drained for reload");
+    await new Promise((r) => setTimeout(r, 200));
     await Promise.allSettled([ws.shutdown(), http.close()]);
     process.exit(0);
   };

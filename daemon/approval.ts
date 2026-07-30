@@ -10,7 +10,7 @@ import type {
 import type { Logger } from "pino";
 import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import type { Config } from "../shared/config.js";
-import { createPending, getPending, getResolvedSnapshot, resolvePending, resolvePendingsByChat, failPending, stashResolved, type Decision } from "./pending.js";
+import { createPending, getPending, getResolvedSnapshot, resolvePending, resolvePendingsByChat, failPending, stashResolved, markCardSent, isReloadError, type Decision } from "./pending.js";
 import {
   cacheGet,
   cachePut,
@@ -1359,11 +1359,17 @@ interface ApproveReq {
   /** Hook 侧原样透传。ExitPlanMode 在 codebuddy 下用它从 transcript 倒查
    *  ~/.codebuddy/plans/*.md 挖 plan 正文 (tool_input 里没有)。 */
   transcript_path?: string;
+  /** Reload 续接: 上一轮长轮询被 drain 时 daemon 回传的 req_id。带着它重来 =
+   *  「别再发一张卡, 把我重新挂到旧卡的那个 reqId 上」。 */
+  resume_req_id?: string;
 }
 
 interface ApproveResp {
-  decision: "allow" | "deny" | "ask";
+  // "retry" 只发给 hook, 不是 Claude Code 的合法 permissionDecision:
+  // 语义是「daemon 正在重启, 带上 req_id 稍后重来」, hook 自己消化掉。
+  decision: "allow" | "deny" | "ask" | "retry";
   reason?: string;
+  req_id?: string;
 }
 
 const decisionToHook = (d: Decision): "allow" | "deny" => (d === "deny" ? "deny" : "allow");
@@ -1449,6 +1455,10 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
         { batchId: batch.batchId, count: batch.members.length, multi: isMulti, approver: batch.approver, tool: batch.toolName },
         "batch flushed",
       );
+      // 只给单卡打「可续接」标: 批量卡的点击要靠内存里的 batchById 才能一次
+      // resolve N 个成员, 那张表撑不过重启 —— 续接了反而会让成员干等一张点了
+      // 没反应的卡。批量成员维持原行为 (drain → fallbackOnError)。
+      if (!isMulti) markCardSent(batch.members[0]!.reqId);
     } catch (e) {
       log.error({ batchId: batch.batchId, err: (e as Error).message }, "batch send failed");
       const err = new Error(`send_card_fail:${(e as Error).message}`);
@@ -1606,6 +1616,9 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
     })();
 
     const longPollMs = cfg.approval.longPollSec * 1000;
+    // Reload 续接: hook 带着上一轮的 req_id 回来, 复用同一个 id 重新挂起 ——
+    // WeCom 上那张卡的按钮编的就是它, 于是旧卡的点击照样能 resolve 这次长轮询。
+    const resumeId = (body.resume_req_id ?? "").trim();
     const { reqId, promise } = createPending({
       meta: {
         kind: "approval",
@@ -1617,8 +1630,10 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
         chatKey: approver,
         transcriptTail,
         danger: danger?.rule,
+        cardSent: Boolean(resumeId), // 续接的前提就是卡已经在群里
       },
       timeoutMs: longPollMs,
+      reqId: resumeId || undefined,
     });
 
     recordApproval({
@@ -1633,11 +1648,14 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
     // Batch coalesce: 同 session 同 tool 的并发请求合流为一张卡。窗口内首位
     // 创建 batch + 计时器, 后续到达者只追加成员, 不发卡。flush 时依据成员数
     // 选择普通 buildCard 或 buildBatchCard。0 = 关闭聚合, 立即 flush。
+    // 续接的请求不再进 batch: 卡已经在群里, 重发就是重复轰炸。
     const member: BatchMember = { reqId, toolInput: display, originalToolInput: toolInput, toolInputStr, cwd, transcriptTail };
     const bk = batchKeyOf(sessionId, toolName);
     // 危险请求既不 join 也不被 join — 一次危险操作 = 一张卡 = 一次点击。
     const existing = danger ? undefined : activeBatches.get(bk);
-    if (existing && !existing.flushed) {
+    if (resumeId) {
+      // no-op: 直接进下面的长轮询, 等旧卡上的点击。
+    } else if (existing && !existing.flushed) {
       existing.members.push(member);
       log.info({ batchId: existing.batchId, count: existing.members.length, reqId }, "batch joined");
     } else {
@@ -1666,6 +1684,13 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
     try {
       decision = await promise;
     } catch (e) {
+      // Reload drain: 卡还挂在 WeCom 上, 让 hook 带着同一个 reqId 等 daemon 回来
+      // 重新长轮询 —— 而不是 fallback 成 ask 把权限框弹回本地 CLI。
+      if (isReloadError(e)) {
+        log.info({ reqId, toolName, sessionId }, "approval parked for reload — telling hook to resume");
+        json(res, 200, { decision: "retry", reason: "daemon_reloading", req_id: reqId } satisfies ApproveResp);
+        return;
+      }
       log.warn({ err: (e as Error).message, reqId }, "approval timed out");
       json(res, 200, fallback(cfg, "approver_timeout", danger) satisfies ApproveResp);
       return;

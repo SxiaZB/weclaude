@@ -20,6 +20,10 @@ export interface PendingMeta {
   /** 命中危险名单的规则名 (daemon/danger.ts)。非空 = 这张卡必须被人单独点,
    *  永远不参与 allow_window 的批量放行。 */
   danger?: string;
+  /** 卡片已经真的发到 WeCom 上了 (flushBatch 成功)。只有这种 pending 在 reload
+   *  drain 时值得让 hook 续接 —— 卡还挂在聊天里, 重启后同 reqId 重新挂起即可复用。
+   *  没发出去的卡续接就是让 hook 空等一个永远不会有人点的东西。 */
+  cardSent?: boolean;
 }
 
 interface Pending {
@@ -34,6 +38,9 @@ const store = new Map<string, Pending>();
 export interface CreatePendingOpts {
   meta: PendingMeta;
   timeoutMs: number;
+  /** 复用一个已知 reqId (reload 续接): 卡片按钮里编的就是它, 重新挂起后
+   *  用户点旧卡依然能 resolve。省略 = 新建一个随机 id。 */
+  reqId?: string;
 }
 
 export interface PendingHandle {
@@ -41,8 +48,8 @@ export interface PendingHandle {
   promise: Promise<Decision>;
 }
 
-export const createPending = ({ meta, timeoutMs }: CreatePendingOpts): PendingHandle => {
-  const reqId = randomUUID();
+export const createPending = ({ meta, timeoutMs, reqId: reuseId }: CreatePendingOpts): PendingHandle => {
+  const reqId = reuseId || randomUUID();
   const promise = new Promise<Decision>((resolve, reject) => {
     const timer = setTimeout(() => {
       store.delete(reqId);
@@ -74,6 +81,33 @@ export const failPending = (reqId: string, err: Error): boolean => {
 };
 
 export const getPending = (reqId: string): PendingMeta | undefined => store.get(reqId)?.meta;
+
+/** 卡片发送成功后打标 — 决定 reload drain 时这条 pending 能不能让 hook 续接。 */
+export const markCardSent = (reqId: string): void => {
+  const p = store.get(reqId);
+  if (p) p.meta.cardSent = true;
+};
+
+// ── Reload drain ────────────────────────────────────────────────────────
+// 进程退出前必须主动了结所有挂着的长轮询: 否则 socket 被硬杀, hook 的 curl
+// 报错 → fallbackOnError=ask → 本地弹权限框, 用户在 WeCom 上那张卡变鬼卡。
+// 已发卡的 approval 走 RELOAD_ERR, 调用方据此回 {decision:"retry", req_id},
+// hook 等 daemon 回来后带同一个 reqId 重新长轮询, 旧卡继续有效。
+const RELOAD_ERR = "daemon_reloading";
+export const isReloadError = (e: unknown): boolean => (e as Error | undefined)?.message === RELOAD_ERR;
+
+export const drainForReload = (): { resumable: number; dropped: number } => {
+  const entries = Array.from(store.entries());
+  const counts = entries.reduce(
+    (acc, [reqId, p]) => {
+      const resumable = p.meta.kind === "approval" && p.meta.cardSent === true;
+      failPending(reqId, new Error(resumable ? RELOAD_ERR : "daemon_shutdown"));
+      return resumable ? { ...acc, resumable: acc.resumable + 1 } : { ...acc, dropped: acc.dropped + 1 };
+    },
+    { resumable: 0, dropped: 0 },
+  );
+  return counts;
+};
 
 export const listPending = (): Array<{ reqId: string; meta: PendingMeta }> =>
   Array.from(store.entries()).map(([reqId, p]) => ({ reqId, meta: p.meta }));

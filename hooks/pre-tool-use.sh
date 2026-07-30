@@ -11,6 +11,10 @@ STATE_DIR="${WEZARD_STATE_DIR:-$HOME/.wezard/state}"
 # Fallback policy when the daemon is unreachable / replies garbage. ask|allow|deny.
 # Default keeps the safe behavior; set to `allow` in trusted local-only setups.
 FALLBACK="${WEZARD_HOOK_FALLBACK:-ask}"
+# daemon 重启 (wezard reload / launchd 拉起) 时等它回来的最长秒数。等回来后带着
+# 上一轮的 req_id 续接同一张卡, 而不是 fallback 把权限框弹回本地 CLI。
+RESUME_WAIT="${WEZARD_RESUME_WAIT:-60}"
+HEALTH_URL="${DAEMON_URL%/approve}/healthz"
 
 emit() {
   local decision="$1" reason="${2:-}"
@@ -155,25 +159,79 @@ if [[ -n "$TRANSCRIPT_PATH" && -r "$TRANSCRIPT_PATH" ]]; then
     | head -c 800 || true)
 fi
 
-BODY=$(jq -nc \
-  --arg sid "$SESSION_ID" \
-  --arg tn "$TOOL_NAME" \
-  --argjson ti "$TOOL_INPUT" \
-  --arg cwd "$CWD" \
-  --arg tail "$TRANSCRIPT_TAIL" \
-  --arg tp "$TRANSCRIPT_PATH" \
-  --arg cb "$CLI_BACKEND" \
-  '{session_id:$sid,tool_name:$tn,tool_input:$ti,cwd:$cwd,transcript_tail:$tail,transcript_path:$tp,cli_backend:$cb}')
+build_body() {
+  jq -nc \
+    --arg sid "$SESSION_ID" \
+    --arg tn "$TOOL_NAME" \
+    --argjson ti "$TOOL_INPUT" \
+    --arg cwd "$CWD" \
+    --arg tail "$TRANSCRIPT_TAIL" \
+    --arg tp "$TRANSCRIPT_PATH" \
+    --arg cb "$CLI_BACKEND" \
+    --arg rid "$RESUME_ID" \
+    '{session_id:$sid,tool_name:$tn,tool_input:$ti,cwd:$cwd,transcript_tail:$tail,transcript_path:$tp,cli_backend:$cb}
+     + (if $rid == "" then {} else {resume_req_id:$rid} end)'
+}
 
-RESP=$(curl -sS --max-time "$HOOK_TIMEOUT" \
-  -H 'Content-Type: application/json' \
-  -d "$BODY" \
-  "$DAEMON_URL" 2>/dev/null) || bridge_down "daemon curl failed"
+# drain 到进程真正退出之间还有 ~200ms。不等它先死就重投, 会打进这个将死的进程,
+# 那次 curl 必然半路断掉、还白白丢掉 req_id。最多等 5s, 期间它没死也就算了。
+wait_for_exit() {
+  local waited=0
+  while (( waited < 5 )); do
+    curl -sS --max-time 1 "$HEALTH_URL" >/dev/null 2>&1 || return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 0
+}
 
-DECISION=$(printf '%s' "$RESP" | jq -r '.decision // "ask"' 2>/dev/null) || bridge_down "bad daemon response"
-REASON=$(printf '%s' "$RESP" | jq -r '.reason // ""' 2>/dev/null)
+# daemon 回来了吗。reload 是「退出 → launchd 重新拉起」, 中间有几百 ms 到几秒
+# 的空窗; 这段时间内的 curl 必然 connection refused。
+wait_for_daemon() {
+  local waited=0
+  while (( waited < RESUME_WAIT )); do
+    if curl -sS --max-time 2 "$HEALTH_URL" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
 
-case "$DECISION" in
-  allow|deny|ask) emit "$DECISION" "$REASON" ;;
-  *) bridge_down "unknown decision: $DECISION" ;;
-esac
+# 长轮询 + 重启续接。整个循环共享 HOOK_TIMEOUT 预算 (hooks.json 的 timeout 只比
+# 它多 10s), 所以每轮 --max-time 用的是剩余额度而不是重新计时。
+RESUME_ID=""
+COLD_RETRIES=0
+while :; do
+  REMAIN=$(( HOOK_TIMEOUT - SECONDS ))
+  (( REMAIN > 5 )) || bridge_down "hook budget exhausted"
+
+  RESP=$(curl -sS --max-time "$REMAIN" \
+    -H 'Content-Type: application/json' \
+    -d "$(build_body)" \
+    "$DAEMON_URL" 2>/dev/null) || RESP=""
+
+  if [[ -z "$RESP" ]]; then
+    # 没走 drain 就没了 (硬杀 / 崩溃)。等它回来重投一次 —— 工具还没执行, 重投
+    # 是安全的; 只是没有 req_id 可续, daemon 会发一张新卡, 旧卡沦为鬼卡。
+    COLD_RETRIES=$((COLD_RETRIES + 1))
+    (( COLD_RETRIES <= 2 )) || bridge_down "daemon unstable"
+    wait_for_daemon || bridge_down "daemon curl failed"
+    continue  # RESUME_ID 有就带着 (卡还活着), 没有就是重发一张新卡
+  fi
+
+  DECISION=$(printf '%s' "$RESP" | jq -r '.decision // "ask"' 2>/dev/null) || bridge_down "bad daemon response"
+  REASON=$(printf '%s' "$RESP" | jq -r '.reason // ""' 2>/dev/null)
+
+  # daemon 正在重启: 卡还挂在 IM 上, 拿着它给的 req_id 等 daemon 回来续接。
+  if [[ "$DECISION" == "retry" ]]; then
+    RESUME_ID=$(printf '%s' "$RESP" | jq -r '.req_id // ""' 2>/dev/null)
+    wait_for_exit
+    wait_for_daemon || bridge_down "daemon did not come back"
+    continue
+  fi
+
+  case "$DECISION" in
+    allow|deny|ask) emit "$DECISION" "$REASON" ;;
+    *) bridge_down "unknown decision: $DECISION" ;;
+  esac
+done
