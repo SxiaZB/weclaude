@@ -1166,6 +1166,25 @@ const fingerprints = (text: string): { headFp: string; tailFp: string } => {
 const injectViaTmux = async (target: string, text: string, images: string[], log: Logger, freshSpawn: boolean, backendName: CliBackendName): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
   log.info({ target, len: text.length, images: images.length, freshSpawn, backendName }, "mirror inject (tmux)");
 
+  // Never type into a modal picker (see detectModalPicker). Checked before the
+  // image pump too — a C-v into a picker is just as destructive as a paste.
+  // 必须在按后端分流之前: 每个后端都有自己的原生确认框, 往任何一个里打字都会
+  // 替用户点掉框并吞掉这条消息。放到 codebuddy 早退之后就等于只保护了 claude。
+  // Escape hatch: WEZARD_MODAL_GUARD=0, in case a future TUI layout trips it.
+  if (process.env.WEZARD_MODAL_GUARD !== "0") {
+    const modal = await detectModalPicker(target);
+    if (modal.modal) {
+      log.warn({ target, title: modal.title, backendName }, "mirror inject: modal picker on pane, refusing to inject");
+      const what = modal.title ? `「${modal.title}」` : "原生确认框";
+      return {
+        ok: false,
+        reason: `目标会话停在 CLI ${what} 等待确认,消息未送达。`
+          + `(强行注入会替你点掉确认框并吞掉这条消息)`
+          + `请到 tmux 里处理该确认框,或发 /stop 取消当前操作后重发。`,
+      };
+    }
+  }
+
   // 图片注入策略按后端分流：
   //   claude / claude-internal —— 走 macOS 剪贴板 + Ctrl+V，TUI 收到 \x16 后
   //     直接读系统剪贴板的 PNGf flavor，附加为 image content block。
@@ -1180,23 +1199,6 @@ const injectViaTmux = async (target: string, text: string, images: string[], log
     const refs = images.map((p) => `@${p}`);
     const textWithRefs = refs.length ? (text ? `${refs.join("\n")}\n${text}` : refs.join("\n")) : text;
     return injectViaTmuxText(target, textWithRefs, log, freshSpawn);
-  }
-
-  // Never type into a modal picker (see detectModalPicker). Checked before the
-  // image pump too — a C-v into a picker is just as destructive as a paste.
-  // Escape hatch: WECLAUDE_MODAL_GUARD=0, in case a future TUI layout trips it.
-  if (process.env.WECLAUDE_MODAL_GUARD !== "0") {
-    const modal = await detectModalPicker(target);
-    if (modal.modal) {
-      log.warn({ target, title: modal.title }, "mirror inject: modal picker on pane, refusing to inject");
-      const what = modal.title ? `「${modal.title}」` : "原生确认框";
-      return {
-        ok: false,
-        reason: `目标会话停在 CLI ${what} 等待确认,消息未送达。`
-          + `(强行注入会替你点掉确认框并吞掉这条消息)`
-          + `请到 tmux 里处理该确认框,或发 /stop 取消当前操作后重发。`,
-      };
-    }
   }
 
   // Pump images first via clipboard+C-v so each one is attached as a separate
