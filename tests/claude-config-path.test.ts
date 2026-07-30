@@ -85,6 +85,31 @@ t("不命中: .claude 只是名字的一部分", () => {
   assert.equal(bash("mkdir -p ~/.claudex/skills"), undefined);
 });
 
+// ── 变量间接 ───────────────────────────────────────────────────────────
+// 写命令段里没有字面 `.claude`, 但赋值的值就在同一条命令里 → 展开一层再判。
+// 不展开的话: 规则侧纯赋值段被当无害段跳过后, `Bash(rm *)` 会静默放行这条命令,
+// 而 CC 的原生确认框照样立起 → 不发卡 + pane 阻塞 (本文件存在的理由)。
+t("命中: 变量间接的写入", () => {
+  const hit = bash("f=~/.claude/settings.json; rm $f");
+  assert.equal(hit?.why, "bash-write");
+  assert.equal(hit?.path, "~/.claude/settings.json");
+});
+t("命中: 花括号引用 / export 声明头 / 重定向到变量", () => {
+  assert.equal(bash("export d=~/.claude/skills && mkdir -p ${d}/x")?.path, "~/.claude/skills/x");
+  assert.ok(bash("f=.claude/settings.json; echo '{}' > $f"));
+  assert.ok(bash('f="~/.claude/settings.json"; tee $f < /tmp/new.json'));
+});
+t("不命中: 变量间接的只读命令(不误伤)", () => {
+  assert.equal(bash("f=~/.claude/settings.json; cat $f"), undefined);
+  assert.equal(bash("f=~/.claude/settings.json"), undefined);
+});
+t("不命中: 变量值不碰 .claude", () => {
+  assert.equal(bash("f=/tmp/x; rm $f"), undefined);
+});
+t("已知盲点: 动态赋值值收不到(不做猜测)", () => {
+  assert.equal(bash("f=$(cat /tmp/target); rm $f"), undefined);
+});
+
 // ── 文件类工具 ─────────────────────────────────────────────────────────
 t("命中: Edit/Write/NotebookEdit 的 .claude 路径", () => {
   assert.equal(claudeConfigWrite("Edit", { file_path: "/Users/x/.claude/settings.json" })?.why, "file");

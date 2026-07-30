@@ -13,6 +13,7 @@
 //
 // 已知盲点: 解释器间接写入(`python3 gen.py` 内部往 `.claude/` 写文件)看不出来 ——
 // 字面判定拿不到运行时行为。那类调用退回旧行为(可能死锁), 不做猜测式拦截。
+// 字面变量间接(`f=~/.claude/x; rm $f`)不在盲点内: 值就在命令里, 展开一层再判。
 //
 // 纯函数, 无 IO —— daemon 决策与单测共用。
 import { splitSegments } from "./allow-rules.js";
@@ -36,6 +37,30 @@ const WRITE_HEADS = new Set([
 
 const unquote = (tok: string): string => tok.replace(/^['"]|['"]$/g, "");
 
+// 变量间接: `f=~/.claude/settings.json; rm $f` —— 写命令那一段没有字面 `.claude`,
+// 纯字面逐段判定看不见它。但赋值的值就摆在同一条命令里, 展开一次就能看见。
+// (允许规则侧的纯赋值段是"无害段跳过"的, 所以这条命令能被 `Bash(rm *)` 放行 ——
+// 不在这里展开, 就正好是本文件开头说的那种"不发卡 + pane 阻塞"静默死锁。)
+// 只收「段首赋值」(可带 export/local 等声明头), 且值必须是字面量: `f=$(…)`
+// 这类动态值收不到, 仍属开头记录的解释器/运行时盲点, 不做猜测。
+const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/u;
+const DECL_HEADS = new Set(["export", "local", "declare", "readonly", "typeset"]);
+const VAR_REF_RE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/gu;
+
+/** 把段首赋值记进变量表 (就地写入 —— 逐段推进时后面的段才能用上前面的赋值)。 */
+const recordAssignments = (toks: string[], vars: Map<string, string>): void => {
+  const start = DECL_HEADS.has(unquote(toks[0] ?? "")) ? 1 : 0;
+  for (let i = start; i < toks.length; i++) {
+    const m = ASSIGN_RE.exec(toks[i]!);
+    if (!m) break; // 段首赋值前缀到此为止, 后面是命令本体
+    vars.set(m[1]!, unquote(m[2]!));
+  }
+};
+
+/** `$f` / `${f}` 展开一层; 表里没有的变量 (如 $HOME) 原样留着继续参与路径判定。 */
+const expandVars = (tok: string, vars: Map<string, string>): string =>
+  vars.size === 0 ? tok : tok.replace(VAR_REF_RE, (whole, braced, bare) => vars.get(braced ?? bare) ?? whole);
+
 /** 路径里是否有 `.claude` 这一段 —— `~/.claude/x`、`a/.claude`、裸 `.claude` 都算。 */
 export const isClaudeConfigPath = (raw: string): boolean => {
   const p = unquote(raw.trim());
@@ -46,9 +71,12 @@ export const isClaudeConfigPath = (raw: string): boolean => {
 const bashHit = (command: string): ClaudeConfigHit | undefined => {
   // 引号感知切分失败(未闭合引号/孤立 &) → 整条当一段看, fail-closed 宁可多发卡。
   const segments = splitSegments(command) ?? [command];
+  const vars = new Map<string, string>();
   for (const seg of segments) {
-    const toks = seg.trim().split(/\s+/u).filter(Boolean);
-    if (toks.length === 0) continue;
+    const rawToks = seg.trim().split(/\s+/u).filter(Boolean);
+    if (rawToks.length === 0) continue;
+    recordAssignments(rawToks, vars);
+    const toks = rawToks.map((t) => expandVars(t, vars));
     const hitTok = toks.find((t) => isClaudeConfigPath(t));
     if (!hitTok) continue;
     const head = (unquote(toks[0]!).split("/").pop() ?? "").trim();
