@@ -78,6 +78,10 @@
     // denyRules 命中直接拒绝不发卡(Bash 复合命令任一段命中即拒);
     // askRules 命中必发卡, 压过 allowRules / ⏱自动放行窗口 / 会话缓存 —— 给
     // 危险前缀兜底, 窗口开着也逐条确认。
+    // 完整判定链(下面的 danger 名单 = "出厂自带的 askRules", 与 askRules 同层):
+    //   denyRules → danger → askRules → .claude 守卫 → allowRules → ⏱窗口 → cache → 发卡
+    // 即: 再宽的 allowRules(如 "Bash(git *)")也不会让 danger 名单失效; 要豁免
+    // 危险判定只能用 danger.allowPatterns —— 那是唯一压得过名单的开关。
     "denyRules": [],             // 例: ["Bash(rm -rf /*)", "Bash(mkfs *)"]
     "askRules": [],              // 例: ["Bash(rm *)", "Bash(sudo *)", "Bash(git push *)"]
     // `.claude/**` 写守卫: 改动 Claude 自己的配置面(settings/hooks/skills/…)会触发

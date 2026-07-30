@@ -1636,8 +1636,15 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         guardActive ? "claude-config guard force card" : "claude-config write detected (no live pane, passing through)",
       );
     }
-    // 必发卡 = askRules 命中 或 守卫生效。两者都要压过放行/窗口/缓存三条捷径。
-    const mustCard = Boolean(askHit) || guardActive;
+    // 危险名单 (daemon/danger.ts): 内置的 rm / 强推 / DROP / 敏感路径等。语义上
+    // 是「出厂自带的 askRules」—— 所以它必须和用户写的 askRules 站在同一层, 排在
+    // allowRules 之前。放在后面的话, 一条 `Bash(git *)` 这样的宽 allow 规则 (尤其
+    // 是从 Claude settings.json 批量导入来的) 就能让整份危险名单失效。
+    const danger: DangerHit | undefined = dangerOf(cfg, toolName, toolInput);
+    if (danger) log.info({ toolName, sessionId, rule: danger.rule }, "danger hit — forcing single approval");
+
+    // 必发卡 = 危险名单 或 askRules 命中 或 守卫生效。三者都要压过放行/窗口/缓存。
+    const mustCard = Boolean(danger) || Boolean(askHit) || guardActive;
 
     // allowRules: matcher 拦下的工具里再挖细粒度豁免 (Bash 可按命令前缀区分)。
     // 交互卡工具 (AskUserQuestion 等) 在 ruleAllows 内部硬保护, 规则写了也不放行。
@@ -1716,25 +1723,30 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     // 检查跳过 (window 需要一个 chat 才存在), 走后面的 no_approver fallback。
     const approver = resolveApprover(cfg, sessionId, getMirrorTarget);
 
-    // 危险名单: 命中者跳过 auto-window / session cache / 批量合流, 每次都单独发卡。
-    const danger: DangerHit | undefined = dangerOf(cfg, toolName, toolInput);
-    if (danger) log.info({ toolName, sessionId, rule: danger.rule }, "danger hit — forcing single approval");
+    // danger.skip / danger 模式这两条早退, 都只对「danger 这个理由」生效 ——
+    // askRules 与 `.claude/**` 守卫是另外两条独立的必发卡理由, 不能被 danger 的
+    // 开关顺带关掉。守卫尤其不能: 放行后 CC 会在 pane 里立起自己的原生确认框,
+    // 而早退意味着 settleClaudeConfigModal 不会执行 —— 没人去按那个框, pane 就
+    // 无限期卡死, 正是守卫要消灭的场景。
+    // (注意这里不能写 !mustCard: danger 命中本身就会置位 mustCard, 那样
+    //  dangerSkips 永远不触发, 等于把上游这个特性废掉。)
+    const forcedByOthers = Boolean(askHit) || guardActive;
 
     // danger.skip: 命中危险名单也直接放行 (跳过 danger)。
-    if (dangerSkips(cfg, danger)) {
+    if (!forcedByOthers && dangerSkips(cfg, danger)) {
       json(res, 200, { decision: "allow", reason: "danger_skip" } satisfies ApproveResp);
       return;
     }
 
     // danger 模式: 名单之外的调用不打扰人, 直接放行 (卡只留给真正危险的操作)。
-    if (dangerModeSkips(cfg, danger)) {
+    if (!forcedByOthers && dangerModeSkips(cfg, danger)) {
       json(res, 200, { decision: "allow", reason: "danger_mode_skip" } satisfies ApproveResp);
       return;
     }
 
     // Auto-approve window: while active for THIS chat, requests short-circuit to allow.
-    // 危险名单 / askRules 命中 / 守卫生效的请求不吃窗口 — 即使开着 ⏱ 也逐条确认。
-    if (!danger && !mustCard && approver && isAutoWindowActive(approver)) {
+    // mustCard (危险名单 / askRules / `.claude/**` 守卫) 的请求不吃窗口 — 即使开着 ⏱ 也逐条确认。
+    if (!mustCard && approver && isAutoWindowActive(approver)) {
       const remainSec = Math.ceil(autoWindowRemainingMs(approver) / 1000);
       log.info({ toolName, sessionId, chatKey: approver, remainSec }, "auto-window allow");
       json(res, 200, {
@@ -1744,9 +1756,9 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
       return;
     }
 
-    // Session cache (危险名单 / askRules 命中 / 守卫生效的请求同样不吃缓存)
+    // Session cache (mustCard 的请求同样不吃缓存)
     const ck = cacheKey(sessionId, toolName, toolInput);
-    const cached = danger || mustCard ? undefined : cacheGet(ck);
+    const cached = mustCard ? undefined : cacheGet(ck);
     if (cached) {
       log.info({ ck, cached }, "cache hit");
       json(res, 200, {
@@ -1878,16 +1890,27 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
           });
         } catch { /* best-effort */ }
       }
+      // 命中危险名单的调用同理: danger 与 askRules 同层, allow 规则压不过它。
+      // 危险卡上本就没有「总是」按钮, 这里是防御性兜底 (决策可能来自 sweep / 旧卡)。
+      if (!askBlocked && danger) {
+        await notify(
+          approver,
+          `⚠️ 该操作命中危险名单「${danger.rule}」，不支持「总是」：这类操作每次都要单独确认。`
+            + `本次已放行。如确要长期免审，请在 config.jsonc 的 \`approval.danger.allowPatterns\` 里加豁免正则。`,
+        );
+      }
       // 守卫生效的调用同理: 规则存了也永远被守卫压过 (且放行它就等于放回死锁),
       // 只做一次性放行并说明为什么「总是」在这里不成立。
-      if (!askBlocked && guardActive) {
+      if (!askBlocked && !danger && guardActive) {
         await notify(
           approver,
           `⚠️ \`.claude/**\` 写操作不支持「总是」：这类改动会触发 CLI 原生确认框，`
             + `而那个框只有在你点过卡之后才能被代按 —— 免审就等于回到静默死锁。本次已放行。`,
         );
       }
-      const gen = askBlocked || guardActive ? [] : alwaysAllowRulesFor(toolName, toolInput, cfg.approval.allowRules);
+      const gen = askBlocked || danger || guardActive
+        ? []
+        : alwaysAllowRulesFor(toolName, toolInput, cfg.approval.allowRules);
       const added = gen.filter((r) => !cfg.approval.allowRules.includes(r));
       if (added.length > 0) {
         cfg.approval.allowRules.push(...added); // 同步热生效; 文件写入失败也不回滚
@@ -1907,7 +1930,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         } catch (e) {
           log.warn({ err: (e as Error).message }, "allow_always notice send failed");
         }
-      } else if (!askBlocked && !guardActive && gen.length === 0) {
+      } else if (!askBlocked && !danger && !guardActive && gen.length === 0) {
         // 生成不了可靠字面规则 — 本次一次性放行并告知。成因有四种, 文案必须指对
         // 排查方向: 曾把 `ls … 2>&1 | head` 的分段失败笼统报成"引号/结构"问题,
         // 用户照着查引号自然查不出东西 (真凶是 fd 重定向的 & 被当成后台执行符)。
