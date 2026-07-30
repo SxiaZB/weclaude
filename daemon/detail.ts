@@ -137,7 +137,7 @@ const detailRoot = (publicBase: string, fallbackHost: string, fallbackPort: numb
       : `http://${resolvePublicHost(fallbackHost)}:${fallbackPort}`;
 
 const detailParams = (id: string): string =>
-  new URLSearchParams({ id, forceInnerBrowser: "1", ww_vw: "1000", ww_vh: "800" }).toString();
+  new URLSearchParams({ id, forceInnerBrowser: "1", ww_vw: "1000", ww_vh: "800", ww_uniq: "1" }).toString();
 
 export const buildDetailUrl = (
   publicBase: string,
