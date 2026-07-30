@@ -240,6 +240,35 @@ t("fd 重定向: 带重定向的命令点「总是」能生成规则", () => {
   assert.deepEqual(alwaysAllowRulesFor("Bash", bash("npm run dev &")), []);
 });
 
+// ── 纯变量赋值段 ────────────────────────────────────────────────────────
+// `f=a.jsonl` 这种整段都是赋值的段曾被判为"未覆盖段" → 整条命令发卡, 且点「总是」
+// 一条规则都存不下 (实战回归: f=a.jsonl; cat $f 命中不了 Bash(cat *))。
+t("纯赋值段: 不阻断放行(实战回归)", () => {
+  assert.equal(ruleAllows(["Bash(cat *)"], "Bash", bash("f=a.jsonl; cat $f")), "Bash(cat *)");
+  assert.ok(ruleAllows(["Bash(cat *)", "Bash(head *)"], "Bash", bash("f=a.jsonl; cat $f | head -3")));
+  assert.ok(ruleAllows(["Bash(cd *)", "Bash(cat *)"], "Bash", bash("cd /tmp && f=a.jsonl; cat $f")));
+  assert.ok(ruleAllows(["Bash(cat *)"], "Bash", bash("A=1 B=2; cat a.txt")));
+});
+t("纯赋值段: 点「总是」能生成规则且闭环", () => {
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("f=a.jsonl; cat $f")), ["Bash(cat *)"]);
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("cd /tmp && f=x; cat $f")), ["Bash(cd /tmp *)", "Bash(cat *)"]);
+  const cmd = "f=a.jsonl; cat $f | head -3";
+  const rules = alwaysAllowRulesFor("Bash", bash(cmd));
+  assert.ok(ruleAllows(rules, "Bash", bash(cmd)), `generated rules should allow original: ${rules.join(", ")}`);
+});
+t("纯赋值段: 赋值里的命令替换仍不放行", () => {
+  assert.equal(ruleAllows(["Bash(cat *)"], "Bash", bash("f=$(evil); cat $f")), undefined);
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("f=$(evil); cat $f")), []);
+});
+t("纯赋值段: 真正的空段仍保守拒绝(不被放宽)", () => {
+  assert.equal(ruleAllows(["Bash(a *)", "Bash(b *)"], "Bash", bash("a && && b")), undefined);
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("a && && b")), []);
+});
+t("纯赋值段: 通篇只有赋值时不作放行凭据", () => {
+  assert.equal(ruleAllows(["Bash(cat *)"], "Bash", bash("f=a.jsonl")), undefined);
+  assert.deepEqual(alwaysAllowRulesFor("Bash", bash("f=a.jsonl")), []);
+});
+
 // ── heredoc 剥离 ────────────────────────────────────────────────────────
 t("heredoc: 带引号 heredoc 正文不参与匹配(写报告场景)", () => {
   const cmd = "cat > /tmp/report.txt <<'EOF'\nh2. 标题 | 内容; rm -rf x\n$(fake)\nEOF";
