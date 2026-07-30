@@ -163,9 +163,9 @@ server.registerTool(
 // rotates claude's sessionId in the same pane; the daemon never sees it
 // and the pane stays in the old cwd.
 server.registerTool(
-  "cd",
+  "enter",
   {
-    title: "Bind project path to current chat",
+    title: "Enter project directory",
     description:
       "Persist a project cwd binding for the WeCom chat that mirrors this Claude session. To apply: send `/clear` or `/new` FROM THE WECOM SIDE — only WeCom-originated commands flow through the daemon's dispatch which kills+respawns the pane in the new cwd. A `/clear` typed in the local Claude REPL does NOT apply the cwd switch; it only rotates the sessionId in the existing pane (still in the old directory). Use absolute paths (or paths starting with ~).",
     inputSchema: {

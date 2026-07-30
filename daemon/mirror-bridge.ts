@@ -3139,7 +3139,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (pending && pending !== running) {
       lines.push(`下次切换: \`${pending}\` (使用 /new 或 /clear 生效)`);
     }
-    lines.push("> 切换其他项目: 在对话中告诉 AI 调用 `cd` MCP 工具");
+    lines.push("> 切换其他项目: 在对话中告诉 AI 调用 `enter` MCP 工具");
     // Session-boundary footer — `/new` and `/clear` are the only two callers,
     // so the tip lands exactly once per fresh context, never mid-conversation.
     lines.push(randomTip());
