@@ -175,6 +175,12 @@ const Danger = z.object({
 
 const Approval = z.object({
   enabled: z.boolean().default(true),
+  // 审批粒度:
+  //   "all"    — 每个命中 matcher 的工具调用都发卡 (默认, 现状)。
+  //   "danger" — 只有命中危险名单 (approval.danger) 的调用才发卡, 其余静默 allow。
+  //              名单被关掉 (danger.enabled=false) 时该模式自动退回 "all" —— 否则
+  //              就成了「全放行」, 与 approval.enabled=false 语义重合且更隐蔽。
+  mode: z.enum(["all", "danger"]).default("all"),
   matcher: z.string().default(".*"),
   approvers: z.array(z.string()).default([]),
   hookTimeoutSec: z.number().int().positive().default(43210),

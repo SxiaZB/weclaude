@@ -97,6 +97,13 @@ const commandsOf = (input: unknown): string[] => {
 // 路径类入参: 只看看起来像路径的字符串, 避免拿正文去撞路径规则。
 const pathish = (s: string): boolean => s.length < 512 && /^[~$/.]|\//.test(s);
 
+/**
+ * danger 模式下这次调用是否可以免卡直接放行。
+ * 名单关掉时不生效 (退回全量审批) —— 「模式=danger + 名单=off」不该等于全放行。
+ */
+export const dangerModeSkips = (cfg: Config, hit: DangerHit | undefined): boolean =>
+  cfg.approval.mode === "danger" && cfg.approval.danger.enabled && !hit;
+
 /** 判定一次工具调用是否落在危险名单里。undefined = 安全。 */
 export const dangerOf = (cfg: Config, toolName: string, toolInput: unknown): DangerHit | undefined => {
   const d = cfg.approval.danger;

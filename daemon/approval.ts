@@ -22,7 +22,7 @@ import {
   getWindowMeta,
 } from "./session-cache.js";
 import { redact } from "./redact.js";
-import { dangerOf, type DangerHit } from "./danger.js";
+import { dangerOf, dangerModeSkips, type DangerHit } from "./danger.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
@@ -1554,6 +1554,12 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
     // 危险名单: 命中者跳过 auto-window / session cache / 批量合流, 每次都单独发卡。
     const danger: DangerHit | undefined = dangerOf(cfg, toolName, toolInput);
     if (danger) log.info({ toolName, sessionId, rule: danger.rule }, "danger hit — forcing single approval");
+
+    // danger 模式: 名单之外的调用不打扰人, 直接放行 (卡只留给真正危险的操作)。
+    if (dangerModeSkips(cfg, danger)) {
+      json(res, 200, { decision: "allow", reason: "danger_mode_skip" } satisfies ApproveResp);
+      return;
+    }
 
     // Auto-approve window: while active for THIS chat, requests short-circuit to allow.
     if (!danger && approver && isAutoWindowActive(approver)) {

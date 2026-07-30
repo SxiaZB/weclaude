@@ -62,6 +62,7 @@
   // ── PreToolUse approval (all tools → button card; align with auth-helper) ─
   "approval": {
     "enabled": true,
+    "mode": "all",               // all = 每次调用都发卡；danger = 只有命中下面危险名单的才发卡，其余静默放行
     "matcher": ".*",             // 全量拦截；Bash 只读命令(grep/ls/cat/...)走脚本 fast-path
     "approvers": [],             // ["user:zhangsan"] empty → defaultChat
     "hookTimeoutSec": 43210,     // hook curl --max-time (12h + 10s)
