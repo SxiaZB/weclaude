@@ -1390,11 +1390,12 @@ interface ApproveResp {
 
 const decisionToHook = (d: Decision): "allow" | "deny" => (d === "deny" ? "deny" : "allow");
 
-// 危险操作永不走 fallbackOnError:"allow" — 超时/断线时降级为 ask, 交回本地 CLI
-// 由人来确认, 而不是静默放行一次 rm。
-const fallback = (cfg: Config, reason: string, danger?: unknown): ApproveResp => ({
-  decision: danger && cfg.approval.fallbackOnError === "allow" ? "ask" : cfg.approval.fallbackOnError,
-  reason: danger ? `${reason}:danger` : reason,
+// 必发卡的请求 (危险名单 / askRules / `.claude/**` 守卫) 永不走 fallbackOnError:
+// "allow" — 超时/断线时降级为 ask, 交回本地 CLI 由人来确认, 而不是静默放行一次
+// rm。只判 danger 的话, 用户自己配的 askRules 在 daemon 挂掉时反而失效。
+const fallback = (cfg: Config, reason: string, forceSingle?: unknown): ApproveResp => ({
+  decision: forceSingle && cfg.approval.fallbackOnError === "allow" ? "ask" : cfg.approval.fallbackOnError,
+  reason: forceSingle ? `${reason}:force_single` : reason,
 });
 
 interface ApprovalDeps {
@@ -1770,12 +1771,12 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
 
     if (!approver) {
       log.warn("no approver configured");
-      json(res, 200, fallback(cfg, "no_approver", danger) satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "no_approver", mustCard) satisfies ApproveResp);
       return;
     }
     if (!client.isConnected) {
       log.warn("ws not connected");
-      json(res, 200, fallback(cfg, "ws_disconnected", danger) satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "ws_disconnected", mustCard) satisfies ApproveResp);
       return;
     }
 
@@ -1805,6 +1806,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         transcriptTail,
         danger: danger?.rule,
         cardSent: Boolean(resumeId), // 续接的前提就是卡已经在群里
+        forceSingle: mustCard,
       },
       timeoutMs: longPollMs,
       reqId: resumeId || undefined,
@@ -1825,8 +1827,9 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     // 续接的请求不再进 batch: 卡已经在群里, 重发就是重复轰炸。
     const member: BatchMember = { reqId, toolInput: display, originalToolInput: toolInput, toolInputStr, cwd, transcriptTail };
     const bk = batchKeyOf(sessionId, toolName);
-    // 危险请求既不 join 也不被 join — 一次危险操作 = 一张卡 = 一次点击。
-    const existing = danger ? undefined : activeBatches.get(bk);
+    // 必发卡请求既不 join 也不被 join — 一次这样的操作 = 一张卡 = 一次点击。
+    // 合流会把它塞进带「⏱全过 / ✅总是」的批量卡, 一次点击就连它一起放行了。
+    const existing = mustCard ? undefined : activeBatches.get(bk);
     if (resumeId) {
       // no-op: 直接进下面的长轮询, 等旧卡上的点击。
     } else if (existing && !existing.flushed) {
@@ -1844,10 +1847,10 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         flushed: false,
         flushTimer: undefined as unknown as NodeJS.Timeout, // set below
       };
-      const coalesceMs = danger ? 0 : cfg.approval.batchCoalesceMs;
+      const coalesceMs = mustCard ? 0 : cfg.approval.batchCoalesceMs;
       const fire = (): void => void flushBatch(batch);
       batch.flushTimer = coalesceMs > 0 ? setTimeout(fire, coalesceMs) : setImmediate(fire) as unknown as NodeJS.Timeout;
-      if (!danger) activeBatches.set(bk, batch);
+      if (!mustCard) activeBatches.set(bk, batch);
       batchById.set(batch.batchId, batch);
       evictBatches();
       log.info({ batchId: batch.batchId, reqId, coalesceMs }, "batch opened");
@@ -1866,13 +1869,13 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         return;
       }
       log.warn({ err: (e as Error).message, reqId }, "approval timed out");
-      json(res, 200, fallback(cfg, "approver_timeout", danger) satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "approver_timeout", mustCard) satisfies ApproveResp);
       return;
     }
 
-    // 危险决策一律不留痕: 不写 session cache、不开自动窗口 (卡上本就没这两个
+    // 必发卡的决策一律不留痕: 不写 session cache、不开自动窗口 (卡上本就没这两个
     // 按钮, 这里是防御性兜底 —— 决策也可能来自 sweep / 旧卡)。
-    if (!danger && decision === "allow_session" && cfg.approval.sessionCacheMinutes > 0) {
+    if (!mustCard && decision === "allow_session" && cfg.approval.sessionCacheMinutes > 0) {
       cachePut(ck, decision, cfg.approval.sessionCacheMinutes * 60_000);
     }
     // 「✅ 总是」: 由本次调用生成规则, 热生效 + 写回 config.jsonc (对齐 Claude
@@ -1881,7 +1884,8 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     if (decision === "allow_always") {
       // 命中 askRules 的调用: allow 规则永远会被 ask 压过, 存了也是死规则 —
       // 提示用户真实的生效路径, 而不是静默写入一条不生效的配置。
-      const askBlocked = ruleMatchesAny(cfg.approval.askRules, toolName, toolInput);
+      // (askHit 在本次请求入口已算过, 同参数同结果, 不重复调用 ruleMatchesAny。)
+      const askBlocked = askHit;
       if (askBlocked) {
         try {
           await client.sendMessage(targetChatId(approver), {
