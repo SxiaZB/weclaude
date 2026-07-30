@@ -46,6 +46,16 @@ const stripEnvPrefix = (segment: string): string => {
   return toks.slice(i).join(" ");
 };
 
+// 纯变量赋值段 (`f=a.jsonl`, `A=1 B=2`): 赋值后没有跟命令, 这一段不执行任何东西 →
+// 无害, 逐段校验与规则生成都应当**跳过**它, 不能当成"未覆盖段"发卡 (实战回归:
+// `f=a.jsonl; cat $f` 明明有 Bash(cat *) 也要发卡, 且点「总是」一条规则都存不下)。
+// 与"真正的空段"(`a && && b` 切出来的段) 严格区分: 后者剥离前就是空的, 属异常输入,
+// 继续走保守路径。`f=$(cmd)` / 反引号形式在更早处已被 HAS_SUBSTITUTION 整体挡下。
+const isPureAssignment = (segment: string): boolean => {
+  const s = norm(segment);
+  return s !== "" && stripEnvPrefix(s) === "";
+};
+
 const bashSpecMatches = (spec: string, segment: string): boolean => {
   const seg = stripEnvPrefix(norm(segment));
   if (!seg) return false;
@@ -200,6 +210,7 @@ const bashCommandAllowed = (
   }
   const hits: string[] = [];
   for (const [i, seg] of segments.entries()) {
+    if (isPureAssignment(seg)) continue; // 纯赋值段无执行能力, 不计入未命中
     // 空段 (如 "a && && b") 视为异常, 交回发卡
     if (!seg) return { allowed: false, reason: { kind: "unparsable" } };
     let matched: string | undefined;
@@ -227,7 +238,10 @@ const bashCommandAllowed = (
     }
     hits.push(matched);
   }
-  return { allowed: true, hits };
+  // 全是赋值段 (`f=1; g=2`): 没有任何段被规则覆盖过, 不作放行凭据, 保守发卡。
+  return hits.length > 0
+    ? { allowed: true, hits }
+    : { allowed: false, reason: { kind: "unparsable" } };
 };
 
 /**
@@ -364,6 +378,7 @@ export const alwaysAllowRulesFor = (
   if (segments === undefined) return []; // 引号未闭合/孤立 &, 不生成
   const rules: string[] = [];
   for (const rawSeg of segments) {
+    if (isPureAssignment(rawSeg)) continue; // 纯赋值段不执行命令, 无需为它生成规则
     const seg = stripEnvPrefix(norm(rawSeg));
     if (!seg) return []; // 空段异常, 整体放弃生成
     // 已被现有规则覆盖的段不再生成 (避免 `Bash(cd service *)` 这类冗余堆积)
