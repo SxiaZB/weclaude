@@ -1467,7 +1467,8 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
 
   const notify = async (approver: string, content: string): Promise<void> => {
     try {
-      await client.sendMessage(targetChatId(approver), { msgtype: "markdown", markdown: { content } });
+      // withTagHeader: 同一 chat 可能并行跑着多个 `#tag` 会话, 裸消息看不出归属。
+      await client.sendMessage(targetChatId(approver), { msgtype: "markdown", markdown: { content: withTagHeader(approver, content) } });
     } catch (e) {
       log.warn({ err: (e as Error).message }, "notify send failed");
     }
@@ -1887,12 +1888,10 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
       // (askHit 在本次请求入口已算过, 同参数同结果, 不重复调用 ruleMatchesAny。)
       const askBlocked = askHit;
       if (askBlocked) {
-        try {
-          await client.sendMessage(targetChatId(approver), {
-            msgtype: "markdown",
-            markdown: { content: `⚠️ 该命令命中强制审批规则 \`${askBlocked}\`（askRules 优先于放行规则），「总是」不会生效，本次已放行。如确要永久放行，需从 config.jsonc 的 askRules 移除该规则。` },
-          });
-        } catch { /* best-effort */ }
+        await notify(
+          approver,
+          `⚠️ 该命令命中强制审批规则 \`${askBlocked}\`（askRules 优先于放行规则），「总是」不会生效，本次已放行。如确要永久放行，需从 config.jsonc 的 askRules 移除该规则。`,
+        );
       }
       // 命中危险名单的调用同理: danger 与 askRules 同层, allow 规则压不过它。
       // 危险卡上本就没有「总是」按钮, 这里是防御性兜底 (决策可能来自 sweep / 旧卡)。
@@ -1926,14 +1925,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
           }
         }
         log.info({ toolName, added, persisted: Boolean(sourcePath) }, "allow_always rules saved");
-        try {
-          await client.sendMessage(targetChatId(approver), {
-            msgtype: "markdown",
-            markdown: { content: `📌 已保存永久放行规则：${added.map((r) => `\`${r}\``).join("、")}` },
-          });
-        } catch (e) {
-          log.warn({ err: (e as Error).message }, "allow_always notice send failed");
-        }
+        await notify(approver, `📌 已保存永久放行规则：${added.map((r) => `\`${r}\``).join("、")}`);
       } else if (!askBlocked && !danger && !guardActive && gen.length === 0) {
         // 生成不了可靠字面规则 — 本次一次性放行并告知。成因有四种, 文案必须指对
         // 排查方向: 曾把 `ls … 2>&1 | head` 的分段失败笼统报成"引号/结构"问题,
@@ -1948,12 +1940,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
             : splitSegments(cmdStr) === undefined
               ? "该命令含未闭合引号或后台执行符 `&`，无法安全分段"
               : "该命令的结构提炼不出可靠前缀（异形段首、或解释器头部拿不到子命令）";
-        try {
-          await client.sendMessage(targetChatId(approver), {
-            msgtype: "markdown",
-            markdown: { content: `📌 ${why}，本次已一次性放行（未保存规则）。` },
-          });
-        } catch { /* best-effort */ }
+        await notify(approver, `📌 ${why}，本次已一次性放行（未保存规则）。`);
       }
     }
     if (!danger && decision === "allow_window" && cfg.approval.windowMinutes > 0) {
