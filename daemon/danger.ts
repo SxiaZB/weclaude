@@ -104,6 +104,10 @@ const pathish = (s: string): boolean => s.length < 512 && /^[~$/.]|\//.test(s);
 export const dangerModeSkips = (cfg: Config, hit: DangerHit | undefined): boolean =>
   cfg.approval.mode === "danger" && cfg.approval.danger.enabled && !hit;
 
+/** danger.skip: 命中危险名单也免卡直接放行 (显式的「跳过 danger」)。 */
+export const dangerSkips = (cfg: Config, hit: DangerHit | undefined): boolean =>
+  !!hit && cfg.approval.danger.skip;
+
 /** 判定一次工具调用是否落在危险名单里。undefined = 安全。 */
 export const dangerOf = (cfg: Config, toolName: string, toolInput: unknown): DangerHit | undefined => {
   const d = cfg.approval.danger;

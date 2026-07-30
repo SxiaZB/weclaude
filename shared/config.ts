@@ -165,6 +165,10 @@ const Wrc = z.object({
 // patterns 都是 JS 正则源码串, 大小写不敏感; allowPatterns 优先级最高。
 const Danger = z.object({
   enabled: z.boolean().default(true),
+  // true = 命中危险名单也直接放行 (显式的「跳过 danger」开关)。相当于对危险操作
+  // 完全免卡 —— 与 enabled=false 的区别: 名单仍会计算 (日志/redact 用得到),
+  // 只是不再拦。默认 false。
+  skip: z.boolean().default(false),
   // false = 丢掉内置名单, 只用下面三组自定义规则。
   builtin: z.boolean().default(true),
   commandPatterns: z.array(z.string()).default([]),
