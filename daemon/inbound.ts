@@ -199,6 +199,7 @@ const renderHelp = (): string =>
     "`每天 08:30 广播 <topic> <内容>`",
     "`取消广播 <topic>`",
     "`订阅列表` · `广播列表`",
+    "AI 也可用 MCP 工具 `subscribe_topic` / `broadcast_topic` 自主订阅与广播。",
     "",
     "▎引用 (quote)",
     "引用消息 + 新文字：被引用内容作为上下文前缀附在你的话前。",

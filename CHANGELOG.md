@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Added
+- `mcp`: 新增 `subscribe_topic` / `broadcast_topic` tool — agent 自主订阅 topic 与广播,与 IM 命令「订阅」「广播」共用同一订阅表。
 - `mcp`: 新增 `handoff` tool — 原地把一个 pane 的会话交接给全新会话。
 - `mirror`: prompt-cache 保活心跳 — 空闲 pane 在缓存过期前廉价续命；心跳记入 chat detail，留痕含真实 cache-read usage。
 - `approval`: 新增 `danger.skip` — 命中危险名单也免卡直接放行。

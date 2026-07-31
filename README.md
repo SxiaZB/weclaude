@@ -19,7 +19,7 @@
 
 ![demo](images/demo.png)
 
-| 功能 | 说明 |
+| 功能<img width="160"> | 说明 |
 | --- | --- |
 | 🛎 **远程审批** | Claude 要跑 `Bash` / `Edit`？审批卡片直推 IM，点 ✅/❌/⏱（放行 N 分钟）。 |
 | 📋 **计划审批** | Claude 在 plan mode 结束（`ExitPlanMode`）时，把计划摘要 + 审批卡推到 IM：点 ✅同意 退出 plan mode 开始执行，或 ✏️继续改 留在 plan mode 继续完善。`AskUserQuestion` 多选题也镜像为投票卡。 |
@@ -237,6 +237,8 @@ curl -sS -X POST http://127.0.0.1:17890/wedoc/invalidate -H 'content-type: appli
 ```
 
 典型用法：在群 A 说 `订阅 sync-daily`，在群 B 说 `每天8点广播 sync-daily 内容：早会 10 分钟后开始`——第二天早 8 点群 A 自动收到。
+
+**MCP 工具**（Claude 自主订阅 / 广播）：`subscribe_topic(topic)` 把当前会话所在的聊天注册进某 topic 的订阅表；`broadcast_topic(topic, markdown)` 把内容扇出给所有订阅者，返回 `sent / failed / subs`。与上面的 IM 命令共用同一份订阅表（`config.jsonc` 的 `topics.subs`），所以你说「订阅 xxx」和 AI 调 `subscribe_topic` 完全等价。这样一个 agent 可以在跑完任务后自己广播结果，无需人工在群里敲命令。
 
 **外部触发**（CI / 监控 / 脚本）：
 

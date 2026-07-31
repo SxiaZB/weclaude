@@ -521,5 +521,47 @@ server.registerTool(
     ),
 );
 
+// ── Topic pub/sub (注册订阅 + 广播) ────────────────────────────────────────
+// A lightweight event bus layered on WeCom chats: a session registers its chat
+// as a subscriber of a named topic, anyone broadcasts to every subscriber at
+// once. Same store the IM commands「订阅」/「广播」use — persisted to config.jsonc
+// (`topics.subs`), surviving daemon reloads. subscribe resolves the caller's
+// chat via selfRef; broadcast is subscriber-agnostic, so it hits the shared
+// /publish route directly.
+server.registerTool(
+  "subscribe_topic",
+  {
+    title: "Subscribe this chat to a topic",
+    description:
+      "Register the CURRENT WeCom chat (the one mirroring this session) as a subscriber of a named topic, so it receives every future broadcast_topic push and scheduled daily broadcast on that topic. Equivalent to the user typing 「订阅 <topic>」 in the chat, but driven by the agent. Topics are free-form event names (e.g. 'ci-fail', 'daily-report'); subscriptions persist across daemon reloads. Use when the user says 「订阅 xxx」/「注册到 xxx 事件」/「以后 xxx 的消息也发这个群」. Returns `added` (false if already subscribed) and the topic's current subscriber count.",
+    inputSchema: {
+      topic: z.string().describe("Topic name to subscribe to, e.g. 'ci-fail'. Free-form: letters / digits / CJK / - / _ / . , no whitespace."),
+    },
+  },
+  async ({ topic }) => unwrap("subscribe_topic", await daemonPost("/topics/subscribe", { topic })),
+);
+
+server.registerTool(
+  "broadcast_topic",
+  {
+    title: "Broadcast a message to a topic's subscribers",
+    description:
+      "Fan a markdown message out to EVERY chat/session subscribed to the given topic. Equivalent to 「广播 <topic> <内容>」. Each subscriber receives it as a normal WeCom bubble in its own channel (tagged sessions get their `#tag` header). Returns `sent` / `failed` / `subs` so you know the reach. Use when the user says 「广播 xxx」/「给订阅 xxx 的都发一下」, or an agent needs to notify a fleet of sessions at once. For a private nudge into ONE peer session, use send_peer instead.",
+    inputSchema: {
+      topic: z.string().describe("Topic to publish to. Subscribers are whoever ran subscribe_topic / 「订阅」 on this topic."),
+      markdown: z.string().describe("Message body in WeCom markdown."),
+    },
+  },
+  async ({ topic, markdown }) => {
+    const resp = await fetch(`${DAEMON_BASE}/publish`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ topic, markdown }),
+    });
+    const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+    return j.ok ? ok(j) : fail(`broadcast_topic failed: ${j.error ?? `http ${resp.status}`}`);
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

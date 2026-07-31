@@ -24,7 +24,7 @@ import {
 import { makeWedocBridge } from "./wedoc.js";
 import { installResponseTracker } from "./last-response.js";
 import { scanClaudeSessions } from "./session-scan.js";
-import { startScheduler, publish as publishTopic } from "./topics.js";
+import { startScheduler, publish as publishTopic, subscribe as subscribeTopic } from "./topics.js";
 import { baseOfKey, keyOf } from "../shared/session-label.js";
 import {
   startGraph,
@@ -475,6 +475,19 @@ const main = async (): Promise<void> => {
       json(res, inj2.ok ? 200 : 502, inj2.ok
         ? { ok: true, target, brief }
         : { ok: false, target, brief, reason: `handoff carry inject failed: ${inj2.reason}` });
+    });
+
+    // POST /topics/subscribe — 把调用方所在的会话(chat)注册到某 topic 的订阅表。
+    // 与 IM 命令「订阅 <topic>」等价,只是走 MCP 让 agent 能自主订阅。self 复用
+    // peer 路由的解析链(target → sessionId → tmuxPane → defaultChat)。广播本身
+    // 是订阅者无关的,直接复用全局 POST /publish,不在这里另开。
+    http.register("POST /topics/subscribe", async (req, res) => {
+      const { self, body } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const topic = ((body as { topic?: string }).topic ?? "").trim();
+      if (!topic) { json(res, 400, { ok: false, reason: "topic required" }); return; }
+      const r = subscribeTopic(cfg, sourcePath, topic, self);
+      json(res, 200, { ok: true, ...r, topic, target: self, subs: (cfg.topics.subs[topic] ?? []).length });
     });
 
     // POST /graph/run — declare a loop graph over this chat's tagged sessions
