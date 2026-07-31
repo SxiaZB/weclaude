@@ -543,6 +543,23 @@ const main = async (): Promise<void> => {
       json(res, 200, { ok: true, topic, removed });
     });
 
+    // POST /config/set — modify daemon config from MCP
+    http.register("POST /config/set", async (req, res) => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as { key?: string; value?: unknown; action?: string };
+      const { configSet } = await import("./config-api.js");
+      const r = configSet(cfg, sourcePath, body.key, body.value, body.action);
+      json(res, r.ok ? 200 : 400, r);
+    });
+
+    http.register("POST /config/get", async (req, res) => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as { key?: string };
+      const { configGet } = await import("./config-api.js");
+      const r = configGet(cfg, body.key);
+      json(res, r.ok ? 200 : 400, r);
+    });
+
     // POST /graph/run — declare a loop graph over this chat's tagged sessions
     // and start walking it. Fire-and-forget: returns a runId immediately, then
     // narrates progress into the chat while it advances.

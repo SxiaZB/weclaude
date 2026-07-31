@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.2.4] - 2026-07-31
+
+### Added
+- `mcp`: 新增 `config_set` tool — 在对话中直接读写 wezard 配置（allowFrom、审批时间窗口、danger skip、cwd、log level 等），无需手动编辑 config.jsonc。
+
 ## [1.2.3] - 2026-07-31
 
 ### Fixed
@@ -83,6 +88,7 @@
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
 [Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.3...HEAD
+[1.2.4]: https://github.com/guxi11/wezard/compare/v1.2.3...v1.2.4
 [1.2.3]: https://github.com/guxi11/wezard/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/guxi11/wezard/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/guxi11/wezard/compare/v1.2.0...v1.2.1

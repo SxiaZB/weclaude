@@ -617,5 +617,34 @@ server.registerTool(
   async ({ topic }) => unwrap("cancel_broadcast", await daemonPost("/topics/cancel-schedule", { topic })),
 );
 
+// ── Config ──────────────────────────────────────────────────────────
+server.registerTool(
+  "config_set",
+  {
+    title: "Wezard config",
+    description:
+      "Read or modify wezard daemon configuration. Supported keys: allow_from (add/remove authorized chats/users), approval_window (auto-approve window minutes), approval_cache (session decision cache minutes), danger_skip (skip dangerous-op gating), danger_enabled (toggle danger detection), approval_mode (all|danger), cwd (default workspace), default_chat (outbound target), log_level (trace|debug|info|warn|error). Use action='add'/'remove' for array keys (allow_from), 'set' for scalars. Keywords: 设置、配置、cfg、wezard、allowFrom、授权、自动通过、时间窗口、danger skip、workspace.",
+    inputSchema: {
+      key: z
+        .enum(["allow_from", "approval_window", "approval_cache", "danger_skip", "danger_enabled", "approval_mode", "cwd", "default_chat", "log_level"])
+        .describe("Config key to read or modify."),
+      value: z
+        .string()
+        .optional()
+        .describe("New value. Omit to read current value. For booleans: 'true'/'false'. For arrays with action=set: JSON array string."),
+      action: z
+        .enum(["set", "add", "remove"])
+        .optional()
+        .describe("For array keys (allow_from): 'add' appends, 'remove' deletes an item. Scalars always use 'set'. Default: 'set'."),
+    },
+  },
+  async ({ key, value, action }) => {
+    if (value === undefined) {
+      return unwrap("config_set", await daemonPost("/config/get", { key }));
+    }
+    return unwrap("config_set", await daemonPost("/config/set", { key, value, action: action ?? "set" }));
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
