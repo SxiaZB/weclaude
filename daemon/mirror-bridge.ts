@@ -1629,10 +1629,16 @@ interface AttachState {
    *  `pinging` guards the inject→settle window; `pingMtime` is the mtime at
    *  inject time, used to distinguish "ping written" from "ping not yet seen". */
   keepalive?: { count: number; settledMtime: number; pinging: boolean; pingMtime: number };
-  /** While set, onItem swallows the entire keepalive ping turn (no bubble, no
-   *  detail, no usage), closing on the turn's terminal signal. The timer is a
-   *  fail-safe so a ping that never emits turn_end can't mute a later real turn. */
+  /** While set, onItem swallows the keepalive ping turn from every WeCom path
+   *  (no bubble, no live stream), closing on the turn's terminal signal. The
+   *  timer is a fail-safe so a ping that never emits turn_end can't mute a later
+   *  real turn. */
   keepaliveQuiet?: NodeJS.Timeout;
+  /** Detail-store turn id for the in-flight keepalive. The ping is kept OUT of
+   *  chat but recorded into chat-detail as a marked turn — its real usage
+   *  (cache-read snapshot) is routed here from the swallowed turn_usage items,
+   *  so the timeline shows the ping happened and proves it was a cheap read. */
+  keepaliveTurnId?: string;
 }
 
 // Mirror outbound state machine. See plan: defer stream open by N ms; flush
@@ -2350,10 +2356,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   };
 
   const onItem = (a: AttachState, item: RenderItem): void => {
-    // Keepalive ping turns are pure cache-warmers: swallow every item so the
-    // ping/pong never reaches chat, the detail store, or usage accounting. Close
-    // the window on the turn's terminal signal (hard or soft turn_end).
+    // Keepalive ping turns are pure cache-warmers: swallow every item from the
+    // WeCom paths so the ping/pong never reaches chat. But route the ping's real
+    // usage into its chat-detail turn (proof it was a cheap cache-read) and close
+    // that turn on the terminal signal (hard or soft turn_end).
     if (a.keepaliveQuiet) {
+      if (a.keepaliveTurnId) {
+        if (item.kind === "turn_usage") {
+          recordTurnUsage(a.keepaliveTurnId, { model: item.model, messageId: item.messageId, usage: item.usage });
+        } else if (item.kind === "turn_end") {
+          recordTurnClose(a.keepaliveTurnId);
+          a.keepaliveTurnId = undefined;
+        }
+      }
       if (item.kind === "turn_end") endKeepaliveQuiet(a);
       return;
     }
@@ -3457,9 +3472,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const kc = cfg.wrc.mirror.keepalive;
     // Suppress the pane→WeCom echo of the ping user line, then swallow the whole
     // ping turn (reply included). The 60s fail-safe clears the quiet window if
-    // the turn somehow never emits turn_end, so a later real turn is never muted.
+    // the turn somehow never emits turn_end, so a later real turn is never muted;
+    // it also closes the detail turn so it can't hang open in the chat timeline.
     rememberInject(kc.ping);
-    a.keepaliveQuiet = setTimeout(() => { a.keepaliveQuiet = undefined; }, 60_000);
+    a.keepaliveQuiet = setTimeout(() => {
+      a.keepaliveQuiet = undefined;
+      if (a.keepaliveTurnId) { recordTurnClose(a.keepaliveTurnId); a.keepaliveTurnId = undefined; }
+    }, 60_000);
     const r = await inject({
       text: kc.ping, images: [], cfg,
       log: log.child({ target: a.target, sessionId: a.sessionId, sub: "keepalive" }),
@@ -3472,12 +3491,18 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       log.warn({ target: a.target, reason: r.reason }, "keepalive: inject failed");
       return;
     }
-    log.info({ target: a.target, count: a.keepalive?.count }, "keepalive: ping injected");
-    if (kc.notify) {
-      const tokens = lastContextTokens(a.jsonlPath);
-      const size = tokens > 0 ? `~${fmtTokens(tokens)} tokens` : "未知";
-      sendStandalone(a, `❤️ 保活 · context ${size} · ${a.keepalive?.count ?? 1}/${kc.maxPings}`);
-    }
+    const n = a.keepalive?.count ?? 1;
+    const tokens = lastContextTokens(a.jsonlPath);
+    const size = tokens > 0 ? `~${fmtTokens(tokens)} tokens` : "未知";
+    log.info({ target: a.target, count: n, tokens }, "keepalive: ping injected");
+    // Record a marked turn into chat-detail — the ping stays out of chat, but the
+    // timeline shows it fired. Real usage is grafted on from the swallowed
+    // turn_usage items in onItem; closed on the ping's turn_end (or the fail-safe).
+    const turnId = newTurnId();
+    a.keepaliveTurnId = turnId;
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: `❤️ keepalive ${n}/${kc.maxPings}` });
+    recordTurnItem(turnId, { t: "text", body: `❤️ 保活心跳 · context ${size} · ${n}/${kc.maxPings}`, ts: Date.now(), final: true });
+    if (kc.notify) sendStandalone(a, `❤️ 保活 · context ${size} · ${n}/${kc.maxPings}`);
   };
 
   let keepaliveTicking = false;
