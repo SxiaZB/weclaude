@@ -1,136 +1,35 @@
 <svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <!-- WeCom-blue night sky: bright blue top-left → deep indigo bottom -->
-    <linearGradient id="bg" x1="80" y1="24" x2="440" y2="500" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#2F73E8"/>
-      <stop offset="0.5" stop-color="#1B4BB5"/>
-      <stop offset="1" stop-color="#0A2160"/>
-    </linearGradient>
-    <radialGradient id="nebula" cx="0.74" cy="0.22" r="0.7">
-      <stop offset="0" stop-color="#7FC8FF" stop-opacity="0.35"/>
-      <stop offset="0.6" stop-color="#7FC8FF" stop-opacity="0"/>
-    </radialGradient>
-    <radialGradient id="nebula2" cx="0.2" cy="0.82" r="0.6">
-      <stop offset="0" stop-color="#8A5BFF" stop-opacity="0.30"/>
-      <stop offset="0.7" stop-color="#8A5BFF" stop-opacity="0"/>
-    </radialGradient>
+    <!-- 5-point sharp star -->
+    <path id="star" d="M 0 -7 L 1.572 -2.163 L 6.657 -2.163 L 2.543 0.826 L 4.114 5.663 L 0 2.674 L -4.114 5.663 L -2.543 0.826 L -6.657 -2.163 L -1.572 -2.163 Z"/>
 
-    <!-- mysterious wizard-purple: deep indigo shadow → violet highlight -->
-    <linearGradient id="hat" x1="170" y1="70" x2="330" y2="360" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#7C56D8"/>
-      <stop offset="0.5" stop-color="#5B37B3"/>
-      <stop offset="1" stop-color="#3A2080"/>
-    </linearGradient>
-    <linearGradient id="hatLight" x1="210" y1="120" x2="300" y2="330" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#9B7BE8" stop-opacity="0.9"/>
-      <stop offset="1" stop-color="#9B7BE8" stop-opacity="0"/>
-    </linearGradient>
-    <linearGradient id="brim" x1="110" y1="330" x2="402" y2="398" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#5A38AE"/>
-      <stop offset="0.5" stop-color="#452A8C"/>
-      <stop offset="1" stop-color="#301C66"/>
-    </linearGradient>
-    <linearGradient id="gold" x1="186" y1="292" x2="326" y2="336" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#FFE08A"/>
-      <stop offset="0.5" stop-color="#F5C542"/>
-      <stop offset="1" stop-color="#D99A22"/>
-    </linearGradient>
+    <!-- bare hat silhouette: cone with razor tip curling up-right + wide brim -->
+    <g id="hatSolid">
+      <path d="M 8 176 C 8 158 62 146 132 146 C 202 146 256 158 256 176 C 256 196 202 208 132 208 C 62 208 8 196 8 176 Z"/>
+      <path d="M 64 158 C 70 108 86 58 120 32 C 158 4 206 -6 250 8 C 226 22 214 34 210 52 C 202 90 190 124 184 158 Z"/>
+    </g>
 
-    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
-      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#050E36" flood-opacity="0.5"/>
-    </filter>
-    <radialGradient id="starGlow" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0" stop-color="#FFFFFF"/>
-      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
-    </radialGradient>
-    <radialGradient id="goldGlow" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0" stop-color="#FFE79A"/>
-      <stop offset="1" stop-color="#FFE79A" stop-opacity="0"/>
-    </radialGradient>
+    <!-- full hat: silhouette (takes `color`) + white band + white stars -->
+    <g id="hat">
+      <use href="#hatSolid" fill="currentColor"/>
+      <path fill="#FFFFFF" opacity="0.92" d="M 70 138 C 102 150 150 150 178 137 L 183 151 C 153 164 101 164 65 151 Z"/>
+      <use href="#star" transform="translate(160 60) scale(1.15)" fill="#FFFFFF"/>
+      <use href="#star" transform="translate(124 100) scale(0.95)" fill="#FFFFFF"/>
+      <use href="#star" transform="translate(162 108) scale(0.9)"  fill="#FFFFFF"/>
+      <use href="#star" transform="translate(132 138) scale(0.85)" fill="#FFFFFF"/>
+      <use href="#star" transform="translate(178 146) scale(0.8)"  fill="#FFFFFF"/>
+    </g>
+
+    <!-- knockout: erase where the front hat (slightly enlarged) sits → transparent gap ring -->
+    <mask id="frontCut" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512">
+      <rect width="512" height="512" fill="#FFFFFF"/>
+      <use href="#hatSolid" transform="translate(233.4 236.8) scale(0.855)" fill="#000000"/>
+    </mask>
   </defs>
 
-  <!-- app-icon rounded square + night sky -->
-  <rect width="512" height="512" rx="114" fill="url(#bg)"/>
-  <rect width="512" height="512" rx="114" fill="url(#nebula)"/>
-  <rect width="512" height="512" rx="114" fill="url(#nebula2)"/>
-
-  <!-- starfield -->
-  <g fill="#FFFFFF">
-    <circle cx="72"  cy="86"  r="2.4" opacity="0.9"/>
-    <circle cx="140" cy="58"  r="1.6" opacity="0.7"/>
-    <circle cx="196" cy="92"  r="1.3" opacity="0.6"/>
-    <circle cx="96"  cy="150" r="1.8" opacity="0.75"/>
-    <circle cx="58"  cy="232" r="2.2" opacity="0.85"/>
-    <circle cx="120" cy="270" r="1.4" opacity="0.6"/>
-    <circle cx="72"  cy="330" r="1.9" opacity="0.8"/>
-    <circle cx="110" cy="404" r="2.3" opacity="0.85"/>
-    <circle cx="176" cy="436" r="1.5" opacity="0.65"/>
-    <circle cx="250" cy="452" r="1.7" opacity="0.7"/>
-    <circle cx="330" cy="440" r="1.4" opacity="0.6"/>
-    <circle cx="400" cy="452" r="2.1" opacity="0.8"/>
-    <circle cx="444" cy="392" r="1.6" opacity="0.7"/>
-    <circle cx="454" cy="300" r="2.4" opacity="0.9"/>
-    <circle cx="418" cy="238" r="1.4" opacity="0.6"/>
-    <circle cx="452" cy="176" r="1.8" opacity="0.75"/>
-    <circle cx="392" cy="110" r="1.5" opacity="0.65"/>
-    <circle cx="330" cy="66"  r="2.0" opacity="0.8"/>
-    <circle cx="270" cy="52"  r="1.4" opacity="0.6"/>
-  </g>
-  <g fill="#FFFFFF">
-    <circle cx="86"  cy="104" r="9" fill="url(#starGlow)" opacity="0.6"/>
-    <path d="M86 92 l3.5 8.5 8.5 3.5 -8.5 3.5 -3.5 8.5 -3.5 -8.5 -8.5 -3.5 8.5 -3.5 z"/>
-    <circle cx="440" cy="140" r="9" fill="url(#starGlow)" opacity="0.6"/>
-    <path d="M440 128 l3.5 8.5 8.5 3.5 -8.5 3.5 -3.5 8.5 -3.5 -8.5 -8.5 -3.5 8.5 -3.5 z"/>
-  </g>
-
-  <g filter="url(#soft)">
-    <!-- floppy brim: wide, gently wavy -->
-    <path d="M104 344
-             C104 322 150 310 200 306
-             C214 314 298 314 312 306
-             C362 310 408 322 408 344
-             C408 372 344 390 256 390
-             C168 390 104 372 104 344 Z"
-          fill="url(#brim)"/>
-
-    <!-- cone: tall, with a dramatic drooping tip curling forward (classic wizard) -->
-    <path d="M198 330
-             C206 262 220 200 240 150
-             C250 124 266 104 292 100
-             C324 95 350 112 350 140
-             C350 166 330 182 306 190
-             C292 194 288 202 292 214
-             C300 250 312 300 320 330 Z"
-          fill="url(#hat)"/>
-    <!-- inner highlight -->
-    <path d="M226 320
-             C232 250 244 190 260 150
-             C268 130 280 116 296 114
-             C280 122 272 140 266 164
-             C254 214 244 280 244 320 Z"
-          fill="url(#hatLight)" opacity="0.55"/>
-
-    <!-- gold band + buckle -->
-    <path d="M206 300 C240 310 274 310 314 300 L322 330 C280 340 236 340 190 330 Z" fill="url(#gold)"/>
-    <rect x="242" y="306" width="30" height="24" rx="6" fill="#3A2080"/>
-    <rect x="249" y="311" width="16" height="14" rx="3.5" fill="url(#gold)"/>
-
-    <!-- gold stars sprinkled on the cone -->
-    <g fill="url(#gold)">
-      <path d="M270 178 l4.5 12 12 4.5 -12 4.5 -4.5 12 -4.5 -12 -12 -4.5 12 -4.5 z"/>
-      <path d="M244 244 l3.5 9.5 9.5 3.5 -9.5 3.5 -3.5 9.5 -3.5 -9.5 -9.5 -3.5 9.5 -3.5 z"/>
-    </g>
-    <!-- gold crescent moon on the cone -->
-    <path d="M290 250 a17 17 0 1 0 12 28 a13 13 0 1 1 -12 -28 z" fill="url(#gold)"/>
-  </g>
-
-  <!-- glowing star crowning the drooping tip -->
-  <circle cx="336" cy="130" r="18" fill="url(#goldGlow)" opacity="0.8"/>
-  <path d="M336 116 l6 16.5 16.5 6 -16.5 6 -6 16.5 -6 -16.5 -16.5 -6 16.5 -6 z" fill="#FFF3CE"/>
-
-  <!-- magic sparkles drifting off the hat -->
-  <g fill="#FFE79A">
-    <path d="M170 210 l5 13.5 13.5 5 -13.5 5 -5 13.5 -5 -13.5 -13.5 -5 13.5 -5 z" opacity="0.95"/>
-    <path d="M356 262 l4 11 11 4 -11 4 -4 11 -4 -11 -11 -4 11 -4 z" opacity="0.85"/>
-  </g>
+  <!-- transparent background — two overlapping hats, WeChat two-bubble composition -->
+  <!-- back hat: larger, upper-left, wizard purple; punched by the front hat's silhouette -->
+  <use href="#hat" transform="translate(44 85) scale(1.3)" color="#6A45C8" mask="url(#frontCut)"/>
+  <!-- front hat: smaller, lower-right, WeCom blue -->
+  <use href="#hat" transform="translate(238 241) scale(0.82)" color="#2F7DF0"/>
 </svg>
