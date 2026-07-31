@@ -30,7 +30,7 @@ import { dangerOf, dangerEarlyExit, type DangerHit } from "./danger.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl, getDetail } from "./detail.js";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
-import { labelFor, tagBadge, tagOfKey, withTagHeader } from "../shared/session-label.js";
+import { tagBadge, tagOfKey, withTagHeader } from "../shared/session-label.js";
 import { sessionNameFor } from "./session-name.js";
 
 // ── Routing helpers ────────────────────────────────────────────────────
@@ -95,13 +95,13 @@ const WRITE_PREVIEW_CHARS = 200;
 
 const SOURCE_ICON = "https://wwcdn.weixin.qq.com/node/wework/images/3d-claude-ai-logo.bce0ddae70.jpg";
 
-// Source 行只承担身份/状态: 普通卡固定品牌位, 危险卡整行变红 —— 比标题前缀醒目
-// 得多 (desc_color: 0 灰 / 2 红)。上文 (transcriptTail) 不再塞这里: 它只有一行
-// 13 字的可见量, 挪进 horizontal_content_list (26 字) 了。
+// Source 行只承担身份/状态: 文案固定品牌位, 危险卡只把文字变红 (desc_color: 2),
+// 不换文案不加图标 —— 红色本身就是信号。上文 (transcriptTail) 不塞这里: 它只有
+// 一行 13 字的可见量, 在 horizontal_content_list (26 字) 里。
 const buildSource = (danger?: string): TemplateCard["source"] =>
   ({
     icon_url: SOURCE_ICON,
-    desc: danger ? "⚠️ 危险操作" : "Claude Code",
+    desc: "Claude Code",
     desc_color: danger ? 2 : 0,
   }) as TemplateCard["source"];
 
@@ -246,65 +246,61 @@ const detailJumpList = (url?: string): TemplateCard["jump_list"] | undefined =>
 // of how many times `/clear` rotates the underlying sessionId.
 const emojiFor = tagBadge;
 
-// ── v2 布局 (2026-07-31 真机对照后定稿) ────────────────────────────────
-// 信息优先级: 谁在问(会话) > 想干什么(desc) > 具体命令 > 在哪(目录) > 上下文。
-//   source        品牌位; 危险卡整行红字 ⚠️
-//   main_title    🔐 <emoji> <会话名> · <工具>  ← 会话身份占最贵的位置
-//   sub_title_text 命令/参数主体 — 8 行可见, 比 quote_area (3 行 ~75 字) 多一半
-//   horizontal    目录(全路径) / 上文 / 危险规则 — keyname 5 字 + value 26 字
-//   jump_list     🔍 完整命令·详情 (PC 跳转)  /  右上⋯ 展开全文 (手机)
-// quote_area 弃用: 容量最小却装过核心信息, 是旧版"命令看不全"的根源。
-// 按钮 style 真机对照: 1=蓝底白字 2=灰底蓝字 3=灰底红字 4=灰底黑字。
-const SUBTITLE_CMD_MAX = 450;
+// ── v3 布局 (2026-07-31 两轮真机反馈后定稿) ──────────────────────────
+// 信息优先级: 谁在问(会话名) > 想干什么(desc) > 具体命令 > 上下文。
+//   source        品牌位; 危险卡文字变红 (仅变色, 不换文案)
+//   main_title    <会话名> · <工具> — 无锁/无 emoji, 纯文字
+//   quote_area    命令主体 — 无标题, 整块可点跳详情页 (PC); 3 行截断由
+//                 右上⋯展开与详情页兜底
+//   horizontal    上文 (最近用户消息); 危险卡多一行规则名
+//   jump_list     「🔍 完整命令·详情」
+// 会话名: #tag (企微发起) > CC 会话名 (本地发起, sessions 注册表) > 首条消息。
 const HMETA_VAL_MAX = 26;
 
-// 会话 emoji 常驻: tagged 按 tag 染色 (与 mirror 气泡一致), untagged 按
-// sessionId (与 /sessions 列表一致) —— 旧版 untagged 无任何标识, 多个默认
-// 会话的卡完全无法区分。
-const cardEmoji = (a: CardArgs): string => {
-  const tag = tagOfKey(a.chatKey);
-  return tag ? labelFor(tag) : labelFor(a.sessionId ?? a.sessionShort);
-};
+const cardTitle = (a: CardArgs): string =>
+  `${a.sessionName || a.sessionShort} · ${shortTool(a.toolName)}`;
 
 // mcp__server__tool → server:tool — 标题里的长工具名压短。
 const shortTool = (toolName: string): string =>
   TRUNC(toolName.replace(/^mcp__/, "").replace(/__/g, ":"), 16);
 
-const cardTitle = (a: CardArgs): string =>
-  `🔐 ${cardEmoji(a)} ${a.sessionName || a.sessionShort} · ${shortTool(a.toolName)}`;
-
 const metaRows = (a: CardArgs): TemplateCard["horizontal_content_list"] => {
   const rows: Array<{ keyname: string; value: string }> = [];
-  if (a.cwd) rows.push({ keyname: "目录", value: TRUNC_LEFT(fmtPath(a.cwd), HMETA_VAL_MAX) });
   const tail = oneLine(a.transcriptTail).trim();
   if (tail) rows.push({ keyname: "上文", value: TRUNC(tail, HMETA_VAL_MAX) });
   if (a.danger) rows.push({ keyname: "危险", value: TRUNC(`命中「${a.danger}」`, HMETA_VAL_MAX) });
   return rows.length > 0 ? (rows as TemplateCard["horizontal_content_list"]) : undefined;
 };
 
-// 命令主体 + 元信息行, 五种卡共用的中段。
+// 命令主体 (引用区, 可点) + 元信息行, 各卡共用的中段。
 const bodyBlocks = (a: CardArgs, r: Rendered): Partial<TemplateCard> => {
   const rows = metaRows(a);
   return {
-    ...(r.body ? { sub_title_text: TRUNC(r.body, SUBTITLE_CMD_MAX) } : {}),
+    ...(r.body ? { quote_area: quoteArea(r.body, a.detailUrl) } : {}),
     ...(rows ? { horizontal_content_list: rows } : {}),
   };
 };
 
-// 危险卡: 只有 拒绝/确认执行 — 不给「全过」「总是」的入口, 否则一次点击就把
-// 后续所有危险操作也放行了, 名单等于失效。配色遵循 destructive 惯例: 安全动作
-// (拒绝) 用主色好按, 危险动作 (确认执行) 红字提示后果。
+// 引用区: 无标题 (省一行), 挂 type:1 + url 整块可点 → 详情页看全文 (PC 好用;
+// 回环链接手机打不开是已知取舍, 手机走右上⋯展开)。
+const quoteArea = (text: string, url?: string): TemplateCard["quote_area"] =>
+  (url
+    ? { type: 1, url, quote_text: text }
+    : { type: 0, quote_text: text }) as TemplateCard["quote_area"];
+
+// 危险卡: 只有 ❌ / ✅ — 不给「N 分钟全过」「✅总是」的入口, 否则一次点击就把
+// 后续所有危险操作也放行了, 名单等于失效。
 const approveButtons = (a: CardArgs): TemplateCard["button_list"] =>
   a.danger
     ? [
-        { text: "拒绝", style: 1, key: encodeKey(a.reqId, "deny") },
-        { text: "确认执行", style: 3, key: encodeKey(a.reqId, "allow") },
+        { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
+        { text: "✅ 确认执行", style: 4, key: encodeKey(a.reqId, "allow") },
       ]
     : [
-        { text: "拒绝", style: 3, key: encodeKey(a.reqId, "deny") },
-        { text: "允许", style: 1, key: encodeKey(a.reqId, "allow") },
-        { text: `${fmtWindow(a.windowMinutes)} 全过`, style: 4, key: encodeKey(a.reqId, "allow_window") },
-        { text: "总是允许", style: 4, key: encodeKey(a.reqId, "allow_always") },
+        { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
+        { text: fmtWindow(a.windowMinutes), style: 3, key: encodeKey(a.reqId, "allow_window") },
+        { text: "✅总是", style: 4, key: encodeKey(a.reqId, "allow_always") },
+        { text: "✅", style: 4, key: encodeKey(a.reqId, "allow") },
       ];
 
 // 正文放不下时的两条出路, 都挂在卡片自己身上 (不再额外发一条完整命令的文本消息):
@@ -496,22 +492,16 @@ const renderBatchBody = (batch: ActiveBatch): string => {
   return TRUNC(lines.join("\n"), QUOTE_MAX);
 };
 
-// 批量卡的标题/中段与单卡同构 (会话名 + 工具×N / 成员列表进 sub_title / 目录行)。
-const batchEmoji = (batch: ActiveBatch): string => {
-  const tag = tagOfKey(batch.approver);
-  return tag ? labelFor(tag) : labelFor(batch.sessionId);
-};
+// 批量卡的标题/中段与单卡同构 (会话名 + 工具×N / 成员列表进引用区)。
 const batchTitle = (batch: ActiveBatch): string =>
-  `🔐 ${batchEmoji(batch)} ${batch.sessionName || batch.sessionId.slice(-8)} · ${shortTool(batch.toolName)} ×${batch.members.length}`;
+  `${batch.sessionName || batch.sessionId.slice(-8)} · ${shortTool(batch.toolName)} ×${batch.members.length}`;
 const batchBlocks = (batch: ActiveBatch, transcriptTail: string): Partial<TemplateCard> => {
   const rows: Array<{ keyname: string; value: string }> = [];
-  const cwd = batch.members[0]?.cwd ?? "";
-  if (cwd) rows.push({ keyname: "目录", value: TRUNC_LEFT(fmtPath(cwd), HMETA_VAL_MAX) });
   const tail = oneLine(transcriptTail).trim();
   if (tail) rows.push({ keyname: "上文", value: TRUNC(tail, HMETA_VAL_MAX) });
   if (batch.danger) rows.push({ keyname: "危险", value: TRUNC(`命中「${batch.danger}」`, HMETA_VAL_MAX) });
   return {
-    sub_title_text: TRUNC(renderBatchBody(batch), SUBTITLE_CMD_MAX),
+    quote_area: quoteArea(renderBatchBody(batch)),
     ...(rows.length > 0 ? { horizontal_content_list: rows as TemplateCard["horizontal_content_list"] } : {}),
   };
 };
@@ -523,10 +513,10 @@ const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCar
   ...batchBlocks(batch, transcriptTail),
   task_id: batch.batchId,
   button_list: [
-    { text: "拒绝", style: 3, key: encodeBatchKey(batch.batchId, "deny") },
-    { text: `允许 ×${batch.members.length}`, style: 1, key: encodeBatchKey(batch.batchId, "allow") },
-    { text: `${fmtWindow(batch.windowMinutes)} 全过`, style: 4, key: encodeBatchKey(batch.batchId, "allow_window") },
-    { text: "总是允许", style: 4, key: encodeBatchKey(batch.batchId, "allow_always") },
+    { text: "❌", style: 4, key: encodeBatchKey(batch.batchId, "deny") },
+    { text: fmtWindow(batch.windowMinutes), style: 3, key: encodeBatchKey(batch.batchId, "allow_window") },
+    { text: "✅总是", style: 4, key: encodeBatchKey(batch.batchId, "allow_always") },
+    { text: `✅ ×${batch.members.length}`, style: 4, key: encodeBatchKey(batch.batchId, "allow") },
   ],
 });
 

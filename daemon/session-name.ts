@@ -1,19 +1,55 @@
-// 审批卡上的「会话名」— 回答"是哪个会话在请求授权"。
+// 审批卡标题上的「会话名」— 回答"是哪个会话在请求授权"。
 //
 // 数据源按可靠度降级:
-//   1. chatKey 里的 `#tag` — CLI 侧显式命名的并行会话, 最准;
-//   2. transcript 里第一条用户消息的首句 — 没有 tag 时, "这个会话是来干嘛的"
-//      的最好近似 (CC 生成会话 summary 用的也是它; summary 行本身不是每个
-//      会话都有, 不可依赖);
-//   3. sessionId 尾八位 — 前两者都拿不到时的保底可辨识串。
-//
-// 首条消息按 transcript 路径缓存: 会话的第一条用户消息不会变, 文件级 LRU 足够,
-// 不用每张卡都读一次盘。
-import { closeSync, openSync, readSync } from "node:fs";
+//   1. chatKey 里的 `#tag` — 企微侧显式命名的并行会话, 人起的名, 最准;
+//   2. CC 的会话名 — `~/.claude{,-internal}/sessions/<pid>.json` 活跃会话注册表
+//      的 `name` 字段 (CC 会话列表显示的就是它, 如 "product-engineer-83")。
+//      只覆盖活着的进程, 但发卡时会话必然活着 —— hook 正是它触发的;
+//   3. transcript 首条用户消息首句 — 注册表意外缺失时的语义兜底;
+//   4. sessionId 尾八位 — 保底可辨识串。
+// (jsonl 的 summary 行实测 0/20 覆盖 — CC 2.1.x 不写, 不可用。)
+import { closeSync, openSync, readSync, readdirSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { tagOfKey } from "../shared/session-label.js";
 
+const NAME_MAX = 16;
+const TRUNC = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+// ── CC 活跃会话注册表 ────────────────────────────────────────────────
+// 目录很小 (每个活跃 claude 进程一个 json), 每次全量扫 + 短 TTL 缓存足够。
+// pid 文件在进程退出后清理, 长缓存反而会拿到死名字。
+const SESSIONS_DIRS = [
+  join(homedir(), ".claude", "sessions"),
+  join(homedir(), ".claude-internal", "sessions"),
+];
+const REGISTRY_TTL_MS = 30_000;
+let registry: { at: number; bySession: Map<string, string> } | null = null;
+
+const scanRegistry = (): Map<string, string> => {
+  const now = Date.now();
+  if (registry && now - registry.at < REGISTRY_TTL_MS) return registry.bySession;
+  const bySession = new Map<string, string>();
+  for (const dir of SESSIONS_DIRS) {
+    let files: string[];
+    try { files = readdirSync(dir); } catch { continue; }
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      try {
+        const row = JSON.parse(readFileSync(join(dir, f), "utf8")) as {
+          sessionId?: string;
+          name?: string;
+        };
+        if (row.sessionId && row.name) bySession.set(row.sessionId, row.name);
+      } catch { /* 半写状态的文件, 跳过 */ }
+    }
+  }
+  registry = { at: now, bySession };
+  return bySession;
+};
+
+// ── transcript 首条用户消息 (语义兜底) ──────────────────────────────
 const HEAD_BYTES = 32 * 1024;
-const NAME_MAX = 12; // main_title 一行 13 字, 名字之外还要放 emoji 和 toolName
 
 const readHead = (path: string): string => {
   try {
@@ -54,28 +90,24 @@ const firstUserText = (path: string): string => {
   return "";
 };
 
-const cache = new Map<string, string>(); // transcriptPath → first user text (原文, 截断在出口做)
+const firstMsgCache = new Map<string, string>(); // transcriptPath → 首条用户消息原文
 const CACHE_MAX = 300;
 
 const firstUserTextCached = (path: string): string => {
-  const hit = cache.get(path);
+  const hit = firstMsgCache.get(path);
   if (hit !== undefined) return hit;
   const v = firstUserText(path);
-  // 空串也缓存 — 空会话反复读盘毫无意义; 会话有了首条消息后 jsonl 路径不变,
-  // 但那时早过了发卡时点, 下一张卡再读一次的成本可接受: 空串不缓存即可。
   if (v) {
-    if (cache.size >= CACHE_MAX) {
-      const oldest = cache.keys().next().value;
-      if (oldest !== undefined) cache.delete(oldest);
+    if (firstMsgCache.size >= CACHE_MAX) {
+      const oldest = firstMsgCache.keys().next().value;
+      if (oldest !== undefined) firstMsgCache.delete(oldest);
     }
-    cache.set(path, v);
+    firstMsgCache.set(path, v);
   }
   return v;
 };
 
-const TRUNC = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
-
-/** 会话名: #tag > transcript 首条用户消息首句 > sessionId 尾八位。 */
+/** 会话名: #tag > CC 会话名 > transcript 首条用户消息 > sessionId 尾八位。 */
 export const sessionNameFor = (
   chatKey: string | undefined,
   transcriptPath: string | undefined,
@@ -83,6 +115,10 @@ export const sessionNameFor = (
 ): string => {
   const tag = chatKey ? tagOfKey(chatKey) : "";
   if (tag) return `#${TRUNC(tag, NAME_MAX)}`;
+  if (sessionId) {
+    const cc = scanRegistry().get(sessionId);
+    if (cc) return TRUNC(cc, NAME_MAX);
+  }
   if (transcriptPath) {
     const t = firstUserTextCached(transcriptPath);
     if (t) return TRUNC(t, NAME_MAX);
