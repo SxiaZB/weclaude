@@ -386,7 +386,7 @@ daemon 同时挂载所有已安装的 CLI，不是二选一：你可以一个 tm
 Anthropic 的 prompt cache 只活 ~5 分钟，且**写缓存 1.25x、读缓存 0.1x**。一个 pane 一旦空闲（agent 在等 peer 回复、或后台任务在跑），整份上下文就会掉出缓存——下一轮真实对话得按 1.25x 把整个上下文重写一遍。保活机制会在缓存**即将过期前**往 pane 注入一次极小的 ping，逼模型发起一次廉价请求（命中缓存前缀走 0.1x 读）并把 5 分钟 TTL 往前滑，真实那轮就只需写增量。
 
 - **只在「缓存还命中得到」的窗口内保活**：空闲落在 `[ttlSec - marginSec, ttlSec)`（默认 `[255s, 300s)`）才 ping。**过了 TTL 就绝不出手**——那时缓存已经没了，ping 反而要付整份上下文的冷写，为一轮 no-op 白烧钱。daemon reload 后挂着的老会话、长时间无人理的 pane，都直接放过，等下一次真实操作自然承担。
-- **零污染**：ping 文案默认 `keepalive — reply with just "pong", take no other action`，逼出一个约 1 token 的极短回复且禁止任何工具动作。这轮 ping/pong **不进聊天**（群里只有一条 `❤️ 保活 · context ~85k tokens · 3/6`），但会作为一条标记 turn **记入 chat detail 时间线**，并把那次真实的 cache-read usage 挂上去——留痕、可审计，证明它确实只是一次廉价读缓存。
+- **零污染**：ping 文案默认 `keepalive — reply with just "pong", take no other action`，逼出一个约 1 token 的极短回复且禁止任何工具动作。这轮 ping/pong **不进聊天**（群里只有一条 `❤️ 保活 · context ~85k tokens · 3/6`），但会 **记入 chat detail 时间线**：记录的是**真实的心跳对话**——注入的 ping 原文 + 模型的真实回复（预期就一个 `pong`）+ 那次真实的 cache-read usage，留痕、可审计，证明它确实只是一次廉价读缓存。
 - **预算封顶 + 会终止**：每个 pane 连续保活 `maxPings`（默认 6）次后就停手让它冷掉；一旦观察到真实活动（新一轮对话），预算自动重置、重新计数。两道终止保险叠加——超过 TTL 的会话本就不 ping，加上 6 次封顶，不会无限保活下去。
 - **`/stop` 手动暂停**：在 IM 里发 `/stop`（Esc 打断当前生成）同时会暂停该会话的保活；等下次有新对话（IM 消息或 CLI 里新起一轮）自动恢复。
 - **只针对 mirror 模式的活 pane**：spawn 模式无 TTY、pane 已死、正在流式输出或会话轮换中的，一律跳过。

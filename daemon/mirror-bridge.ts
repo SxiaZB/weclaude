@@ -2360,16 +2360,26 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   };
 
   const onItem = (a: AttachState, item: RenderItem): void => {
-    // Keepalive ping turns are pure cache-warmers: swallow every item from the
-    // WeCom paths so the ping/pong never reaches chat. But route the ping's real
-    // usage into its chat-detail turn (proof it was a cheap cache-read) and close
-    // that turn on the terminal signal (hard or soft turn_end).
+    // Keepalive ping turns are cache-warmers: swallow every item from the WeCom
+    // paths so the ping/pong never reaches chat. But record the REAL exchange
+    // into its chat-detail turn — the actual assistant reply (expected: just
+    // "pong"), the tool calls if any, and the usage (proof it was a cheap
+    // cache-read) — so the detail page shows the genuine heartbeat, not a
+    // synthetic summary. Closed on the terminal signal (hard or soft turn_end).
     if (a.keepaliveQuiet) {
-      if (a.keepaliveTurnId) {
-        if (item.kind === "turn_usage") {
-          recordTurnUsage(a.keepaliveTurnId, { model: item.model, messageId: item.messageId, usage: item.usage });
+      const id = a.keepaliveTurnId;
+      if (id) {
+        const now = Date.now();
+        if (item.kind === "text") {
+          recordTurnItem(id, { t: "text", body: item.body, ts: now, final: item.final === true });
+        } else if (item.kind === "tool_use") {
+          for (const c of item.calls) recordTurnItem(id, { t: "tool_use", toolUseId: c.toolUseId, toolName: c.name, toolInput: c.input, ts: now });
+        } else if (item.kind === "tool_result") {
+          recordTurnItem(id, { t: "tool_result", toolUseId: item.toolUseId, body: item.full, ts: now });
+        } else if (item.kind === "turn_usage") {
+          recordTurnUsage(id, { model: item.model, messageId: item.messageId, usage: item.usage });
         } else if (item.kind === "turn_end") {
-          recordTurnClose(a.keepaliveTurnId);
+          recordTurnClose(id);
           a.keepaliveTurnId = undefined;
         }
       }
@@ -3499,13 +3509,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const tokens = lastContextTokens(a.jsonlPath);
     const size = tokens > 0 ? `~${fmtTokens(tokens)} tokens` : "未知";
     log.info({ target: a.target, count: n, tokens }, "keepalive: ping injected");
-    // Record a marked turn into chat-detail — the ping stays out of chat, but the
-    // timeline shows it fired. Real usage is grafted on from the swallowed
-    // turn_usage items in onItem; closed on the ping's turn_end (or the fail-safe).
+    // Open a chat-detail turn for the real heartbeat exchange: userQuery is the
+    // actual ping we injected; the assistant reply (expected: just "pong"), any
+    // tool calls, and usage are grafted on from the swallowed items in onItem;
+    // closed on the ping's turn_end (or the fail-safe). Kept out of chat.
     const turnId = newTurnId();
     a.keepaliveTurnId = turnId;
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: `❤️ keepalive ${n}/${kc.maxPings}` });
-    recordTurnItem(turnId, { t: "text", body: `❤️ 保活心跳 · context ${size} · ${n}/${kc.maxPings}`, ts: Date.now(), final: true });
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: kc.ping });
     if (kc.notify) sendStandalone(a, `❤️ 保活 · context ${size} · ${n}/${kc.maxPings}`);
   };
 
