@@ -18,22 +18,6 @@ import { computeAuditReport } from "./audit.js";
 import { syncProjectConfig, renderSyncReport } from "./cfg-sync.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
 import { tagOfKey, withTagHeader } from "../shared/session-label.js";
-import {
-  parseSubscribe,
-  parseUnsubscribe,
-  parseBroadcast,
-  parseDailySchedule,
-  parseCancelSchedule,
-  isListSchedules,
-  isListSubs,
-  subscribe,
-  unsubscribe,
-  addSchedule,
-  removeSchedulesByTopic,
-  publish,
-  renderSubs,
-  renderSchedules,
-} from "./topics.js";
 
 // Chat-binding key: stable id for "this conversation thread". Used as
 // session-map key, mirror target, defaultChat. NOT used for auth.
@@ -148,7 +132,6 @@ const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 const isEnterCommand = (text: string): boolean => text.trim() === "/n";
 const isRevealCommand = (text: string): boolean => text.trim() === "/reveal";
 const isHelpCommand = (text: string): boolean => /^\/(?:help|\?|h)$/i.test(text.trim());
-const isSkillBCommand = (text: string): boolean => text.trim() === "/skill-b";
 
 // Static command reference. Grouped: session control, usage/info, topic
 // broadcast (natural-language, zh+en). Anything not matching a command is a
@@ -191,15 +174,10 @@ const renderHelp = (): string =>
     "`/audit` 本会话 token/成本明细 (含 subagent) · `/audit <tag>` 指定标签会话",
     "`/cfgsync` 预演跨 CLI 项目配置同步 · `/cfgsync apply` 执行 (需授权)",
     "`/help` 本帮助",
-    "`/skill-b` 广播接口用法 (贴给 Claude)",
     "",
-    "▎广播订阅",
-    "`订阅 <topic>` · `退订 <topic>`",
-    "`广播 <topic> <内容>`",
-    "`每天 08:30 广播 <topic> <内容>`",
-    "`取消广播 <topic>`",
-    "`订阅列表` · `广播列表`",
-    "AI 也可用 MCP 工具 `subscribe_topic` / `broadcast_topic` 自主订阅与广播。",
+    "▎事件订阅 / 广播",
+    "已迁到 MCP:直接对 AI 说「订阅 xxx」「广播 xxx: …」「每天8点广播 xxx: …」,",
+    "它会调 `subscribe_topic` / `broadcast_topic` / `schedule_broadcast` 等工具处理。",
     "",
     "▎引用 (quote)",
     "引用消息 + 新文字：被引用内容作为上下文前缀附在你的话前。",
@@ -208,28 +186,6 @@ const renderHelp = (): string =>
     "",
     "其余文本直接转发给已绑定的 Claude 会话。",
   ].join("\n");
-
-// /skill-b — 回执一段 prompt,告诉 Claude 如何调用本 daemon 的 /publish 广播接口。
-// 用围栏代码块包裹便于用户在 WeCom 长按 copy 后贴给上游 Claude。
-const renderSkillBroadcast = (): string => [
-  "把下面这段贴给 Claude,它就知道怎么广播:",
-  "```",
-  "本机 daemon 在 127.0.0.1:17890 暴露 POST /publish,用来向已订阅某 topic 的会话广播消息。",
-  "",
-  "调用示例:",
-  "curl -sS -X POST http://127.0.0.1:17890/publish \\",
-  "  -H 'Content-Type: application/json' \\",
-  "  -d '{\"topic\":\"daily-report\",\"markdown\":\"# 标题\\n正文...\"}'",
-  "",
-  "请求体:",
-  "- topic (必填):订阅表里的 key",
-  "- markdown 或 text (二选一):消息内容,markdown 语法",
-  "",
-  "返回: { ok, topic, sent, failed, subs }。ws_disconnected=true 表示 daemon 与 WeCom WS 断开。",
-  "",
-  "长消息用 --data-binary @file.json,避免 shell 转义踩坑。",
-  "```",
-].join("\n");
 
 // /session(s) [arg] — list live Claude sessions, or switch the mirror to one.
 // Bare "/sessions" (or "/session") lists; an arg (animal emoji, sessionId, or
@@ -533,72 +489,6 @@ export const installInboundRouter = (
     serializeSpawn(who, async () =>
       "hasMirrorTarget" in bridge && bridge.hasMirrorTarget(who) ? "✅ 复用已建立的会话" : await spawnSession(who));
 
-  // 事件订阅 / 广播命令。授权后调用,不再走 bridge dispatch。返回 true 表示已处理。
-  const topicLog = log.child({ mod: "topics" });
-  const handleTopicCommand = async (
-    frame: WsFrame<BaseMessage>,
-    msg: BaseMessage,
-    who: string,
-    text: string,
-  ): Promise<boolean> => {
-    // 订阅/广播回执同样按会话 tag 标注 —— `#docs /subs` 的回执必须落在 `#docs`
-    // 的视觉通道里, 否则同一聊天并行会话时分不清是谁的回执。
-    const reply = async (t: string): Promise<void> => {
-      try { await client.replyStream(frame, msg.msgid, withTagHeader(who, t), true); } catch { /* ignore */ }
-    };
-    const sub = parseSubscribe(text);
-    if (sub) {
-      const r = subscribe(cfg, sourcePath, sub.topic, who);
-      await reply(r.added
-        ? `✅ 已订阅 \`${sub.topic}\` (会话: \`${who}\`)`
-        : `ℹ️ 已在 \`${sub.topic}\` 订阅列表中`);
-      return true;
-    }
-    const unsub = parseUnsubscribe(text);
-    if (unsub) {
-      const r = unsubscribe(cfg, sourcePath, unsub.topic, who);
-      await reply(r.removed ? `✅ 已退订 \`${unsub.topic}\`` : `ℹ️ 未订阅 \`${unsub.topic}\``);
-      return true;
-    }
-    const daily = parseDailySchedule(text);
-    if (daily) {
-      addSchedule(cfg, sourcePath, {
-        topic: daily.topic,
-        hour: daily.hour,
-        minute: daily.minute,
-        content: daily.content,
-        createdBy: who,
-        createdAt: Date.now(),
-      });
-      const hh = String(daily.hour).padStart(2, "0");
-      const mm = String(daily.minute).padStart(2, "0");
-      const subCount = (cfg.topics.subs[daily.topic] ?? []).length;
-      await reply(`✅ 定时已添加: 每天 ${hh}:${mm} 广播 \`${daily.topic}\` (当前 ${subCount} 订阅者)`);
-      return true;
-    }
-    const bcast = parseBroadcast(text);
-    if (bcast) {
-      const r = await publish(client, cfg, topicLog, bcast.topic, bcast.content);
-      await reply(`📣 已广播到 \`${r.topic}\`: 送达 ${r.sent} / ${r.subs.length}${r.failed ? `,失败 ${r.failed}` : ""}`);
-      return true;
-    }
-    const cancel = parseCancelSchedule(text);
-    if (cancel) {
-      const n = removeSchedulesByTopic(cfg, sourcePath, cancel.topic);
-      await reply(n > 0 ? `✅ 已删除 \`${cancel.topic}\` 的 ${n} 条定时` : `ℹ️ \`${cancel.topic}\` 无定时任务`);
-      return true;
-    }
-    if (isListSubs(text)) {
-      await reply(renderSubs(cfg, who));
-      return true;
-    }
-    if (isListSchedules(text)) {
-      await reply(renderSchedules(cfg));
-      return true;
-    }
-    return false;
-  };
-
   // Prefix user-visible daemon replies with `<emoji> #tag` when the routed
   // session is tagged, so a chat hosting multiple concurrent tagged sessions
   // stays visually disambiguated. Untagged (default) session passes through
@@ -631,11 +521,6 @@ export const installInboundRouter = (
     // /pwd — bypass allowFrom too. Read-only project-path lookup.
     if (isPwdCommand(text)) {
       await replyText(frame, msg, who, renderPwd(who));
-      return { stop: true };
-    }
-    // /skill-b — 静态 prompt 回执,教 Claude 调用 /publish 广播接口。纯文本,bypass allowFrom。
-    if (isSkillBCommand(text)) {
-      await replyText(frame, msg, who, renderSkillBroadcast());
       return { stop: true };
     }
     // /cost — token / cost ESTIMATE pulled from ~/.claude(-internal)?/projects
@@ -748,11 +633,8 @@ export const installInboundRouter = (
       await replyText(frame, msg, who, reply);
       return { stop: true };
     }
-    // 事件订阅 / 广播 / 定时。授权后即可使用,任意 principal 可对本会话订阅/退订,
-    // 广播权限同 allowFrom(已过上面的 auth 门)。命令不进入 bridge dispatch,
-    // 用轻量 replyStream 回执。
-    const topicHandled = await handleTopicCommand(frame, msg, who, text);
-    if (topicHandled) return { stop: true };
+    // 事件订阅 / 广播 / 定时已全部迁移到 MCP 工具(subscribe_topic /
+    // broadcast_topic / schedule_broadcast …),不再有 IM 文本命令。
     // Authorized `/stop` — Esc the live pane to interrupt whatever Claude is
     // currently doing. Mirror-mode only; bails cleanly when no attachment.
     if (isStopCommand(text)) {

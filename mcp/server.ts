@@ -563,5 +563,59 @@ server.registerTool(
   },
 );
 
+server.registerTool(
+  "unsubscribe_topic",
+  {
+    title: "Unsubscribe this chat from a topic",
+    description:
+      "Remove the CURRENT WeCom chat from a topic's subscriber list, so it stops receiving that topic's broadcasts and scheduled pushes. The inverse of subscribe_topic. Returns `removed` (false if it wasn't subscribed). Use when the user says 「退订 xxx」/「别再往这个群发 xxx 了」.",
+    inputSchema: {
+      topic: z.string().describe("Topic name to unsubscribe from."),
+    },
+  },
+  async ({ topic }) => unwrap("unsubscribe_topic", await daemonPost("/topics/unsubscribe", { topic })),
+);
+
+server.registerTool(
+  "list_topics",
+  {
+    title: "List this chat's subscriptions and all scheduled broadcasts",
+    description:
+      "Show what THIS chat is subscribed to (`subs`: topic + subscriber count) plus every daily scheduled broadcast on the host (`schedules`: topic, HH:MM, creator). Use when the user asks 「订阅列表」/「有哪些定时广播」/「我订了什么」. Read-only.",
+    inputSchema: {},
+  },
+  async () => unwrap("list_topics", await daemonPost("/topics/list", {})),
+);
+
+server.registerTool(
+  "schedule_broadcast",
+  {
+    title: "Schedule a daily broadcast to a topic",
+    description:
+      "Register a recurring daily broadcast: every day at hour:minute (host local time) the daemon publishes `content` to all subscribers of `topic`. Equivalent to 「每天 HH:MM 广播 <topic> <内容>」. Persists across daemon reloads. Use when the user says 「每天 8 点广播 xxx」/「定时给订阅者发 xxx」. To fire once immediately instead, use broadcast_topic.",
+    inputSchema: {
+      topic: z.string().describe("Topic whose subscribers receive the daily push."),
+      hour: z.number().int().min(0).max(23).describe("Hour of day, 0-23 (host local time)."),
+      minute: z.number().int().min(0).max(59).optional().describe("Minute, 0-59. Default 0."),
+      content: z.string().describe("Message body in WeCom markdown, sent every day at the given time."),
+    },
+  },
+  async ({ topic, hour, minute, content }) =>
+    unwrap("schedule_broadcast", await daemonPost("/topics/schedule", { topic, hour, minute: minute ?? 0, content })),
+);
+
+server.registerTool(
+  "cancel_broadcast",
+  {
+    title: "Cancel a topic's daily scheduled broadcasts",
+    description:
+      "Delete ALL daily scheduled broadcasts for a topic (does NOT touch subscriptions or fire anything). Equivalent to 「取消广播 <topic>」. Returns how many schedules were removed. Use when the user says 「取消 xxx 的定时」/「别再每天发 xxx 了」.",
+    inputSchema: {
+      topic: z.string().describe("Topic whose scheduled broadcasts should be removed."),
+    },
+  },
+  async ({ topic }) => unwrap("cancel_broadcast", await daemonPost("/topics/cancel-schedule", { topic })),
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

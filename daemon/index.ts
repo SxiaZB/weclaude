@@ -24,7 +24,16 @@ import {
 import { makeWedocBridge } from "./wedoc.js";
 import { installResponseTracker } from "./last-response.js";
 import { scanClaudeSessions } from "./session-scan.js";
-import { startScheduler, publish as publishTopic, subscribe as subscribeTopic } from "./topics.js";
+import {
+  startScheduler,
+  publish as publishTopic,
+  subscribe as subscribeTopic,
+  unsubscribe as unsubscribeTopic,
+  listSubs,
+  listSchedules,
+  addSchedule,
+  removeSchedulesByTopic,
+} from "./topics.js";
 import { baseOfKey, keyOf } from "../shared/session-label.js";
 import {
   startGraph,
@@ -477,17 +486,61 @@ const main = async (): Promise<void> => {
         : { ok: false, target, brief, reason: `handoff carry inject failed: ${inj2.reason}` });
     });
 
-    // POST /topics/subscribe — 把调用方所在的会话(chat)注册到某 topic 的订阅表。
-    // 与 IM 命令「订阅 <topic>」等价,只是走 MCP 让 agent 能自主订阅。self 复用
-    // peer 路由的解析链(target → sessionId → tmuxPane → defaultChat)。广播本身
-    // 是订阅者无关的,直接复用全局 POST /publish,不在这里另开。
+    // ── Topic pub/sub (MCP-driven) ─────────────────────────────────────
+    // 订阅/退订/列表/定时/取消 全部走 MCP,不再有 IM 文本命令。self 复用 peer
+    // 路由的解析链(target → sessionId → tmuxPane → defaultChat),把调用方所在
+    // 的聊天当作订阅者。即时广播是订阅者无关的,复用全局 POST /publish,不在这里
+    // 另开。持久化与 startScheduler 定时器不变。
+    const topicOf = (body: PeerBody): string => ((body as { topic?: string }).topic ?? "").trim();
+
     http.register("POST /topics/subscribe", async (req, res) => {
       const { self, body } = await readPeerBody(req);
       if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
-      const topic = ((body as { topic?: string }).topic ?? "").trim();
+      const topic = topicOf(body);
       if (!topic) { json(res, 400, { ok: false, reason: "topic required" }); return; }
       const r = subscribeTopic(cfg, sourcePath, topic, self);
       json(res, 200, { ok: true, ...r, topic, target: self, subs: (cfg.topics.subs[topic] ?? []).length });
+    });
+
+    http.register("POST /topics/unsubscribe", async (req, res) => {
+      const { self, body } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const topic = topicOf(body);
+      if (!topic) { json(res, 400, { ok: false, reason: "topic required" }); return; }
+      const r = unsubscribeTopic(cfg, sourcePath, topic, self);
+      json(res, 200, { ok: true, ...r, topic, target: self });
+    });
+
+    // List = 本聊天订阅了哪些 topic + 全部定时广播(scheduler 是进程级的)。
+    http.register("POST /topics/list", async (req, res) => {
+      const { self } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      json(res, 200, { ok: true, target: self, subs: listSubs(cfg, self), schedules: listSchedules(cfg) });
+    });
+
+    http.register("POST /topics/schedule", async (req, res) => {
+      const { self, body } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const topic = topicOf(body);
+      const b = body as { hour?: number; minute?: number; content?: string };
+      const hour = Number(b.hour);
+      const minute = Number(b.minute ?? 0);
+      const content = (b.content ?? "").toString();
+      if (!topic) { json(res, 400, { ok: false, reason: "topic required" }); return; }
+      if (!content.trim()) { json(res, 400, { ok: false, reason: "content required" }); return; }
+      if (!Number.isInteger(hour) || hour < 0 || hour > 23) { json(res, 400, { ok: false, reason: "hour must be 0-23" }); return; }
+      if (!Number.isInteger(minute) || minute < 0 || minute > 59) { json(res, 400, { ok: false, reason: "minute must be 0-59" }); return; }
+      addSchedule(cfg, sourcePath, { topic, hour, minute, content, createdBy: self, createdAt: Date.now() });
+      json(res, 200, { ok: true, topic, hour, minute, subs: (cfg.topics.subs[topic] ?? []).length });
+    });
+
+    http.register("POST /topics/cancel-schedule", async (req, res) => {
+      const { self, body } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const topic = topicOf(body);
+      if (!topic) { json(res, 400, { ok: false, reason: "topic required" }); return; }
+      const removed = removeSchedulesByTopic(cfg, sourcePath, topic);
+      json(res, 200, { ok: true, topic, removed });
     });
 
     // POST /graph/run — declare a loop graph over this chat's tagged sessions
