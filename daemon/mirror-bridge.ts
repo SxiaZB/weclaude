@@ -3590,14 +3590,17 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // The clocks themselves come from message turns, so metadata churn (which
         // bumps mtime but is not a turn) can never move them. `grewSinceLast` now
         // means a NEW message turn appeared — not that the file grew.
-        const prevLastMs = k.lastMs;
+        const prevRealMs = k.lastRealMs;
         if (mtime > k.seenMtime + 1000) {
           const s = keepaliveStamps(a.jsonlPath, pingSig);
           if (s.stamped) { k.lastMs = s.lastMs; k.lastRealMs = s.lastRealMs; }
           else { k.lastMs = mtime; k.lastRealMs = mtime; } // backend without timestamps → fall back to mtime
         }
         k.seenMtime = mtime;
-        const grewSinceLast = k.lastMs > prevLastMs + 1000;
+        // Round reset / real-activity re-anchor keys off REAL turns only — a
+        // keepalive ping+pong advances lastMs but NOT lastRealMs, so the heartbeat
+        // no longer reads as activity to itself (which was pinning round at 1/N).
+        const grewSinceLast = k.lastRealMs > prevRealMs + 1000;
         const busy = paneIsBusy(await capturePaneTail(a.tmuxPane, 12));
 
         if (k.pinging) {
