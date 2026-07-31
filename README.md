@@ -121,24 +121,22 @@ IM 里发 `/new` 直接开新 tmux 窗口 + 新 Claude 会话；`/clear` 清当�
 
 ## 事件订阅 / 定时广播
 
-一个轻量 pub/sub：任意群或单聊都能订阅一个 **topic**（自定义事件名），任何授权用户都能广播；daemon 内置分钟级调度器，每天定点自动推送。订阅关系与定时任务持久化到 `~/.wezard/config.jsonc` 的 `topics` 段，`wezard reload` 后自动恢复。
+一个轻量 pub/sub：任意群或单聊都能订阅一个 **topic**（自定义事件名），任何会话都能广播；daemon 内置分钟级调度器，每天定点自动推送。订阅关系与定时任务持久化到 `~/.wezard/config.jsonc` 的 `topics` 段，`wezard reload` 后自动恢复。
 
-**IM 命令**（在已授权的会话里说，中英文均可）：
+**全部由 MCP 工具驱动**——直接对 Claude 说人话，它自己调工具，不用记命令语法：
 
-```
-订阅 sync-daily                       # 当前会话订阅 topic（群里说→群订阅，单聊里说→个人订阅）
-退订 sync-daily
-广播 sync-daily 内容：xxx              # 立即广播给所有订阅者
-每天 08:00 广播 sync-daily 内容：xxx   # 定时（也接受「每天8点」「每天8:30」「每日 08:00」）
-广播列表 / 订阅列表                    # 查看当前状态
-取消广播 sync-daily                    # 删掉该 topic 的所有定时
-```
+| 说 | 工具 | 干什么 |
+| --- | --- | --- |
+| 「订阅 sync-daily」 | `subscribe_topic(topic)` | 把当前聊天加进某 topic 的订阅表 |
+| 「别再往这群发 sync-daily」 | `unsubscribe_topic(topic)` | 退订 |
+| 「广播 sync-daily：早会 10 分钟后开始」 | `broadcast_topic(topic, markdown)` | 立即扇出给所有订阅者，返回 `sent / failed / subs` |
+| 「每天 8 点广播 sync-daily：…」 | `schedule_broadcast(topic, hour, minute, content)` | 注册每日定时广播 |
+| 「取消 sync-daily 的定时」 | `cancel_broadcast(topic)` | 删掉该 topic 的所有定时 |
+| 「我订了什么 / 有哪些定时」 | `list_topics()` | 列出本聊天订阅 + 全部定时 |
 
-典型用法：在群 A 说 `订阅 sync-daily`，在群 B 说 `每天8点广播 sync-daily 内容：早会 10 分钟后开始`——第二天早 8 点群 A 自动收到。
+典型用法：在群 A 说「订阅 sync-daily」，在群 B 说「每天 8 点广播 sync-daily：早会 10 分钟后开始」——第二天早 8 点群 A 自动收到。一个 agent 也能在跑完任务后自己 `broadcast_topic` 汇报结果，无需人工敲命令。
 
-**MCP 工具**（Claude 自主订阅 / 广播）：`subscribe_topic(topic)` 把当前会话所在的聊天注册进某 topic 的订阅表；`broadcast_topic(topic, markdown)` 把内容扇出给所有订阅者，返回 `sent / failed / subs`。与上面的 IM 命令共用同一份订阅表（`config.jsonc` 的 `topics.subs`），所以你说「订阅 xxx」和 AI 调 `subscribe_topic` 完全等价。这样一个 agent 可以在跑完任务后自己广播结果，无需人工在群里敲命令。
-
-**外部触发**（CI / 监控 / 脚本）：
+**外部触发**（CI / 监控 / 脚本，无需 MCP）：daemon 在 loopback 暴露 `POST /publish`，广播给某 topic 的所有订阅者：
 
 ```bash
 curl -sS -X POST http://127.0.0.1:17890/publish \
@@ -146,13 +144,15 @@ curl -sS -X POST http://127.0.0.1:17890/publish \
   -d '{"topic":"ci-fail","markdown":"🔴 build #1234 failed on main"}'
 ```
 
-调用方只关心事件名，运维通过 IM 命令改订阅者，代码零改动。
+调用方只关心事件名，订阅者由 AI 通过 MCP 工具增删，代码零改动。
 
 ---
 
 ## 一个聊天里跑多个会话（`#tag` 路由）
 
 同一个 WeCom 聊天里可以同时挂多个并行 Claude session，靠消息里的 `#tag` 前缀路由。不带 tag 就是默认 session，与旧行为一致。
+
+![多会话](images/multi-session.png)
 
 **创建 & 切换**
 
@@ -267,11 +267,17 @@ IM 里发 `/help` 可随时拉出完整命令表；每次 `/new`、`/clear` 之�
 wezard status              # 看 daemon + WS 健康
 wezard logs -f             # 实时日志
 wezard send <chat> <text>  # 主动推消息
+wezard sync                # 重写 hook/MCP/env 进各 settings.json
 wezard reload              # 重启 daemon（改了配置后用）
+wezard migrate             # 一次性：从旧名 weclaude 迁移到 wezard
 wezard unsync              # 卸载 hook/MCP（保留 daemon）
 wezard uninstall           # 完整卸载（先于 npm uninstall）
 ```
 
+> ⬆️ **升级**：`npm i -g wezard@latest` 装新版二进制，再 `wezard sync && wezard reload` 刷新 hook/MCP 注入并重启 daemon（幂等，`~/.wezard/` 的 config/secrets 原样保留）。
+>
+> `wezard migrate` 只用于从**旧包名 `weclaude`** 迁移（搬 `~/.weclaude` → `~/.wezard`、重装 daemon/插件），普通版本升级用不到。
+>
 > ⚠️ **卸载顺序**：先 `wezard uninstall` 再 `npm uninstall -g wezard`。否则 launchd/systemd 会一直尝试拉起已删除的二进制。`~/.wezard/` 下的 config/secrets 不会被清，二次安装可无缝复用。
 
 ---
