@@ -21,7 +21,7 @@ import {
   clearAutoWindow,
   getWindowMeta,
 } from "./session-cache.js";
-import { NEVER_RULE_ALLOW, alwaysAllowRulesFor, ruleAllows, ruleMatchesAny, splitSegments } from "../shared/allow-rules.js";
+import { NEVER_RULE_ALLOW, alwaysAllowRulesFor, evaluateAllow, ruleMatchesAny, splitSegments, type DenyReason } from "../shared/allow-rules.js";
 import { claudeConfigWrite, type ClaudeConfigHit } from "../shared/claude-config-path.js";
 import type { NativeModalAnswer } from "./mirror-bridge.js";
 import { appendUnique } from "../shared/config-writer.js";
@@ -70,8 +70,10 @@ interface CardArgs {
   detailUrl?: string;  // 空则不渲染 jump_list
   /** 命中危险名单的规则名。非空 → 卡片去掉「全过」按钮, 必须单次确认。 */
   danger?: string;
-  /** 会话名 (#tag / 首条用户消息 / 短 id) — 发卡时算好, resolved 卡直接复用。 */
+  /** 会话名 (#tag / CC 会话名 / 首条用户消息 / 短 id) — 发卡时算好, resolved 卡复用。 */
   sessionName?: string;
+  /** 未命中 allowRules 的具体原因 — 渲染到「审核」行。 */
+  denyReason?: DenyReason;
 }
 
 const TRUNC = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -95,13 +97,13 @@ const WRITE_PREVIEW_CHARS = 200;
 
 const SOURCE_ICON = "https://wwcdn.weixin.qq.com/node/wework/images/3d-claude-ai-logo.bce0ddae70.jpg";
 
-// Source 行只承担身份/状态: 文案固定品牌位, 危险卡只把文字变红 (desc_color: 2),
-// 不换文案不加图标 —— 红色本身就是信号。上文 (transcriptTail) 不塞这里: 它只有
-// 一行 13 字的可见量, 在 horizontal_content_list (26 字) 里。
-const buildSource = (danger?: string): TemplateCard["source"] =>
+// Source 行 = 会话身份位: 放会话名 (谁在请求), 让 main_title 整块 13×2 字腾给
+// "想干什么"。危险卡只把这行文字变红 (desc_color: 2), 不换文案不加图标 ——
+// 红色本身就是信号。会话名缺失时回落品牌名, 不留空行。
+const buildSource = (danger?: string, sessionName?: string): TemplateCard["source"] =>
   ({
     icon_url: SOURCE_ICON,
-    desc: "Claude Code",
+    desc: TRUNC(sessionName || "Claude Code", 13),
     desc_color: danger ? 2 : 0,
   }) as TemplateCard["source"];
 
@@ -257,9 +259,28 @@ const emojiFor = tagBadge;
 // 会话名: #tag (企微发起) > CC 会话名 (本地发起, sessions 注册表) > 首条消息。
 const HMETA_VAL_MAX = 26;
 
-// 标题只放会话名 —— 工具名在下面的命令正文里一眼可见, 标题重复它是浪费
-// main_title 那 13×2 字的宝贵空间。
-const cardTitle = (a: CardArgs): string => a.sessionName || a.sessionShort;
+// 一级标题 = Claude 自己写的意图 (tool_input.description), 回答"想干什么" ——
+// 13×2 字里最值钱的内容。没有 description 的工具 (Read/Write/Edit…) 回落
+// 「工具 · 目录/」, 因为具体路径在下面的引用区里已经有了。
+const cardTitle = (a: CardArgs, r: Rendered): string =>
+  r.desc || `${shortTool(a.toolName)} · ${dirName(a.cwd)}/`;
+
+// 「审核」行: 说清这条命令为什么没被白名单放行 —— 与「危险」行同一种表达方式。
+// 能算出「总是」将生成的规则时直接给规则 (点总是会发生什么), 否则给段落定位。
+const denyReasonText = (d: DenyReason): string | undefined => {
+  switch (d.kind) {
+    case "segment_unmatched":
+      return d.rule
+        ? `${d.index}/${d.total}段 → ${d.rule}`
+        : `${d.index}/${d.total}段 ${d.segment}`;
+    case "substitution": return "含 $() 动态构造，无法白名单";
+    case "unparsable": return "引号未闭合或含后台符 &";
+    case "tool_not_listed": return `${shortTool(d.tool)} 未在白名单`;
+    case "never_allow": return "交互工具，永不免审";
+    // 没配白名单规则 = 用户没在用这套机制, 每张卡都挂这行纯噪声。
+    case "no_rules": return undefined;
+  }
+};
 
 // mcp__server__tool → server:tool — 标题里的长工具名压短。
 const shortTool = (toolName: string): string =>
@@ -269,7 +290,14 @@ const metaRows = (a: CardArgs): TemplateCard["horizontal_content_list"] => {
   const rows: Array<{ keyname: string; value: string }> = [];
   const tail = oneLine(a.transcriptTail).trim();
   if (tail) rows.push({ keyname: "上文", value: TRUNC(tail, HMETA_VAL_MAX) });
-  if (a.danger) rows.push({ keyname: "危险", value: TRUNC(`命中「${a.danger}」`, HMETA_VAL_MAX) });
+  // 为什么要人来点这一下 —— 优先级 危险 > 未白名单。danger 命中时命令很可能
+  // 本来就在白名单里, 再报"未放行"是误导。
+  if (a.danger) {
+    rows.push({ keyname: "危险", value: TRUNC(`命中「${a.danger}」`, HMETA_VAL_MAX) });
+  } else if (a.denyReason) {
+    const why = denyReasonText(a.denyReason);
+    if (why) rows.push({ keyname: "审核", value: TRUNC(why, HMETA_VAL_MAX) });
+  }
   return rows.length > 0 ? (rows as TemplateCard["horizontal_content_list"]) : undefined;
 };
 
@@ -333,8 +361,8 @@ const buildCard = (a: CardArgs): TemplateCard => {
   const menu = fullCmdMenu(a);
   return {
     card_type: "button_interaction",
-    source: buildSource(a.danger),
-    main_title: mainTitle(cardTitle(a), r.desc),
+    source: buildSource(a.danger, a.sessionName),
+    main_title: { title: TRUNC(cardTitle(a, r), 26) },
     ...bodyBlocks(a, r),
     ...(menu ? { action_menu: menu } : {}),
     ...(jl ? { jump_list: jl } : {}),
@@ -389,8 +417,8 @@ const buildResolvedCard = (
   const menu = fullCmdMenu(a);
   return {
     card_type: "button_interaction",
-    source: buildSource(a.danger),
-    main_title: mainTitle(cardTitle(a), r.desc),
+    source: buildSource(a.danger, a.sessionName),
+    main_title: { title: TRUNC(cardTitle(a, r), 26) },
     ...bodyBlocks(a, r),
     ...(menu ? { action_menu: menu } : {}),
     ...(jl ? { jump_list: jl } : {}),
@@ -404,8 +432,8 @@ const buildCancelledCard = (a: CardArgs): TemplateCard => {
   const jl = detailJumpList(a.detailUrl);
   return {
     card_type: "button_interaction",
-    source: buildSource(a.danger),
-    main_title: mainTitle(cardTitle(a), r.desc),
+    source: buildSource(a.danger, a.sessionName),
+    main_title: { title: TRUNC(cardTitle(a, r), 26) },
     ...bodyBlocks(a, r),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -421,8 +449,8 @@ const buildAlreadyResolvedCard = (a: CardArgs): TemplateCard => {
   const jl = detailJumpList(a.detailUrl);
   return {
     card_type: "button_interaction",
-    source: buildSource(a.danger),
-    main_title: mainTitle(cardTitle(a), r.desc),
+    source: buildSource(a.danger, a.sessionName),
+    main_title: { title: TRUNC(cardTitle(a, r), 26) },
     ...bodyBlocks(a, r),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
@@ -457,6 +485,8 @@ interface ActiveBatch {
   danger?: string;
   /** 会话名 (同 CardArgs.sessionName) — 批次内成员同 session, 开批时算一次。 */
   sessionName?: string;
+  /** 未命中 allowRules 的原因 (同 CardArgs.denyReason)。 */
+  denyReason?: DenyReason;
   members: BatchMember[];
   flushTimer: NodeJS.Timeout;
   flushed: boolean;
@@ -509,7 +539,7 @@ const batchBlocks = (batch: ActiveBatch, transcriptTail: string): Partial<Templa
 
 const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCard => ({
   card_type: "button_interaction",
-  source: buildSource(batch.danger),
+  source: buildSource(batch.danger, batch.sessionName),
   main_title: { title: batchTitle(batch) },
   ...batchBlocks(batch, transcriptTail),
   task_id: batch.batchId,
@@ -539,7 +569,7 @@ const buildBatchResolvedCard = (
       };
   return {
     card_type: "button_interaction",
-    source: buildSource(batch.danger),
+    source: buildSource(batch.danger, batch.sessionName),
     main_title: { title: batchTitle(batch) },
     ...batchBlocks(batch, transcriptTail),
     task_id: batch.batchId,
@@ -549,7 +579,7 @@ const buildBatchResolvedCard = (
 
 const buildBatchAlreadyResolvedCard = (batch: ActiveBatch, transcriptTail: string): TemplateCard => ({
   card_type: "button_interaction",
-  source: buildSource(batch.danger),
+  source: buildSource(batch.danger, batch.sessionName),
   main_title: { title: batchTitle(batch) },
   ...batchBlocks(batch, transcriptTail),
   task_id: batch.batchId,
@@ -1627,6 +1657,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
             windowMinutes: batch.windowMinutes,
             danger: batch.danger,
             sessionName: batch.sessionName,
+            denyReason: batch.denyReason,
             detailUrl: detailUrlFor(m.reqId),
           });
         })();
@@ -1732,13 +1763,17 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     const mustCard = Boolean(danger) || Boolean(askHit) || guardActive;
 
     // allowRules: matcher 拦下的工具里再挖细粒度豁免 (Bash 可按命令前缀区分)。
-    // 交互卡工具 (AskUserQuestion 等) 在 ruleAllows 内部硬保护, 规则写了也不放行。
-    const ruleHit = mustCard ? undefined : ruleAllows(cfg.approval.allowRules, toolName, toolInput);
-    if (ruleHit) {
+    // 交互卡工具 (AskUserQuestion 等) 在引擎内部硬保护, 规则写了也不放行。
+    // 用 evaluateAllow 而非 ruleAllows: 未命中时要把"因为哪一段"带到卡上,
+    // 光知道"没放行"帮不了用户判断。判定本身零额外开销 (原本就要跑这一次)。
+    const verdict = evaluateAllow(cfg.approval.allowRules, toolName, toolInput);
+    if (!mustCard && verdict.allowed) {
+      const ruleHit = [...new Set(verdict.hits)].join(" + ");
       log.info({ toolName, sessionId, rule: ruleHit }, "allow-rule skip");
       json(res, 200, { decision: "allow", reason: `allow_rule:${ruleHit}` } satisfies ApproveResp);
       return;
     }
+    const denyReason = verdict.allowed ? undefined : verdict.reason;
 
     // EnterPlanMode: block model-initiated plan mode. deny + reason 回传 model,
     // 让它别进 plan mode、直接干活。用户仍可在本地 Shift+Tab 手动进 plan mode
@@ -1882,6 +1917,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         transcriptTail,
         danger: danger?.rule,
         sessionName,
+        denyReason,
         cardSent: Boolean(resumeId), // 续接的前提就是卡已经在群里
         forceSingle: mustCard,
       },
@@ -1921,6 +1957,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         windowMinutes: cfg.approval.windowMinutes,
         danger: danger?.rule,
         sessionName,
+        denyReason,
         members: [member],
         flushed: false,
         flushTimer: undefined as unknown as NodeJS.Timeout, // set below
@@ -2393,6 +2430,7 @@ export const installApprovalEventListener = (
               transcriptTail: meta?.transcriptTail ?? "",
               windowMinutes: cfg.approval.windowMinutes,
               sessionName: meta?.sessionName,
+              denyReason: meta?.denyReason,
               detailUrl: detailUrlFor(reqId),
             })
           : buildResolvedCard({
@@ -2410,6 +2448,7 @@ export const installApprovalEventListener = (
               chatKey: meta?.chatKey ?? "",
               danger: meta?.danger,
               sessionName: meta?.sessionName,
+              denyReason: meta?.denyReason,
               detailUrl: detailUrlFor(reqId),
             });
         await client.updateTemplateCard(frame, card);

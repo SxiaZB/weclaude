@@ -2,6 +2,7 @@
 // Used for both PreToolUse approvals and any other "send card → wait click" flows.
 import { randomUUID } from "node:crypto";
 import { baseOfKey } from "../shared/session-label.js";
+import type { DenyReason } from "../shared/allow-rules.js";
 
 export type Decision = "allow" | "allow_session" | "allow_window" | "allow_always" | "deny";
 
@@ -20,6 +21,8 @@ export interface PendingMeta {
   /** 命中危险名单的规则名 (daemon/danger.ts)。仅用于卡片渲染 (⚠️ 标题 + 去掉
    *  「全过」按钮); 「必须单独点」这一属性由 forceSingle 表达。 */
   danger?: string;
+  /** 未命中 allowRules 的原因 — 卡片「审核」行的数据源, resolved 卡重渲染复用。 */
+  denyReason?: DenyReason;
   /** 卡片标题上的会话名 (#tag / transcript 首条用户消息 / 短 id), 发卡时算好,
    *  resolved 卡重渲染直接复用 — 事件回调里没有 transcript_path 可现算。 */
   sessionName?: string;
