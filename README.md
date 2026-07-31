@@ -1,4 +1,4 @@
-# weclaude
+# wezard
 
 **把 Claude Code 装进企业微信。** 在地铁上、被窝里、开会摸鱼时，照样能跟你电脑上的 Claude 干活。
 
@@ -12,7 +12,7 @@
 - 📡 **MCP 主动推送** — Claude 通过 `wecom__send_markdown` / `wecom__send_card` / `wecom__ask_user` 主动汇报或问询。
 - 📄 **文档读写** — Claude 通过 `wecom_doc_list_tools` / `wecom_doc_call` 直接调企业微信智能机器人的 doc / smartsheet / smartpage MCP，新建在线文档、写 Markdown、读链接、操作智能表格——全程在内网，不需要 corp access_token。
 - 🗂 **多会话发现/切换** — Claude 通过 `list_claude_sessions` / `switch_claude_session` / `new_claude_session` 列出本机 tmux 内所有在跑的 Claude 会话（带摘要 + 稳定动物 emoji 标签）、把 IM 镜像切到其中任一个、或在指定路径新开一个会话。审批卡标题也带同一枚 emoji，多个会话兜底到同一 IM 时一眼区分。
-- 🔄 **重启即续** — 电脑重启 / tmux 全没了 / daemon 崩了都不掉档：IM ↔ 会话绑定持久化在 `~/.weclaude/mirror-attachments.json`，下一条 IM 消息自动 `claude --resume` 拉起新 tmux pane，历史完整继承；`tmux attach -t weclaude` 接管即可。
+- 🔄 **重启即续** — 电脑重启 / tmux 全没了 / daemon 崩了都不掉档：IM ↔ 会话绑定持久化在 `~/.wezard/mirror-attachments.json`，下一条 IM 消息自动 `claude --resume` 拉起新 tmux pane，历史完整继承；`tmux attach -t wezard` 接管即可。
 
 ---
 
@@ -21,18 +21,18 @@
 **前置**：macOS / Linux、Node ≥ 20、PATH 里能找到 `claude` 或 `claude-internal`、企业微信「智能机器人」的 `botId` + `secret`。镜像模式额外需要 `tmux`。
 
 ```bash
-npm install -g weclaude
-weclaude init
+npm install -g wezard
+wezard init
 ```
 
-`init` 会交互式问你 4 个问题，把配置落到 `~/.weclaude/`：
+`init` 会交互式问你 4 个问题，把配置落到 `~/.wezard/`：
 
 | 问什么 | 落到哪 |
 | --- | --- |
-| botId / secret | `~/.weclaude/secrets.json` |
-| 用哪个 Claude（`claude` / `claude-internal` / 自定义路径） | `~/.weclaude/config.jsonc` |
-| 用哪种模式（`headless` / `mirror`，见下文） | `~/.weclaude/config.jsonc` |
-| 是否开启 PreToolUse 远程审批 | `~/.weclaude/config.jsonc` |
+| botId / secret | `~/.wezard/secrets.json` |
+| 用哪个 Claude（`claude` / `claude-internal` / 自定义路径） | `~/.wezard/config.jsonc` |
+| 用哪种模式（`headless` / `mirror`，见下文） | `~/.wezard/config.jsonc` |
+| 是否开启 PreToolUse 远程审批 | `~/.wezard/config.jsonc` |
 
 然后自动：编译 → 注入 hook/MCP → 装常驻 daemon（macOS launchd / Linux systemd --user）→ 等 WebSocket 鉴权。
 
@@ -49,28 +49,28 @@ weclaude init
 **从某个 fork / 分支装（自带改动的版本）**：`dist/` 不入库，但 `prepare` 脚本会在 git 安装时自动编译，所以可以直接：
 
 ```bash
-npm i -g github:<你的用户名>/weclaude          # 默认分支
-npm i -g github:<你的用户名>/weclaude#<分支名>   # 指定分支
+npm i -g github:<你的用户名>/wezard          # 默认分支
+npm i -g github:<你的用户名>/wezard#<分支名>   # 指定分支
 ```
 
-**内网 / 需要正向代理**：weclaude 的出站（WeCom WebSocket、智能机器人文档 MCP）会读环境变量里的代理。安装与运行都带上 `HTTPS_PROXY`：
+**内网 / 需要正向代理**：wezard 的出站（WeCom WebSocket、智能机器人文档 MCP）会读环境变量里的代理。安装与运行都带上 `HTTPS_PROXY`：
 
 ```bash
-HTTPS_PROXY=http://your-proxy:port npm i -g github:<你的用户名>/weclaude
+HTTPS_PROXY=http://your-proxy:port npm i -g github:<你的用户名>/wezard
 # 也可在 config.jsonc 写死: bot.proxy = "http://your-proxy:port"（优先级高于环境变量）
 ```
 
 daemon 进程同样需要能读到代理变量（见下方守护脚本里 `export HTTPS_PROXY`）。
 
-**无 systemd 的环境（容器等）**：`init` 装 daemon 这步在 macOS 走 launchd、Linux 走 `systemd --user`。若机器没有 systemd user session（很多容器：PID 1 非 systemd、无 `XDG_RUNTIME_DIR`），这步会失败——其余配置（hook / MCP / 插件）已生效，只差 daemon 没被托管。用一个简单的重启循环守护即可，存成 `~/.weclaude/daemonctl.sh`：
+**无 systemd 的环境（容器等）**：`init` 装 daemon 这步在 macOS 走 launchd、Linux 走 `systemd --user`。若机器没有 systemd user session（很多容器：PID 1 非 systemd、无 `XDG_RUNTIME_DIR`），这步会失败——其余配置（hook / MCP / 插件）已生效，只差 daemon 没被托管。用一个简单的重启循环守护即可，存成 `~/.wezard/daemonctl.sh`：
 
 ```bash
 #!/usr/bin/env bash
-# 无 systemd 时的 weclaude daemon 守护：setsid 脱离终端的重启循环。
+# 无 systemd 时的 wezard daemon 守护：setsid 脱离终端的重启循环。
 set -uo pipefail
-REPO="$(npm root -g)/weclaude"
+REPO="$(npm root -g)/wezard"
 NODE="$(command -v node)"
-WC="$HOME/.weclaude"; PIDFILE="$WC/supervisor.pid"; LOG="$WC/daemon.log"
+WC="$HOME/.wezard"; PIDFILE="$WC/supervisor.pid"; LOG="$WC/daemon.log"
 mkdir -p "$WC"
 # 内网：daemon 出站要走代理。按需改成你的代理地址，或删掉这两行。
 export HTTPS_PROXY="${HTTPS_PROXY:-http://your-proxy:port}"; export https_proxy="$HTTPS_PROXY"
@@ -92,12 +92,12 @@ esac
 ```
 
 ```bash
-chmod +x ~/.weclaude/daemonctl.sh
-~/.weclaude/daemonctl.sh start    # 起 daemon（自带崩溃重启）
-~/.weclaude/daemonctl.sh status   # 看状态
+chmod +x ~/.wezard/daemonctl.sh
+~/.wezard/daemonctl.sh start    # 起 daemon（自带崩溃重启）
+~/.wezard/daemonctl.sh status   # 看状态
 ```
 
-容器重启不会自动拉起 daemon——把 `~/.weclaude/daemonctl.sh start` 加进 shell profile 或容器入口即可（幂等，已在跑就 no-op）。
+容器重启不会自动拉起 daemon——把 `~/.wezard/daemonctl.sh start` 加进 shell profile 或容器入口即可（幂等，已在跑就 no-op）。
 
 ---
 
@@ -111,9 +111,9 @@ chmod +x ~/.weclaude/daemonctl.sh
 | **流式输出** | 转发 assistant 文本块 | 完整流式：打字机、tool_use、思考过程都看得到 |
 | **适合谁** | 简单单轮问答 / CI 类自动化 | 真·远程结对编程 |
 
-镜像模式下，IM 里发 `/new` 直接开新 tmux 窗口 + 新 Claude 会话；`/clear` 清当前上下文；带图消息自动注入剪贴板。所有 IM 聊天共享一个 tmux session（默认名 `weclaude`），每个聊天一个独立 window，**关 tmux / daemon 崩了 / 整机重启都能自愈**：IM↔会话绑定 write-through 落到 `~/.weclaude/mirror-attachments.json`，daemon 起来就 eager restore；重启后 pane 全死，下一条 IM 消息触发 `claude --resume <sid>` 拉起新 pane，`--resume` fork 出的新 jsonl 由 watcher 从 EOF 无缝接管（不会把整段历史再推一遍到 IM）。中途在别处 `/clear` 把 jsonl rotate 掉也不丢绑定，会自愈到同项目目录下最新的 jsonl。
+镜像模式下，IM 里发 `/new` 直接开新 tmux 窗口 + 新 Claude 会话；`/clear` 清当前上下文；带图消息自动注入剪贴板。所有 IM 聊天共享一个 tmux session（默认名 `wezard`），每个聊天一个独立 window，**关 tmux / daemon 崩了 / 整机重启都能自愈**：IM↔会话绑定 write-through 落到 `~/.wezard/mirror-attachments.json`，daemon 起来就 eager restore；重启后 pane 全死，下一条 IM 消息触发 `claude --resume <sid>` 拉起新 pane，`--resume` fork 出的新 jsonl 由 watcher 从 EOF 无缝接管（不会把整段历史再推一遍到 IM）。中途在别处 `/clear` 把 jsonl rotate 掉也不丢绑定，会自愈到同项目目录下最新的 jsonl。
 
-> 💡 **mirror 不要求你必须先在 CLI 里开 tmux**：在企业微信里直接发 `/new` 就能从零起一个新 tmux 窗口 + Claude 会话；甚至首次发任意消息都会自动 spawn + 绑定（首条消息既是绑定信号也是第一句 prompt）。回家打开终端 `tmux attach -t weclaude` 接管即可。
+> 💡 **mirror 不要求你必须先在 CLI 里开 tmux**：在企业微信里直接发 `/new` 就能从零起一个新 tmux 窗口 + Claude 会话；甚至首次发任意消息都会自动 spawn + 绑定（首条消息既是绑定信号也是第一句 prompt）。回家打开终端 `tmux attach -t wezard` 接管即可。
 
 ---
 
@@ -145,7 +145,7 @@ chmod +x ~/.weclaude/daemonctl.sh
 
 ## 文档 / 智能表格 / 智能文档
 
-`weclaude` 把企业微信智能机器人的远端 MCP（doc / smartsheet / contact 等）桥接到本地 Claude，**不走 corp access_token**：daemon 直接复用 botId+secret 的 WS 长连，通过 `aibot_get_mcp_config` 命令拉到每个 category 的 Streamable HTTP MCP URL，再以 JSON-RPC 调 `tools/list` / `tools/call`，`x-openclaw-wecom-userid` header 透传文档归属人。
+`wezard` 把企业微信智能机器人的远端 MCP（doc / smartsheet / contact 等）桥接到本地 Claude，**不走 corp access_token**：daemon 直接复用 botId+secret 的 WS 长连，通过 `aibot_get_mcp_config` 命令拉到每个 category 的 Streamable HTTP MCP URL，再以 JSON-RPC 调 `tools/list` / `tools/call`，`x-openclaw-wecom-userid` header 透传文档归属人。
 
 **前置一次性授权**：在企业微信「工作台 - 智能机器人 - 你的机器人 - 可使用权限」里勾选「文档」「智能表格」对应能力。第一次调用如果未授权，远端会返回结构化错误（errcode 851013）+ 授权链接，原样转给 Claude，照着点同意即可。
 
@@ -186,7 +186,7 @@ curl -sS -X POST http://127.0.0.1:17890/wedoc/invalidate -H 'content-type: appli
 
 ## 事件订阅 / 定时广播
 
-一个轻量 pub/sub：任意群或单聊都能订阅一个 **topic**（自定义事件名），任何授权用户都能广播；daemon 内置分钟级调度器，每天定点自动推送。订阅关系与定时任务持久化到 `~/.weclaude/config.jsonc` 的 `topics` 段，`weclaude reload` 后自动恢复。
+一个轻量 pub/sub：任意群或单聊都能订阅一个 **topic**（自定义事件名），任何授权用户都能广播；daemon 内置分钟级调度器，每天定点自动推送。订阅关系与定时任务持久化到 `~/.wezard/config.jsonc` 的 `topics` 段，`wezard reload` 后自动恢复。
 
 **IM 命令**（在已授权的会话里说，中英文均可）：
 
@@ -222,7 +222,7 @@ sequenceDiagram
     autonumber
     participant CC as Claude Code
     participant Hook as PreToolUse hook
-    participant D as weclaude daemon
+    participant D as wezard daemon
     participant WS as WeCom WS
     participant U as 你 (IM)
 
@@ -246,7 +246,7 @@ sequenceDiagram
     autonumber
     participant U as 你 (IM)
     participant WS as WeCom WS
-    participant D as weclaude daemon
+    participant D as wezard daemon
     participant T as tmux + claude
     participant J as session.jsonl
 
@@ -316,40 +316,82 @@ tagged session 的每条回复自带 `emoji #tag` 前缀（emoji 由 tag 名 has
 
 ---
 
-## 常用命令
+## 多 CLI 后端（`claude` / `claude-internal` / `codebuddy`）
 
-```bash
-weclaude status              # 看 daemon + WS 健康
-weclaude logs -f             # 实时日志
-weclaude send <chat> <text>  # 主动推消息
-weclaude reload              # 重启 daemon（改了配置后用）
-weclaude unsync              # 卸载 hook/MCP（保留 daemon）
-weclaude uninstall           # 完整卸载（先于 npm uninstall）
+daemon 同时挂载所有已安装的 CLI，不是二选一：你可以一个 tmux 窗口跑 `claude`、另一个跑 `codebuddy`，各自绑不同的 IM 聊天。**会话身份就是它的 jsonl 路径**，daemon 由路径反推是哪个 CLI 写的，`--resume` 用哪个二进制、jsonl 用哪套 schema 解析、project-dir 怎么编码，全部由此派生。
+
+```
+/new                 沿用「当前会话」的 CLI 新开
+/new codebuddy       换到 codebuddy 新开
+/new claude-internal 换到 claude-internal 新开
 ```
 
-> ⚠️ **卸载顺序**：先 `weclaude uninstall` 再 `npm uninstall -g weclaude`。否则 launchd/systemd 会一直尝试拉起已删除的二进制。`~/.weclaude/` 下的 config/secrets 不会被清，二次安装可无缝复用。
+默认后端由 `wrc.defaultCli` 决定（缺省 `claude`），二进制路径可用 `wrc.cliBackends.<name>.bin` 覆盖。
+
+**和 `#tag` 完全正交**，两者可以任意组合、顺序不限：
+
+```
+/new codebuddy #docs    用 codebuddy 起一个 docs 标签会话
+/new #docs codebuddy    等价写法
+#docs 帮我改 README      → 路由到那个 codebuddy 会话
+/clear #docs            → 只清它，且仍留在 codebuddy 上
+```
+
+切换 CLI 后 tag 路由的所有行为都保持不变：
+
+- `/clear #tag` rotate 出的新 jsonl 仍落在该 CLI 的 projects 目录，watcher 按该后端的 dialect 迁移绑定；
+- pane 挂了自愈 `--resume` 用的是**该会话所属**的二进制，不会串到 `defaultCli`；
+- 首次 `/new #tag` 没有自己的历史记录时，**继承本聊天基础会话的 CLI**（与 cwd 的聊天级继承规则一致），不会悄悄退回默认后端；
+- `/sessions` 列表在混用多个 CLI 时，每行自动标注 `(codebuddy)` 之类的来源。
+
+---
+
+## 常用命令
+
+IM 里发 `/help` 可随时拉出完整命令表；每次 `/new`、`/clear` 之后，回执会随机附一条功能提示，用来慢慢摊开命令面。
+
+```
+/new · /clear · /stop · /n          会话控制
+/sessions [emoji|id]                 列出 / 切换 live 会话
+/new <cli> [#tag]                    切换 CLI 后端 / 开并行会话
+/id · /pwd · /usage · /cost · /audit  信息查询（免授权）
+/help                                全部命令
+```
+
+本机 shell：
+
+```bash
+wezard status              # 看 daemon + WS 健康
+wezard logs -f             # 实时日志
+wezard send <chat> <text>  # 主动推消息
+wezard reload              # 重启 daemon（改了配置后用）
+wezard unsync              # 卸载 hook/MCP（保留 daemon）
+wezard uninstall           # 完整卸载（先于 npm uninstall）
+```
+
+> ⚠️ **卸载顺序**：先 `wezard uninstall` 再 `npm uninstall -g wezard`。否则 launchd/systemd 会一直尝试拉起已删除的二进制。`~/.wezard/` 下的 config/secrets 不会被清，二次安装可无缝复用。
 
 ---
 
 ## 常见问题
 
 **Q: hook 不触发？**
-`cat ~/.claude/settings.json | jq .hooks.PreToolUse`，没东西就跑 `weclaude sync` 重写。
+`cat ~/.claude/settings.json | jq .hooks.PreToolUse`，没东西就跑 `wezard sync` 重写。
 
 **Q: 卡片点了没反应？**
 企业微信卡片就地刷新只有 5 秒窗口，超时不刷新是正常的，决策本身仍然生效。
 
 **Q: daemon 起不来？**
-`weclaude logs -f` 看；常见是 `botId` / `secret` 写错卡在 WebSocket 鉴权。
+`wezard logs -f` 看；常见是 `botId` / `secret` 写错卡在 WebSocket 鉴权。
 
 **Q: 多机部署？**
-`config.jsonc` 可以纳入 dotfiles；`secrets.json` 每台机器独立填。第二台机器跑 `weclaude init` 会跳过覆盖提示，但仍要重新走 claim 步骤拿本机 IM principal。
+`config.jsonc` 可以纳入 dotfiles；`secrets.json` 每台机器独立填。第二台机器跑 `wezard init` 会跳过覆盖提示，但仍要重新走 claim 步骤拿本机 IM principal。
 
 ---
 
 ## 架构一瞥
 
-三个进程走 `127.0.0.1:17890` + `~/.weclaude/`：
+三个进程走 `127.0.0.1:17890` + `~/.wezard/`：
 
 ```
  WeCom ── WebSocket ──► daemon (常驻, launchd/systemd)

@@ -1,6 +1,7 @@
 // Daemon entry. Resident process — exits only on signal or fatal WS auth failure.
 import { loadConfig } from "../shared/config.js";
 import { makeLogger } from "../shared/log.js";
+import { bindCliBackends, type CliBackendName } from "../shared/cli-backends.js";
 import { startWs } from "./ws.js";
 import { startHttp, json } from "./http.js";
 import { installInboundRouter } from "./inbound.js";
@@ -10,10 +11,11 @@ import { makeBridge } from "./cc-bridge.js";
 import { startMirror, installMirrorEventListener, type MirrorBridge } from "./mirror-bridge.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { installApprovalEventListener, makeApproveHandler } from "./approval.js";
-import { initDetailPersistence, makeDetailHandler, configureRemoteForward } from "./detail.js";
+import { initDetailPersistence, makeDetailHandler, chatHandlers, configureRemoteForward } from "./detail.js";
 import { initAutoWindowPersistence } from "./session-cache.js";
 import { makeMessageHandler } from "./outbound.js";
 import { makeCardHandler, makeAskHandler, installAskEventListener } from "./ask.js";
+import { drainForReload } from "./pending.js";
 import {
   makeClaimStartHandler,
   makeClaimStatusHandler,
@@ -23,12 +25,24 @@ import { makeWedocBridge } from "./wedoc.js";
 import { installResponseTracker } from "./last-response.js";
 import { scanClaudeSessions } from "./session-scan.js";
 import { startScheduler, publish as publishTopic } from "./topics.js";
+import { baseOfKey, keyOf } from "../shared/session-label.js";
+import {
+  startGraph,
+  stopRun,
+  getRun,
+  listRuns,
+  validateSpec,
+  waitForIdle,
+  type GraphSpec,
+  type GraphNodeSpec,
+  type GraphStepSpec,
+} from "./graph.js";
 
 // pino's file transport is async; without flush, log.fatal before process.exit
 // vanishes. Mirror anything fatal to stderr too so launchd's stderr.log captures it.
 const fatalExit = (msg: string, extra?: Record<string, unknown>): never => {
   // eslint-disable-next-line no-console
-  console.error(`[weclaude-daemon] FATAL: ${msg}`, extra ?? "");
+  console.error(`[wezard-daemon] FATAL: ${msg}`, extra ?? "");
   process.exit(1);
 };
 
@@ -37,12 +51,20 @@ const main = async (): Promise<void> => {
   const log = makeLogger({
     logFile: cfg.daemon.logFile,
     logLevel: cfg.daemon.logLevel,
-    name: "weclaude-daemon",
+    name: "wezard-daemon",
   });
   log.info({ sourcePath, pid: process.pid }, "daemon start");
 
+  // Bind the CLI backend registry. `primary` (= defaultCli) drives new-session
+  // spawns; `backends` is every installed CLI whose transcript root exists, so
+  // sessions from all of them can be mirrored concurrently — each attachment
+  // derives its dialect from its own jsonl path. Must run BEFORE any mirror
+  // attach / tmux spawn.
+  const { primary, backends } = bindCliBackends({ ...cfg.wrc, projectsDirOverride: cfg.wrc.mirror.projectsDir });
+  log.info({ primary: primary.name, bin: primary.bin, backends: backends.map((b) => b.name) }, "cli backends bound");
+
   // Restore auto-approve windows persisted across daemon restarts —
-  // otherwise a `weclaude reload` silently drops the user's "10min" choice.
+  // otherwise a `wezard reload` silently drops the user's "10min" choice.
   initAutoWindowPersistence(cfg.daemon.stateDir);
   // Replay tool/approval detail records so reload doesn't lose click-to-detail
   // links from messages already on the user's WeCom timeline.
@@ -135,6 +157,7 @@ const main = async (): Promise<void> => {
   http.register("GET /claim/status", makeClaimStatusHandler());
   http.register("POST /claim/reset", makeClaimResetHandler());
   http.register("GET /detail", makeDetailHandler(log.child({ mod: "detail" })));
+  for (const [key, handler] of Object.entries(chatHandlers())) http.register(key, handler);
   installAskEventListener(ws.client, log.child({ mod: "ask" }));
 
   // 智能机器人 doc / smartsheet / contact MCP 桥接 — 总是注册路由, 失败让
@@ -146,7 +169,7 @@ const main = async (): Promise<void> => {
     const bridge = makeWedocBridge({
       client: ws.client,
       log: wedocLog,
-      pluginVersion: "weclaude-0.1",
+      pluginVersion: "wezard-0.1",
       cacheTtlMs: 30 * 60_000,
       configFetchTimeoutMs: 15_000,
       requestTimeoutMs: 30_000,
@@ -220,7 +243,7 @@ const main = async (): Promise<void> => {
       const r = m.attach({ sessionId: body.sessionId, jsonlPath: body.jsonlPath, target: body.target, tmuxPane: body.tmuxPane, tmuxSession: body.tmuxSession });
       json(res, r.ok ? 200 : 400, r);
     });
-    // Manual auto-spawn trigger — used by `weclaude init` to materialize a
+    // Manual auto-spawn trigger — used by `wezard init` to materialize a
     // tmux+claude pane immediately after claim, instead of waiting for the
     // first inbound. Body: { target?: "user:xxx" | "chat:xxx" }. Falls back
     // to cfg.defaultChat. Same code path as the inbound auto-spawn so any
@@ -252,6 +275,7 @@ const main = async (): Promise<void> => {
           ok: true,
           current: currentSid,
           sessions: sessions.map((s) => ({ ...s, current: s.sessionId === currentSid })),
+          backends: backends.map((b) => b.name),
         });
       } catch (e) {
         json(res, 500, { ok: false, reason: (e as Error).message });
@@ -290,7 +314,7 @@ const main = async (): Promise<void> => {
     // spawn+attach path as /mirror/spawn, just with an explicit cwdOverride.
     http.register("POST /sessions/new", async (req, res) => {
       const { readBody } = await import("./http.js");
-      const body = (await readBody(req)) as Partial<{ cwd: string; target: string }>;
+      const body = (await readBody(req)) as Partial<{ cwd: string; target: string; cli: CliBackendName }>;
       const cwd = (body.cwd ?? "").toString().trim();
       if (!cwd) {
         json(res, 400, { ok: false, reason: "cwd required" });
@@ -302,14 +326,14 @@ const main = async (): Promise<void> => {
         return;
       }
       const spawnLog = log.child({ mod: "mirror", sub: "sessions-new", target });
-      const r = await spawnTmuxClaude({ cfg, log: spawnLog, windowName: target, cwdOverride: cwd });
+      const r = await spawnTmuxClaude({ cfg, log: spawnLog, windowName: target, cwdOverride: cwd, cli: body.cli });
       if (!r.ok) { json(res, 500, { ok: false, reason: r.reason }); return; }
       const att = m.attach({ sessionId: r.sessionId!, jsonlPath: r.jsonlPath!, target, tmuxPane: r.tmuxPane, tmuxSession: r.tmuxSession, cwd: r.cwd });
       json(res, att.ok ? 200 : 500, att.ok
-        ? { ok: true, sessionId: r.sessionId, target, cwd: r.cwd, tmuxSession: r.tmuxSession, tmuxPane: r.tmuxPane }
+        ? { ok: true, sessionId: r.sessionId, target, cwd: r.cwd, cli: r.cli, tmuxSession: r.tmuxSession, tmuxPane: r.tmuxPane }
         : { ok: false, reason: att.reason });
     });
-    // Frame-less inject — used by `weclaude init` to fire a demo prompt right
+    // Frame-less inject — used by `wezard init` to fire a demo prompt right
     // after /mirror/spawn so first-time users see the full PreToolUse → card
     // → mirror loop without needing to type in WeCom.
     http.register("POST /mirror/inject", async (req, res) => {
@@ -349,6 +373,151 @@ const main = async (): Promise<void> => {
       const r = m.setPendingCwd(target, cwd);
       json(res, r.ok ? 200 : 400, { ...r, target });
     });
+    // ── Peer collaboration + loop graph ────────────────────────────────
+    // These routes let the Claude inside one pane act on its SIBLINGS: the
+    // other `#tag` sessions of the same WeCom chat. An MCP tool can only see
+    // its own process, so the daemon — which owns every attachment — is the
+    // only place that can answer "what is #fix doing" or "inject this into
+    // #review". Callers identify themselves the same way /mirror/cwd does:
+    // explicit target → sessionId → tmuxPane (stable across /clear) →
+    // defaultChat.
+    const resolveSelf = (b: Partial<{ target: string; sessionId: string; tmuxPane: string }>): string => {
+      const explicit = (b.target ?? "").trim();
+      if (explicit) return explicit;
+      const bySid = b.sessionId?.trim() ? m.targetForSession(b.sessionId.trim()) : undefined;
+      if (bySid) return bySid;
+      const byPane = b.tmuxPane?.trim() ? m.targetForPane(b.tmuxPane.trim()) : undefined;
+      if (byPane) return byPane;
+      return (cfg.defaultChat ?? "").trim();
+    };
+    // Peer addressed by tag. Empty tag = the chat's default (untagged) session,
+    // which is a legitimate collaboration target ("report back to the main one").
+    const peerTarget = (self: string, tag: string): string =>
+      keyOf(baseOfKey(self), (tag ?? "").trim().replace(/^#/, ""));
+
+    interface PeerBody { target?: string; sessionId?: string; tmuxPane?: string; tag?: string }
+    const readPeerBody = async (req: import("node:http").IncomingMessage): Promise<{ self: string; body: PeerBody }> => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as PeerBody;
+      return { self: resolveSelf(body), body };
+    };
+
+    http.register("POST /peers/list", async (req, res) => {
+      const { self } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session (pass target/sessionId/tmuxPane)" }); return; }
+      const peers = await m.peers(self);
+      json(res, 200, { ok: true, self, base: baseOfKey(self), peers });
+    });
+
+    http.register("POST /peers/peek", async (req, res) => {
+      const { self, body } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const target = peerTarget(self, body.tag ?? "");
+      const rows = Math.min(Math.max(Number((body as { rows?: number }).rows ?? 24) || 24, 8), 120);
+      const peek = await m.peekPane(target, rows);
+      // The pane may be gone (closed window) while the transcript survives —
+      // still answer with the last reply so the caller learns something.
+      json(res, 200, {
+        ok: true,
+        target,
+        pane: peek.pane ?? "",
+        paneError: peek.ok ? undefined : peek.reason,
+        busy: peek.busy ?? false,
+        lastText: m.lastText(target),
+      });
+    });
+
+    http.register("POST /peers/send", async (req, res) => {
+      const { self, body } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const text = ((body as { text?: string }).text ?? "").toString();
+      if (!text.trim()) { json(res, 400, { ok: false, reason: "text required" }); return; }
+      const target = peerTarget(self, body.tag ?? "");
+      // Injecting into your own pane would type into the box you're generating
+      // from — Claude Code queues it and the caller deadlocks waiting for itself.
+      if (target === self) { json(res, 400, { ok: false, reason: "refusing to inject into the calling session itself" }); return; }
+      const r = await m.injectText(target, text);
+      json(res, r.ok ? 200 : 502, { ...r, target });
+    });
+
+    http.register("POST /peers/wait", async (req, res) => {
+      const { self, body } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const target = peerTarget(self, body.tag ?? "");
+      if (target === self) { json(res, 400, { ok: false, reason: "refusing to wait on the calling session itself" }); return; }
+      const timeoutMs = Math.min(Math.max(Number((body as { timeoutSec?: number }).timeoutSec ?? 900) || 900, 10), 7200) * 1000;
+      const r = await waitForIdle(target, m.isBusy, timeoutMs, () => false);
+      json(res, 200, { ok: true, target, idle: r.idle, reason: r.reason, lastText: m.lastText(target) });
+    });
+
+    // POST /graph/run — declare a loop graph over this chat's tagged sessions
+    // and start walking it. Fire-and-forget: returns a runId immediately, then
+    // narrates progress into the chat while it advances.
+    http.register("POST /graph/run", async (req, res) => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as Partial<{
+        target: string; sessionId: string; tmuxPane: string;
+        nodes: GraphNodeSpec[]; steps: GraphStepSpec[];
+        rounds: number; until: string; idleTimeoutSec: number;
+      }>;
+      const self = resolveSelf(body);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const spec: GraphSpec = {
+        base: baseOfKey(self),
+        nodes: Array.isArray(body.nodes) ? body.nodes : [],
+        steps: Array.isArray(body.steps) ? body.steps : [],
+        rounds: body.rounds,
+        until: body.until,
+        idleTimeoutSec: body.idleTimeoutSec,
+      };
+      const bad = validateSpec(spec);
+      if (bad) { json(res, 400, { ok: false, reason: bad }); return; }
+      const graphLog = log.child({ mod: "graph", base: spec.base });
+      const run = startGraph(spec, {
+        // Reuse a live tagged pane; only spawn when the node doesn't exist yet
+        // (or its pane died). Re-spawning a healthy node would throw away the
+        // context that makes a multi-round loop worth running.
+        ensureNode: async (target, node) => {
+          const existing = (await m.peers(target)).find((p) => p.target === target);
+          if (existing?.paneAlive) return { ok: true };
+          const r = await m.newSession(target, node.tag, node.cli, { model: node.model, cwd: node.cwd });
+          return { ok: r.ok, reason: r.reason };
+        },
+        send: (target, text) => m.injectText(target, text),
+        isBusy: m.isBusy,
+        lastText: async (target) => m.lastText(target),
+        notify: (base, markdown) => {
+          const chatId = base.replace(/^(user|chat|group):/, "");
+          void ws.client
+            .sendMessage(chatId, { msgtype: "markdown", markdown: { content: markdown } })
+            .catch((e: unknown) => graphLog.warn({ err: (e as Error).message }, "graph notify failed"));
+        },
+        log: graphLog,
+      });
+      json(res, 200, { ok: true, runId: run.runId, base: run.base, nodes: spec.nodes.length, steps: spec.steps.length, rounds: spec.rounds ?? 1 });
+    });
+
+    http.register("GET /graph/status", (req, res) => {
+      const u = new URL(req.url ?? "", "http://x");
+      const runId = (u.searchParams.get("runId") ?? "").trim();
+      if (runId) {
+        const run = getRun(runId);
+        json(res, run ? 200 : 404, run ? { ok: true, run } : { ok: false, reason: `unknown runId ${runId}` });
+        return;
+      }
+      const base = (u.searchParams.get("target") ?? "").trim();
+      json(res, 200, { ok: true, runs: listRuns(base ? baseOfKey(base) : undefined) });
+    });
+
+    http.register("POST /graph/stop", async (req, res) => {
+      const { readBody } = await import("./http.js");
+      const body = (await readBody(req)) as Partial<{ runId: string }>;
+      const runId = (body.runId ?? "").trim();
+      if (!runId) { json(res, 400, { ok: false, reason: "runId required" }); return; }
+      const stopped = stopRun(runId);
+      json(res, stopped ? 200 : 404, stopped ? { ok: true, runId } : { ok: false, reason: `run ${runId} not found or already finished` });
+    });
+
     http.register("GET /mirror/cwd", async (req, res) => {
       const u = new URL(req.url ?? "", "http://x");
       let target = (u.searchParams.get("target") ?? "").trim();
@@ -374,6 +543,9 @@ const main = async (): Promise<void> => {
   const shutdown = async (signal: string): Promise<void> => {
     log.info({ signal }, "shutdown signal");
     scheduler.stop();
+    // 同 POST /shutdown: 先把挂着的审批长轮询了结成「稍后续接」, 再关连接。
+    log.info(drainForReload(), "pending drained for reload");
+    await new Promise((r) => setTimeout(r, 200));
     await Promise.allSettled([ws.shutdown(), http.close()]);
     process.exit(0);
   };
@@ -391,6 +563,6 @@ const main = async (): Promise<void> => {
 
 main().catch((e) => {
   // eslint-disable-next-line no-console
-  console.error("[weclaude-daemon] fatal:", e);
+  console.error("[wezard-daemon] fatal:", e);
   process.exit(1);
 });

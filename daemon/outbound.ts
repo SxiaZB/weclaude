@@ -1,8 +1,9 @@
-// Outbound message handler for /message endpoint (used by `weclaude send` & MCP).
+// Outbound message handler for /message endpoint (used by `wezard send` & MCP).
 import type { WSClient } from "@wecom/aibot-node-sdk";
 import type { Logger } from "pino";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
+import { withTagHeader } from "../shared/session-label.js";
 
 // Strip principal prefix (`user:` / `chat:`) AND `#tag` suffix so callers
 // can pass daemon-internal target keys (`user:xxx#foo`) verbatim; the WeCom
@@ -34,9 +35,12 @@ export const makeMessageHandler = (client: WSClient, log: Logger): Handler => {
       return;
     }
     try {
+      // Callers pass the daemon-internal target key verbatim (`user:xxx#foo`) —
+      // keep the `#tag` visual on the content before stripping it off the id,
+      // so CLI/MCP pushes match mirror bubbles from the same session.
       await client.sendMessage(stripPrefix(chat), {
         msgtype: "markdown",
-        markdown: { content },
+        markdown: { content: withTagHeader(chat, content) },
       });
       log.info({ chat, len: content.length }, "tx markdown");
       json(res, 200, { ok: true });

@@ -1,0 +1,17 @@
+[Unit]
+Description=wezard svr (detail relay for chat/tool detail links)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO__
+ExecStart=__NODE__ __REPO__/dist/svr/index.js
+Restart=always
+RestartSec=5
+StandardOutput=append:__HOME__/.wezard/svr.stdout.log
+StandardError=append:__HOME__/.wezard/svr.stderr.log
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target

@@ -8,13 +8,16 @@
 // sweep, which only the resident daemon is positioned to do.
 //
 // Scope: tmux-hosted sessions only (a session with no pane can't receive
-// pasted input, so it's not a useful mirror target). Linux-only (reads /proc);
-// returns [] elsewhere, degrading gracefully.
+// pasted input, so it's not a useful mirror target). Linux reads /proc;
+// macOS falls back to `ps` + `lsof` (no /proc there); other platforms
+// degrade to [] gracefully.
 import { spawn } from "node:child_process";
-import { readdirSync, readFileSync, existsSync, statSync, readlinkSync, openSync, readSync, closeSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
-import { labelFor } from "./session-label.js";
+import { readdirSync, readFileSync, existsSync, statSync, readlinkSync } from "node:fs";
+import { join, basename } from "node:path";
+import { activeBackends, backendForPath, projectDirsFor, type CliBackendName } from "../shared/cli-backends.js";
+import { expandHome } from "../shared/paths.js";
+import { labelFor } from "../shared/session-label.js";
+import { summarizeTail } from "./peers.js";
 
 export interface SessionInfo {
   sessionId: string;
@@ -30,6 +33,9 @@ export interface SessionInfo {
   lastActivity: number;
   /** One-line "what is this session doing" preview from the transcript tail. */
   summary: string;
+  /** Which CLI owns this session, derived from the transcript's projects root.
+   *  Lets a caller (and the UI) tell a claude pane from a codebuddy one. */
+  cli: CliBackendName;
 }
 
 interface PaneOwner {
@@ -43,7 +49,16 @@ const dirnameOfNode = (): string => {
 };
 
 const augmentedPath = (orig: string | undefined): string => {
-  const extras = [dirnameOfNode(), "/opt/homebrew/bin", "/usr/local/bin", `${process.env.HOME ?? ""}/.local/bin`].filter(Boolean);
+  // sbin dirs matter: lsof lives in /usr/sbin on macOS, and launchd starts the
+  // daemon with a stripped PATH that lacks it.
+  const extras = [
+    dirnameOfNode(),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    `${process.env.HOME ?? ""}/.local/bin`,
+    "/usr/sbin",
+    "/sbin",
+  ].filter(Boolean);
   const seen = new Set<string>();
   return [orig ?? "", ...extras]
     .flatMap((p) => p.split(":"))
@@ -51,9 +66,9 @@ const augmentedPath = (orig: string | undefined): string => {
     .join(":");
 };
 
-const runTmux = (args: string[]): Promise<{ ok: boolean; stdout: string }> =>
+const runCmd = (cmd: string, args: string[]): Promise<{ ok: boolean; stdout: string }> =>
   new Promise((resolve) => {
-    const p = spawn("tmux", args, {
+    const p = spawn(cmd, args, {
       env: { ...process.env, PATH: augmentedPath(process.env.PATH) },
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -63,10 +78,22 @@ const runTmux = (args: string[]): Promise<{ ok: boolean; stdout: string }> =>
     p.on("close", (code) => resolve({ ok: code === 0, stdout: out }));
   });
 
+const runTmux = (args: string[]): Promise<{ ok: boolean; stdout: string }> => runCmd("tmux", args);
+
+// ── Process table snapshot ──────────────────────────────────────────────
+// One scan produces pid → {ppid, cmd} for the whole host; the tmux-pane walk
+// and the agent-cli filter both read from it, so the source (Linux /proc vs
+// macOS ps) is a contained difference.
+
+interface ProcEntry {
+  ppid: number;
+  cmd: string;
+}
+
 // Read /proc/<pid>/stat → ppid. comm (2nd field) is wrapped in parens and may
 // itself contain spaces/parens, so split on the LAST ')' and index from there:
 // fields after comm are state ppid ... → ppid is index 1 of the tail.
-const ppidOf = (pid: number): number | null => {
+const ppidOfProc = (pid: number): number | null => {
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     const rp = stat.lastIndexOf(")");
@@ -79,7 +106,7 @@ const ppidOf = (pid: number): number | null => {
   }
 };
 
-const cmdlineOf = (pid: number): string => {
+const cmdlineOfProc = (pid: number): string => {
   try {
     return readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
   } catch {
@@ -87,12 +114,62 @@ const cmdlineOf = (pid: number): string => {
   }
 };
 
-const cwdOf = (pid: number): string => {
+const procSnapshotLinux = (): Map<number, ProcEntry> => {
+  const m = new Map<number, ProcEntry>();
+  let pids: number[];
   try {
-    return readlinkSync(`/proc/${pid}/cwd`);
+    pids = readdirSync("/proc").filter((n) => /^\d+$/.test(n)).map((n) => parseInt(n, 10));
   } catch {
-    return "";
+    return m;
   }
+  for (const pid of pids) {
+    const ppid = ppidOfProc(pid);
+    if (ppid != null) m.set(pid, { ppid, cmd: cmdlineOfProc(pid) });
+  }
+  return m;
+};
+
+// macOS: `ps` snapshot. -ww keeps long cmdlines (a `--session-id` near the end
+// of a wrapped command would otherwise be truncated away); BSD ps rejects a
+// bare `ax` mixed with dashed flags, hence `-ax`.
+const procSnapshotPs = async (): Promise<Map<number, ProcEntry>> => {
+  const r = await runCmd("ps", ["-ww", "-ax", "-o", "pid=,ppid=,command="]);
+  const m = new Map<number, ProcEntry>();
+  if (!r.ok) return m;
+  for (const line of r.stdout.split("\n")) {
+    const mm = /^\s*(\d+)\s+(\d+)\s+(.*\S)\s*$/.exec(line);
+    if (mm) m.set(parseInt(mm[1]!, 10), { ppid: parseInt(mm[2]!, 10), cmd: mm[3]! });
+  }
+  return m;
+};
+
+const procSnapshot = (): Promise<Map<number, ProcEntry>> | Map<number, ProcEntry> =>
+  process.platform === "linux" ? procSnapshotLinux() : procSnapshotPs();
+
+// cwd is only needed for the handful of agent-cli candidates, so it's resolved
+// lazily per platform: Linux reads /proc directly; macOS batches one lsof call
+// (`-Fn` → machine-readable `p<pid>` / `n<path>` records).
+const cwdMapFor = async (pids: number[]): Promise<Map<number, string>> => {
+  const m = new Map<number, string>();
+  if (pids.length === 0) return m;
+  if (process.platform === "linux") {
+    for (const pid of pids) {
+      try {
+        m.set(pid, readlinkSync(`/proc/${pid}/cwd`));
+      } catch {
+        /* process gone or unreadable */
+      }
+    }
+    return m;
+  }
+  const r = await runCmd("lsof", ["-a", "-p", pids.join(","), "-d", "cwd", "-Fn"]);
+  if (!r.ok) return m;
+  let cur = 0;
+  for (const line of r.stdout.split("\n")) {
+    if (line.startsWith("p")) cur = parseInt(line.slice(1), 10);
+    else if (line.startsWith("n") && cur > 0) m.set(cur, line.slice(1));
+  }
+  return m;
 };
 
 // Pull a `--session-id <uuid>` out of a cmdline. Returns "" when absent
@@ -102,19 +179,22 @@ const sessionIdFromCmd = (cmd: string): string => {
   return m?.[1] ?? "";
 };
 
-const looksLikeClaude = (cmd: string): boolean => /claude/i.test(cmd);
+// A process belongs to an agent CLI if its cmdline mentions any active
+// backend's binary name. Derived from the registry rather than hardcoded, so a
+// custom `cliBackends.<name>.bin` is recognized too — without this, codebuddy
+// panes were invisible to the scan and could never be listed or switched to.
+const looksLikeAgentCli = (cmd: string): boolean =>
+  activeBackends().some((b) => cmd.toLowerCase().includes(basename(b.bin).toLowerCase()));
 
-// Project roots claude writes transcripts under, internal build first.
-const PROJECT_ROOT_INTERNAL = join(homedir(), ".claude-internal", "projects");
-const PROJECT_ROOT_DEFAULT = join(homedir(), ".claude", "projects");
-const PROJECT_ROOTS = [PROJECT_ROOT_INTERNAL, PROJECT_ROOT_DEFAULT];
+// Transcript roots of every active backend, in registry order (primary first).
+const projectRoots = (): string[] => activeBackends().map((b) => expandHome(b.projectsDir));
 
 // Locate `<sessionId>.jsonl` (UUID is globally unique, so we don't have to
 // reverse the cwd→dir encoding). Skips subagent transcripts (they live under a
 // `<sid>/subagents/` subdir, never directly under a project dir).
 const findJsonl = (sessionId: string): string => {
   const name = `${sessionId}.jsonl`;
-  for (const root of PROJECT_ROOTS) {
+  for (const root of projectRoots()) {
     if (!existsSync(root)) continue;
     let subs: import("node:fs").Dirent[];
     try {
@@ -131,19 +211,19 @@ const findJsonl = (sessionId: string): string => {
   return "";
 };
 
-// claude's cwd→projectDir encoding: replace each `/` `.` `_` with `-`.
-const encodeProjectDir = (absCwd: string): string => absCwd.replace(/[/._]/g, "-");
+// cwd→projectDir encoding is backend-specific; projectDirsFor yields one
+// candidate per active backend (primary first) using each one's own dialect.
+// (The old local copies diverged — the Claude encoder here also mapped `_`,
+// which does NOT match what Claude Code writes.)
 
 // Expected jsonl path for a freshly-spawned session whose transcript doesn't
-// exist on disk yet (claude only writes it after the first user input). Used so
+// exist on disk yet (a CLI only writes it after the first user input). Used so
 // a brand-new `new_claude_session` still shows up in the list immediately.
 const expectedJsonl = (cwd: string, sessionId: string): string => {
   if (!cwd || !sessionId) return "";
-  const enc = encodeProjectDir(cwd);
-  for (const root of PROJECT_ROOTS) {
-    if (existsSync(join(root, enc))) return join(root, enc, `${sessionId}.jsonl`);
-  }
-  return join(PROJECT_ROOT_INTERNAL, enc, `${sessionId}.jsonl`);
+  const cands = projectDirsFor(cwd);
+  const hit = cands.find(({ dir }) => existsSync(dir)) ?? cands[0];
+  return hit ? join(hit.dir, `${sessionId}.jsonl`) : "";
 };
 
 // Resume-mode fallback: a claude launched with bare `-r`/`--resume` carries no
@@ -153,9 +233,7 @@ const expectedJsonl = (cwd: string, sessionId: string): string => {
 // sharing a cwd don't both resolve to the same newest file.
 const inferByCwd = (cwd: string, taken: Set<string>): { sessionId: string; jsonlPath: string } | null => {
   if (!cwd) return null;
-  const enc = encodeProjectDir(cwd);
-  for (const root of PROJECT_ROOTS) {
-    const dir = join(root, enc);
+  for (const { dir } of projectDirsFor(cwd)) {
     if (!existsSync(dir)) continue;
     let files: string[];
     try {
@@ -183,61 +261,6 @@ const inferByCwd = (cwd: string, taken: Set<string>): { sessionId: string; jsonl
   return null;
 };
 
-// Extract the last ~3 user/assistant text turns from a transcript as a one-line
-// "what is this session doing" preview. Reads only the file tail (bounded), so
-// huge multi-MB transcripts don't get slurped fully into memory.
-const TAIL_BYTES = 64 * 1024;
-const summarize = (jsonlPath: string): string => {
-  if (!existsSync(jsonlPath)) return "(新会话 · 暂无对话)";
-  let fd: number | undefined;
-  try {
-    const size = statSync(jsonlPath).size;
-    const start = Math.max(0, size - TAIL_BYTES);
-    const len = Math.min(size, TAIL_BYTES);
-    const buf = Buffer.allocUnsafe(len);
-    fd = openSync(jsonlPath, "r");
-    const read = readSync(fd, buf, 0, len, start);
-    const lines = buf.subarray(0, read).toString("utf8").split("\n").filter((l) => l.trim());
-    const turns: string[] = [];
-    for (const line of lines) {
-      let row: Record<string, unknown>;
-      try {
-        row = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      const msg = (row.message ?? {}) as Record<string, unknown>;
-      const role = (msg.role ?? row.role) as string | undefined;
-      if (role !== "user" && role !== "assistant") continue;
-      if (row.isMeta) continue;
-      const c = msg.content ?? row.content;
-      let text = "";
-      if (typeof c === "string") text = c;
-      else if (Array.isArray(c))
-        text = c
-          .filter((b): b is { type: string; text?: string } => !!b && (b as { type?: string }).type === "text")
-          .map((b) => b.text || "")
-          .join(" ");
-      text = text
-        .replace(/<(system-reminder|command-[^>]*|local-command-[^>]*)>[\s\S]*?<\/\1>/g, "")
-        .replace(/\s+/g, " ")
-        .trim();
-      if (text) turns.push(`${role === "user" ? "你" : "AI"}: ${text.slice(0, 80)}`);
-    }
-    return turns.slice(-3).join(" | ") || "(暂无对话)";
-  } catch {
-    return "(无法读取对话)";
-  } finally {
-    if (fd !== undefined) {
-      try {
-        closeSync(fd);
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-};
-
 // Build pane_pid → {paneId, session}. We map the *pane's* root pid; the claude
 // worker is a descendant, so we walk its ppid chain up to find a matching pane.
 const tmuxPaneIndex = async (): Promise<Map<number, PaneOwner>> => {
@@ -254,12 +277,16 @@ const tmuxPaneIndex = async (): Promise<Map<number, PaneOwner>> => {
 
 // Climb the ppid chain from `pid` until we hit a pid that owns a tmux pane.
 // Bounded to avoid pathological loops.
-const tmuxOwnerOf = (pid: number, paneIdx: Map<number, PaneOwner>): PaneOwner | null => {
+const tmuxOwnerOf = (
+  pid: number,
+  procs: Map<number, ProcEntry>,
+  paneIdx: Map<number, PaneOwner>,
+): PaneOwner | null => {
   let cur: number | null = pid;
   for (let i = 0; i < 40 && cur != null && cur > 1; i++) {
     const hit = paneIdx.get(cur);
     if (hit) return hit;
-    const pp = ppidOf(cur);
+    const pp: number | undefined = procs.get(cur)?.ppid;
     if (pp == null || pp === cur) break;
     cur = pp;
   }
@@ -268,30 +295,29 @@ const tmuxOwnerOf = (pid: number, paneIdx: Map<number, PaneOwner>): PaneOwner | 
 
 export const scanClaudeSessions = async (): Promise<SessionInfo[]> => {
   const paneIdx = await tmuxPaneIndex();
-  let pids: number[];
-  try {
-    pids = readdirSync("/proc").filter((n) => /^\d+$/.test(n)).map((n) => parseInt(n, 10));
-  } catch {
-    return []; // not Linux / no /proc
-  }
+  const procs = await procSnapshot();
+  if (procs.size === 0) return []; // unsupported platform / ps+proc both missing
 
   // Collect tmux-hosted claude workers, then collapse to ONE session per pane
   // (a tmux pane runs exactly one claude session; a pane may host several
   // claude processes — shim + worker + nested — which must not each count as
   // a separate session). Per pane: prefer a process carrying an explicit
   // `--session-id`; else fall back to one resume-mode inference by cwd.
-  const byPane = new Map<string, { pid: number; owner: PaneOwner; cwd: string; explicitSid: string }>();
-  for (const pid of pids) {
-    const cmd = cmdlineOf(pid);
-    if (!cmd || !looksLikeClaude(cmd)) continue;
-    const owner = tmuxOwnerOf(pid, paneIdx);
+  const byPane = new Map<string, { pid: number; owner: PaneOwner; explicitSid: string }>();
+  for (const [pid, e] of procs) {
+    if (!e.cmd || !looksLikeAgentCli(e.cmd)) continue;
+    const owner = tmuxOwnerOf(pid, procs, paneIdx);
     if (!owner) continue; // tmux scope
-    const explicitSid = sessionIdFromCmd(cmd);
+    const explicitSid = sessionIdFromCmd(e.cmd);
     const prev = byPane.get(owner.paneId);
     if (!prev || (!prev.explicitSid && explicitSid)) {
-      byPane.set(owner.paneId, { pid, owner, cwd: cwdOf(pid), explicitSid });
+      byPane.set(owner.paneId, { pid, owner, explicitSid });
     }
   }
+
+  // Resolve cwd only for the chosen worker per pane (a handful of pids).
+  const cwds = await cwdMapFor(Array.from(byPane.values()).map((w) => w.pid));
+  const panes = Array.from(byPane.values()).map((w) => ({ ...w, cwd: cwds.get(w.pid) ?? "" }));
 
   const seen = new Set<string>();
   const out: SessionInfo[] = [];
@@ -312,11 +338,11 @@ export const scanClaudeSessions = async (): Promise<SessionInfo[]> => {
       tmuxSession: owner.session,
       tmuxPane: owner.paneId,
       lastActivity,
-      summary: summarize(jsonlPath),
+      summary: summarizeTail(jsonlPath),
+      cli: backendForPath(jsonlPath).name,
     });
   };
 
-  const panes = Array.from(byPane.values());
   // Pass 1: explicit `--session-id` — exact, no ambiguity. Seeds `seen` so
   // resume inference in pass 2 can't re-claim these ids. A freshly-spawned
   // session may not have written its jsonl yet — fall back to the expected

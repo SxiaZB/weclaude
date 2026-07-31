@@ -19,12 +19,25 @@ import type { WSClient, WsFrame, WsFrameHeaders, EventMessageWith, TemplateCard,
 import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
+import {
+  activeBackends,
+  backendForPath,
+  type CliBackend,
+  type CliBackendName,
+  projectDirFor,
+  projectDirsFor,
+  type NormalizedTranscriptLine,
+} from "../shared/cli-backends.js";
 import { isModalPane, parseModalOptions, pickModalAnswer, type ModalPaneVerdict } from "../shared/modal-pane.js";
 import type { MirrorStore } from "./mirror-store.js";
+import { hasMirrorAskq, runMirrorAskqFlow, hasMirrorPlan, mootMirrorPlan, runMirrorPlanFlow } from "./approval.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
-import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl } from "./detail.js";
-import type { TurnUsage } from "./detail.js";
-import { labelFor } from "./session-label.js";
+import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl, buildChatUrl } from "./detail.js";
+import type { CtxCut, TurnUsage } from "./detail.js";
+import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
+import { splitMarkdown } from "../shared/md-chunk.js";
+import { randomTip } from "./tips.js";
+import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, type PeerInfo } from "./peers.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -47,11 +60,11 @@ const augmentedPath = (orig: string | undefined): string => {
     .join(":");
 };
 
-// Claude Code encodes a project's cwd into a directory name by replacing each
-// `/` AND `.` with `-`. Absolute path `/Users/foo/.bar` → `-Users-foo--bar`
-// (note the double dash from the dot). Missing the dot rule sends the tail
-// to a non-existent dir → ENOENT → silent pane→chat dropout.
-const encodeProjectDir = (absCwd: string): string => absCwd.replace(/[/.]/g, "-");
+// Backend resolution is per-transcript, not global: `backendForPath` recovers
+// which CLI wrote a jsonl from its projects root, so claude / claude-internal /
+// codebuddy sessions can be mirrored side by side. `projectDirFor` re-encodes a
+// cwd under that same backend's dialect (Claude: leading `-`, CodeBuddy: none)
+// so pane-drift comparisons stay apples-to-apples.
 
 // Pull the bound session's actual project cwd from its transcript head. Each
 // jsonl line carries a `cwd` field; the encoded directory name is lossy (both
@@ -85,40 +98,73 @@ interface ResolvedSession {
   jsonlPath: string;
 }
 
-// Newest-mtime *.jsonl in the encoded project dir for `cwd`. A `/clear` (or a
-// native `/new`) rotation always leaves a fresh jsonl here, so this is how the
-// mirror re-finds the live session after a rotation it didn't itself record —
-// used by resolveSession's auto-pick and by restoreFromStore's heal path.
-const latestJsonlForCwd = (cfg: Config, cwd: string): ResolvedSession | undefined => {
-  const projectDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(expandHome(cwd)));
-  if (!existsSync(projectDir)) return undefined;
-  const top = readdirSync(projectDir)
-    .filter((n) => n.endsWith(".jsonl"))
-    .map((n) => ({ name: n, mtime: statSync(join(projectDir, n)).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime)[0];
-  if (!top) return undefined;
-  return { sessionId: top.name.replace(/\.jsonl$/, ""), jsonlPath: join(projectDir, top.name) };
+// Every *.jsonl under `cwd`'s project dir, ranked newest-mtime first. A cwd can
+// hold transcripts from more than one CLI (same project opened in claude and in
+// codebuddy), so the default is the union across all active backends — that is
+// what lets a fresh session be discovered regardless of which binary wrote it.
+//
+// `only` narrows to a single backend. Every path that RE-BINDS an existing
+// attachment must pass it: healing a claude chat onto the codebuddy transcript
+// that merely happens to be newer in the same directory would hand the chat to
+// a session it can neither resume (`claude --resume` wouldn't find the sid) nor
+// parse (wrong jsonl dialect). Only genuine discovery searches the union.
+const rankedJsonlsForCwd = (
+  cwd: string,
+  only?: CliBackend,
+): Array<{ sessionId: string; jsonlPath: string; mtime: number }> =>
+  projectDirsFor(expandHome(cwd))
+    .filter(({ backend }) => !only || backend.name === only.name)
+    .flatMap(({ dir }) => {
+      let names: string[];
+      try { names = readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { return []; }
+      return names.flatMap((n) => {
+        const p = join(dir, n);
+        try { return [{ sessionId: n.replace(/\.jsonl$/, ""), jsonlPath: p, mtime: statSync(p).mtimeMs }]; }
+        catch { return []; }
+      });
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+
+// Newest-mtime *.jsonl in the project dir(s) for `cwd`. A `/clear` (or a native
+// `/new`) rotation always leaves a fresh jsonl here, so this is how the mirror
+// re-finds the live session after a rotation it didn't itself record — used by
+// resolveSession's auto-pick and by restoreFromStore's heal path.
+const latestJsonlForCwd = (cwd: string, only?: CliBackend): ResolvedSession | undefined => {
+  const top = rankedJsonlsForCwd(cwd, only)[0];
+  return top ? { sessionId: top.sessionId, jsonlPath: top.jsonlPath } : undefined;
 };
 
-// Locate a transcript by sessionId across every sibling project dir under the
-// projects root. Claude Code's EnterWorktree/ExitWorktree relocate the SAME-sid
+// Locate a transcript by sessionId across every sibling project dir of every
+// active backend. Claude Code's EnterWorktree/ExitWorktree relocate the SAME-sid
 // jsonl between <cwd> and <cwd>/.claude/worktrees/<name> — each cwd encodes to
 // its own project dir, so the path moves but the sid doesn't. It's a rename
 // (byte prefix preserved), so a tail can follow it with a continuous offset.
 // Newest-mtime wins if a stale sibling lingers.
-const findJsonlBySid = (projectsRoot: string, sid: string): string | undefined => {
+const findJsonlBySid = (sid: string, only?: CliBackend): string | undefined => {
   const sidFile = `${sid}.jsonl`;
-  try {
-    return readdirSync(projectsRoot)
-      .flatMap((d) => {
-        const p = join(projectsRoot, d, sidFile);
-        try { return [{ p, m: statSync(p).mtimeMs }]; } catch { return []; }
-      })
-      .sort((a, b) => b.m - a.m)[0]?.p;
-  } catch {
-    return undefined;
-  }
+  return (only ? [only] : activeBackends())
+    .flatMap((b) => {
+      const root = expandHome(b.projectsDir);
+      try { return readdirSync(root).map((d) => join(root, d, sidFile)); } catch { return []; }
+    })
+    .flatMap((p) => { try { return [{ p, m: statSync(p).mtimeMs }]; } catch { return []; } })
+    .sort((a, b) => b.m - a.m)[0]?.p;
 };
+
+// Backend-agnostic line adapter for the raw-jsonl predicates below. They were
+// written against Claude's schema (type:"user", isMeta, string content) —
+// codebuddy persists message/function_call records instead, so route every
+// parsed line through the owning backend's adapter first (identity for claude).
+const normalizeForPath = (path: string, raw: unknown): TranscriptLine | null =>
+  backendForPath(path).normalizeTranscriptLine(raw) as TranscriptLine | null;
+
+// Local-command noise on user lines: Claude marks the caveat / command-stdout
+// records isMeta; codebuddy persists them as PLAIN user messages (no isMeta
+// field at all). Predicates looking for the first REAL user line must skip
+// both forms explicitly.
+const isLocalCommandNoise = (content: unknown): boolean =>
+  typeof content === "string" &&
+  (content.includes('data-role="command-caveat"') || content.includes("<local-command-stdout>"));
 
 // True if `path` holds at least one real (non-meta, non-sidechain) user line —
 // i.e. it's a live session, not an empty just-touched jsonl. Bounded head read.
@@ -133,8 +179,8 @@ const jsonlHasUserLine = (path: string): boolean => {
     for (const line of buf.toString("utf8").split("\n")) {
       if (!line.trim()) continue;
       try {
-        const j = JSON.parse(line) as TranscriptLine;
-        if (j.type === "user" && !j.isMeta && !j.isSidechain) return true;
+        const j = normalizeForPath(path, JSON.parse(line));
+        if (j?.type === "user" && !j.isMeta && !j.isSidechain) return true;
       } catch { /* partial line */ }
     }
   } catch { /* unreadable */ }
@@ -162,40 +208,37 @@ const findInjectOffset = (path: string, fp: string): number | undefined => {
   } catch { return undefined; }
 };
 
-// Newest-mtime *.jsonl WITH user content in cwd's encoded project dir. The
-// content gate skips an empty just-touched file so we bind the real session.
-// Reliable for worktree dirs (one session lives there); restore + the drift
-// follower only consult it on cross-dir moves, where that assumption holds.
-const liveSessionForCwd = (projectsDir: string, cwd: string): ResolvedSession | undefined => {
-  const dir = join(projectsDir, encodeProjectDir(expandHome(cwd)));
-  let names: string[];
-  try { names = readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { return undefined; }
-  const ranked = names
-    .flatMap((n) => { const p = join(dir, n); try { return [{ p, sid: n.replace(/\.jsonl$/, ""), m: statSync(p).mtimeMs }]; } catch { return []; } })
-    .sort((a, b) => b.m - a.m);
-  for (const c of ranked) if (jsonlHasUserLine(c.p)) return { sessionId: c.sid, jsonlPath: c.p };
+// Newest-mtime *.jsonl WITH user content in cwd's project dir(s), across all
+// active backends. The content gate skips an empty just-touched file so we bind
+// the real session. Reliable for worktree dirs (one session lives there);
+// restore + the drift follower only consult it on cross-dir moves, where that
+// assumption holds.
+const liveSessionForCwd = (cwd: string, only?: CliBackend): ResolvedSession | undefined => {
+  for (const c of rankedJsonlsForCwd(cwd, only)) {
+    if (jsonlHasUserLine(c.jsonlPath)) return { sessionId: c.sessionId, jsonlPath: c.jsonlPath };
+  }
   return undefined;
 };
 
 const resolveSession = (cfg: Config, log: Logger): ResolvedSession | undefined => {
   const cwd = expandHome(cfg.wrc.cwd);
-  const projectDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(cwd));
-  if (!existsSync(projectDir)) {
-    log.error({ projectDir }, "mirror: project dir not found (no claude session ever ran in cwd?)");
+  const dirs = projectDirsFor(cwd).map(({ dir }) => dir).filter((d) => existsSync(d));
+  if (dirs.length === 0) {
+    log.error({ probed: projectDirsFor(cwd).map(({ dir }) => dir) }, "mirror: project dir not found (no CLI session ever ran in cwd?)");
     return undefined;
   }
   const pinned = cfg.wrc.mirror.sessionId.trim();
   if (pinned) {
-    const p = join(projectDir, `${pinned}.jsonl`);
-    if (!existsSync(p)) {
-      log.error({ p }, "mirror: pinned sessionId jsonl missing");
+    const p = dirs.map((d) => join(d, `${pinned}.jsonl`)).find((x) => existsSync(x));
+    if (!p) {
+      log.error({ pinned, dirs }, "mirror: pinned sessionId jsonl missing");
       return undefined;
     }
     return { sessionId: pinned, jsonlPath: p };
   }
-  const top = latestJsonlForCwd(cfg, cwd);
+  const top = latestJsonlForCwd(cwd);
   if (!top) {
-    log.error({ projectDir }, "mirror: no .jsonl in project dir");
+    log.error({ dirs }, "mirror: no .jsonl in project dir");
     return undefined;
   }
   return top;
@@ -224,6 +267,12 @@ interface TailDeps {
   /** Originating session/target for the detail page header. */
   sessionId: string;
   target: string;
+  /** Backend-specific jsonl normalizer. Converts a parsed line from the
+   *  active CLI's transcript schema into the Claude Code TranscriptLine shape
+   *  that renderLine consumes. Returns null to drop the line. Claude backends
+   *  are identity; codebuddy maps message/function_call/function_call_result
+   *  records into the nested message.content shape. */
+  normalizeLine?: (raw: unknown) => NormalizedTranscriptLine | null;
   /** Override the initial read offset. Default: current EOF (or 0 if missing).
    *  Used by /clear migration to replay the freshly-rotated jsonl from start —
    *  the user line dedupes via isOwnInject, assistant lines stream normally. */
@@ -281,6 +330,8 @@ interface TranscriptLine {
   };
   isMeta?: boolean;
   isSidechain?: boolean;
+  /** 见 NormalizedTranscriptLine.softTurnEnd —— 后端只能确认"这条消息写完了"。 */
+  softTurnEnd?: boolean;
 }
 
 // Target keys are `user:xxx[#tag]` / `chat:xxx[#tag]`. Strip the principal
@@ -294,27 +345,16 @@ const stripPrincipalPrefix = (s: string): string => {
 };
 
 // Extract the `#tag` suffix from a target key, "" if untagged.
-const tagOfTarget = (s: string): string => {
-  const h = s.indexOf("#");
-  return h >= 0 ? s.slice(h + 1) : "";
-};
+const tagOfTarget = tagOfKey;
 
 // Drop the `#tag` suffix — collapses tagged session keys to the chat-scoped
-// base principal (`user:xxx#foo` → `user:xxx`). Used to share cwd state
-// across all sessions that live in the same WeCom chat.
-const basePrincipalOf = (s: string): string => {
-  const h = s.indexOf("#");
-  return h >= 0 ? s.slice(0, h) : s;
-};
+// base principal. Shared with the peer/graph layer via session-label.
+const basePrincipalOf = baseOfKey;
 
 // Prefix outbound content with `<emoji> #tag` header (blank line separator)
 // when the target carries a `#tag` suffix. Untagged targets pass through
 // unchanged — default session keeps its plain-bubble UX.
-const withSessionTag = (target: string, content: string): string => {
-  const tag = tagOfTarget(target);
-  if (!tag) return content;
-  return `${labelFor(tag)} \`#${tag}\`\n\n${content}`;
-};
+const withSessionTag = withTagHeader;
 
 // Claude Code wraps slash-command invocations into the user message as
 //   <command-message>name</command-message>
@@ -325,9 +365,12 @@ const withSessionTag = (target: string, content: string): string => {
 //
 // Strategy: extract /cmd + args into a single styled line; strip the rest.
 // Returns "" when the message is purely meta — caller filters.
+// Opening tag tolerates attributes: codebuddy emits e.g.
+// `<system-reminder data-role="command-caveat">` (verified 100+ on disk) —
+// a bare `<tag>` match lets the whole caveat leak into the WeCom bubble.
 const SLASH_TAG_RE = /<command-name>([\s\S]*?)<\/command-name>/;
 const SLASH_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
-const META_TAG_RE = /<(command-message|command-name|command-args|local-command-stdout|local-command-caveat|system-reminder|task-notification)>[\s\S]*?<\/\1>/g;
+const META_TAG_RE = /<(command-message|command-name|command-args|local-command-stdout|local-command-caveat|system-reminder|task-notification)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
 const TASK_NOTIF_RE = /<task-notification>([\s\S]*?)<\/task-notification>/;
 
 // Claude Code's `/goal` installs a session-scoped Stop hook and injects this
@@ -417,8 +460,10 @@ type RenderItem =
   | { kind: "goal_start"; condition: string }
   // Skill stdout (e.g. /model). Always emitted as a standalone bubble — bypasses
   // deferred-state filtering so the user sees /model output even when no
-  // assistant turn is active.
-  | { kind: "skill_output"; body: string }
+  // assistant turn is active. `quiet` 例外: subagent/后台任务完成通知 —— 主 agent
+  // 随后自己会把结论说进本轮答复里, 单独再推一条只是重复噪声。只记进 turn/detail,
+  // 不发气泡。
+  | { kind: "skill_output"; body: string; quiet?: boolean }
   | {
       kind: "tool_use";
       body: string;
@@ -427,11 +472,12 @@ type RenderItem =
       calls: Array<{ toolUseId: string; name: string; input: unknown }>;
     }
   | { kind: "tool_result"; body: string; toolUseId: string; full: string }
-  // Assistant turn truly ended (stop_reason ∈ {end_turn, stop_sequence,
-  // max_tokens}). Emitted AFTER any text/tool_use items from the same line so
-  // onItem can finalize the bubble once the content has been appended. Pure
-  // signal — no body to render.
-  | { kind: "turn_end" }
+  // Assistant turn ended. Emitted AFTER any text/tool_use items from the same
+  // line so onItem can finalize the bubble once the content has been appended.
+  // Pure signal — no body to render.
+  //   • 硬信号 (soft 缺省): stop_reason==="end_turn" 的终态行, 或 system/turn_duration。
+  //   • soft:true: 后端只能说"这条消息写完了" (codebuddy), 需静默期确认才作数。
+  | { kind: "turn_end"; soft?: boolean }
   // Per-assistant-line usage snapshot (model + token counts). Consumed only in
   // brief mode where it's fed into the turn store for aggregate chip display.
   // Non-brief onItem drops it silently — no bubble, no stream side effect.
@@ -513,6 +559,15 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
   } catch {
     return [];
   }
+  // Phase 3: normalize backend-specific jsonl (codebuddy splits tool_use /
+  // tool_result into independent top-level records; Claude is identity). Done
+  // AFTER JSON.parse so the adapter works on structured data, BEFORE the
+  // isMeta/isSidechain gates so backend-mapped fields flow through.
+  if (deps.normalizeLine) {
+    const normalized = deps.normalizeLine(line);
+    if (!normalized) return [];
+    line = normalized as TranscriptLine;
+  }
   if (line.isSidechain) return [];
   if (line.isMeta) {
     // isMeta 行整体丢弃, 唯一例外是 /goal 的激活 marker (isMeta:true 的 user
@@ -541,10 +596,10 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
       }
 
       // Background task completion — strip the raw tag soup and render
-      // a single styled line.
+      // a single styled line. quiet: 这是 subagent 的回执, 不单独推给聊天。
       const taskMatch = c.match(TASK_NOTIF_RE);
       if (taskMatch && taskMatch[1]) {
-        out.push({ kind: "skill_output", body: renderTaskNotification(taskMatch[1]) });
+        out.push({ kind: "skill_output", body: renderTaskNotification(taskMatch[1]), quiet: true });
         return out;
       }
 
@@ -589,13 +644,24 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
     const blocks = line.message?.content;
     if (!Array.isArray(blocks)) return [];
     // Mark text items emitted from a terminal-stop_reason line as `final`.
-    // Per Anthropic protocol, a line with stop_reason ∈ {end_turn, stop_sequence,
-    // max_tokens} contains only text blocks (tool_use → stop_reason="tool_use"),
+    // Per Anthropic protocol, an `end_turn` line contains only text blocks
+    // (tool_use → stop_reason="tool_use"),
     // so these texts ARE the agent's final answer for the turn. Downstream uses
     // `final` to decide bubble splits — mid-turn text appends; only final text
     // after tools peels out into its own standalone (preview = real answer).
+    // 只认 end_turn。另两个终态在 CC 落盘语义里都不是"这一轮说完了":
+    //   • stop_sequence —— 实测 152 次里 ~150 次是 CC 合成的错误/限额行
+    //     ("API Error: …" / "You've hit your session limit" / "No response
+    //     requested."), 其中可重试的那种 (stalled mid-stream / ECONNRESET) CC 会
+    //     自动续跑同一轮, 在它上面收口 = turn 中途断掉。真正终止的那些后面必跟
+    //     system/turn_duration, 由下方权威信号兜住, 不会漏收。
+    //   • max_tokens —— 语义是"消息被截断", CC 继续同一轮; 全量 transcript 0 命中。
     const sr = line.message?.stop_reason;
-    const isFinal = sr === "end_turn" || sr === "stop_sequence" || sr === "max_tokens";
+    const isFinal = sr === "end_turn";
+    // final 是三态: true=终句, false=已知的中途输出, undefined=后端说不清 (软收口)。
+    // 软后端不能填 false —— 那会让每句叙述都触发 earlyLinkBubble, 把 loading 气泡
+    // 提前收成详情链接, 一句话答完的 turn 也要拆成两条消息。
+    const textFinal = isFinal ? true : line.softTurnEnd ? undefined : false;
     let pending: Array<{ toolUseId: string; name: string; input: unknown }> = [];
     const flushPending = (): void => {
       if (pending.length === 0) return;
@@ -623,7 +689,7 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
       if (b?.type === "text" && typeof b.text === "string") {
         flushPending();
         const t = b.text.trim();
-        if (t && !deps.isOwnAssistantSend?.(t)) out.push({ kind: "text", body: t, final: isFinal });
+        if (t && !deps.isOwnAssistantSend?.(t)) out.push({ kind: "text", body: t, final: textFinal });
       } else if (b?.type === "tool_use" && deps.includeTools) {
         const name = b.name ?? "tool";
         const toolUseId = b.id ?? "";
@@ -667,9 +733,26 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
     // Terminal stop_reason → emit turn_end so onItem closes the live bubble.
     // `tool_use` is intentionally excluded — more turns will follow once the
     // tool result lands; finalizing now would split a single logical reply.
-    if (isFinal) out.push({ kind: "turn_end" });
+    //
+    // 但 stop_reason 是 **消息级** 字段, 而 CC 把同一个 message.id 拆成多行落盘
+    // (thinking / text / tool_use 各占一行), 每行都原样带着这个 stop_reason ——
+    // 终态消息的 thinking 行先落盘, 就已经是 end_turn 了。在它上面收口 = turn 提前
+    // 结束: 紧随其后的真正答案(text 行)落在已关闭的 turn 之外, 只能走 standalone,
+    // 且此后整轮的 tool/text 全部退化成散装气泡。终态消息里必然有 text 块 (含
+    // tool_use 的消息 stop_reason 恒为 "tool_use"), 且实测终态消息从不拆出第二个
+    // text 行 —— 所以"本行带 text 块"精确等价于"本消息的最后一行"。
+    if (isFinal && blocks.some((b) => b?.type === "text")) out.push({ kind: "turn_end" });
+    // 软收口 (codebuddy): 这条消息写完了, 但说不出后面还有没有 function_call。
+    else if (line.softTurnEnd) out.push({ kind: "turn_end", soft: true });
     return out;
   }
+
+  // CC (≥2.1.198) 在一轮真正跑完后写一行 `system/turn_duration` —— 权威收口信号。
+  // 补上 stop_reason 路径覆盖不到的场景: 被 esc 打断的 turn 只剩 thinking 行, 永远
+  // 没有终态 text 行, 否则 brief turn 会一直挂到 hardTimer。与 stop_reason 收口重复
+  // 时无害 —— closeBriefTurn / finalizeStream 都是幂等的。goal 模式下 Stop hook 拦住
+  // 了收尾, CC 不写这一行, 所以不会把自主执行提前踢出 goal 模式。
+  if (line.type === "system" && line.subtype === "turn_duration") return [{ kind: "turn_end" }];
 
   // Slash-command records for TUI-only commands land here as `type:"system"`,
   // `subtype:"local_command"` — the invocation itself and, if present, a
@@ -692,26 +775,12 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
   return [];
 };
 
-// Greedy line-wise packing — never cuts mid-line, so a `[text](url)` link
-// (always emitted as a single line) is never bisected. A single oversized
-// line falls back to char-slicing for that line only.
-const splitChunks = (s: string, max: number): string[] => {
-  if (s.length <= max) return [s];
-  const out: string[] = [];
-  let cur = "";
-  const flush = (): void => { if (cur) { out.push(cur); cur = ""; } };
-  for (const line of s.split("\n")) {
-    if (line.length > max) {
-      flush();
-      for (let i = 0; i < line.length; i += max) out.push(line.slice(i, i + max));
-      continue;
-    }
-    const next = cur ? cur + "\n" + line : line;
-    if (next.length > max) { flush(); cur = line; } else { cur = next; }
-  }
-  flush();
-  return out;
-};
+// Block-wise packing (shared/md-chunk): never cuts mid-line, and never cuts a
+// fenced block or table in a way that breaks rendering — see splitMarkdown.
+const splitChunks = splitMarkdown;
+
+// Room reserved in every chunk for the `emoji \`#tag\` \`2/5\`` header line.
+const TAG_HEADER_BUDGET = 32;
 
 interface TailHandle {
   stop: () => void;
@@ -733,7 +802,8 @@ export const startMirrorTail = (deps: TailDeps): TailHandle => {
   // offset. Because the move is a rename (byte prefix preserved), the offset
   // stays continuous across enter→work→exit: no re-dump, no missed lines, and
   // switching back to the original path just resumes on the same offset.
-  const projectsRoot = dirname(dirname(deps.jsonlPath));
+  // The sid search is scoped to the backend owning this transcript — a sid from
+  // another CLI is never ours, however recently it was written.
   const candidates: string[] = [deps.jsonlPath];
 
   // Newest-mtime candidate that currently exists (the move can briefly leave a
@@ -748,7 +818,7 @@ export const startMirrorTail = (deps: TailDeps): TailHandle => {
   const resolveLive = (): string | undefined => {
     const known = existing();
     if (known) return known;
-    const found = findJsonlBySid(projectsRoot, deps.sessionId);
+    const found = findJsonlBySid(deps.sessionId, backendForPath(deps.jsonlPath));
     if (found && !candidates.includes(found)) candidates.push(found);
     return existing();
   };
@@ -850,6 +920,10 @@ interface InjectArgs {
   cfg: Config;
   log: Logger;
   sessionId: string;
+  /** Bound transcript path. Identifies which CLI owns the session, so the
+   *  spawn-mode inject resumes it with THAT binary — resuming a codebuddy
+   *  session with `claude` (or vice versa) just errors "session not found". */
+  jsonlPath: string;
   /** tmux pane (e.g. `%5`) auto-discovered from caller's $TMUX_PANE at attach time. Empty → spawn-mode inject (writes to jsonl only, not the live TTY). */
   tmuxTarget?: string;
   /** Set when this inject runs immediately after a `claude --resume` respawn:
@@ -901,6 +975,15 @@ const RECENT_SIGS_MAX = 64;
 // Anything else (webp/heic/...) we transcode to PNG via `sips` first; sips ships
 // with macOS so no extra dep. Files are cached next to the original; cleanup is
 // left to the inbox dir's regular eviction.
+//
+// 注入策略 —— JXA 主路径 + AppleScript 兜底：
+//   codebuddy v2.72.0 的 release note 明确说"macOS 图片粘贴新增 JXA NSPasteboard
+//   后备方案，兼容企业微信等第三方截图工具"——说明 codebuddy 的 TUI 在主路径
+//   (AppleScript «class PNGf») 读不到图时，会走 JXA `$.NSPasteboard.generalPasteboard`
+//   后备。我们显式用 JXA 写一份 `NSPasteboardTypePNG` flavor，保证 codebuddy 的
+//   后备路径一定能读到；同时 `NSPasteboardTypePNG` 和 `«class PNGf»` 在系统层是
+//   同一个 UTI (public.png)，Claude Code 的主路径读 JXA 写入的 flavor 也没问题。
+//   JXA 失败（极少见，比如 AppKit 框架加载失败）才回退到纯 AppleScript。
 const PB_CLASS_BY_EXT: Record<string, string> = {
   png: "«class PNGf»",
   jpg: "JPEG picture",
@@ -931,11 +1014,34 @@ const setMacClipboardImage = async (imgPath: string): Promise<{ ok: boolean; rea
     pathToUse = tmp;
     pbClass = "«class PNGf»";
   }
-  // POSIX path quoting: backslash-escape `\` and `"` for AppleScript string literal.
+  // POSIX path quoting: backslash-escape `\` and `"` for both AppleScript and
+  // JXA string literals (二者转义规则一致)。
   const escaped = pathToUse.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+  // 主路径：JXA 直接写 NSPasteboardTypePNG。clearContents 后单 flavor 写入，
+  // 同时覆盖 codebuddy v2.72.0 JXA 后备读路径和 Claude Code 主路径。
+  // (public.png UTI 与 «class PNGf» 同一，Claude Code 读这份不会回归。)
+  const jxa = [
+    "ObjC.import('AppKit');",
+    "const pb = $.NSPasteboard.generalPasteboard;",
+    "pb.clearContents();",
+    `const data = $.NSData.dataWithContentsOfFile("${escaped}");`,
+    "if (data.isNil()) $.abort('read failed');",
+    "pb.setData(data, forType: $.NSPasteboardTypePNG);",
+  ].join(" ");
+  const rJxa = await runProc("osascript", ["-l", "JavaScript", "-e", jxa]);
+  if (rJxa.ok) return { ok: true };
+
+  // 兜底：JXA 失败才回退纯 AppleScript（用原 pbClass，可能是 JPEG/GIF/TIFF，
+  // 不强转 PNG —— 这条路径本来就是 Claude Code 历史验证过的）。
   const script = `set the clipboard to (read POSIX file "${escaped}" as ${pbClass})`;
-  const r = await runProc("osascript", ["-e", script]);
-  if (!r.ok) return { ok: false, reason: `osascript: ${r.stderr.slice(-200)}` };
+  const rApple = await runProc("osascript", ["-e", script]);
+  if (!rApple.ok) {
+    return {
+      ok: false,
+      reason: `clipboard set failed: jxa=${rJxa.stderr.slice(-120)}; applescript=${rApple.stderr.slice(-120)}`,
+    };
+  }
   return { ok: true };
 };
 
@@ -950,11 +1056,6 @@ const capturePaneTail = async (target: string, rows = 12): Promise<string> => {
   const r = await tmuxRun(["capture-pane", "-t", target, "-p", "-S", `-${rows}`]);
   return r.ok ? r.stdout : "";
 };
-
-// Strip ANSI SGR + CSI + OSC sequences so a slash-command stdout is safely
-// embeddable in a WeCom bubble. We don't try to preserve color — text only.
-const stripAnsi = (s: string): string =>
-  s.replace(/\x1B\[[0-9;?]*[a-zA-Z]/g, "").replace(/\x1B\][^\x07]*\x07/g, "");
 
 // Trim slash-command stdout to the useful section. TUI panels prepend a run
 // of leading whitespace / bar-chart glyph rows before the human-readable
@@ -1062,16 +1163,18 @@ const fingerprints = (text: string): { headFp: string; tailFp: string } => {
 //   3. narrow-window poll (last 5 rows = just the input box, NOT the echo
 //      above) for tailFp absence → submit was honored.
 //   4. on stuck-after-Enter, retry Enter once with extra settle.
-const injectViaTmux = async (target: string, text: string, images: string[], log: Logger, freshSpawn: boolean): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
-  log.info({ target, len: text.length, images: images.length, freshSpawn }, "mirror inject (tmux)");
+const injectViaTmux = async (target: string, text: string, images: string[], log: Logger, freshSpawn: boolean, backendName: CliBackendName): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
+  log.info({ target, len: text.length, images: images.length, freshSpawn, backendName }, "mirror inject (tmux)");
 
   // Never type into a modal picker (see detectModalPicker). Checked before the
   // image pump too — a C-v into a picker is just as destructive as a paste.
-  // Escape hatch: WECLAUDE_MODAL_GUARD=0, in case a future TUI layout trips it.
-  if (process.env.WECLAUDE_MODAL_GUARD !== "0") {
+  // 必须在按后端分流之前: 每个后端都有自己的原生确认框, 往任何一个里打字都会
+  // 替用户点掉框并吞掉这条消息。放到 codebuddy 早退之后就等于只保护了 claude。
+  // Escape hatch: WEZARD_MODAL_GUARD=0, in case a future TUI layout trips it.
+  if (process.env.WEZARD_MODAL_GUARD !== "0") {
     const modal = await detectModalPicker(target);
     if (modal.modal) {
-      log.warn({ target, title: modal.title }, "mirror inject: modal picker on pane, refusing to inject");
+      log.warn({ target, title: modal.title, backendName }, "mirror inject: modal picker on pane, refusing to inject");
       const what = modal.title ? `「${modal.title}」` : "原生确认框";
       return {
         ok: false,
@@ -1080,6 +1183,22 @@ const injectViaTmux = async (target: string, text: string, images: string[], log
           + `请到 tmux 里处理该确认框,或发 /stop 取消当前操作后重发。`,
       };
     }
+  }
+
+  // 图片注入策略按后端分流：
+  //   claude / claude-internal —— 走 macOS 剪贴板 + Ctrl+V，TUI 收到 \x16 后
+  //     直接读系统剪贴板的 PNGf flavor，附加为 image content block。
+  //   codebuddy —— 它的 TUI 在 TMUX 环境下收到 C-v 后会先调
+  //     syncTmuxToSystemClipboard()（执行 `tmux save-buffer - | pbcopy`），
+  //     这会用 tmux buffer 的文本内容覆盖系统剪贴板，把 daemon 刚写入的
+  //     PNGf flavor 冲掉（pbcopy 只写 public.utf8-plain-text，NSImage 读不到）。
+  //     所以 codebuddy 走 C-v 必然失败 —— 改走 @<path> 文本提及，让 LLM
+  //     调 Read 工具读图（Read 支持图片，见 codebuddy tools-reference.md）。
+  //     v2.52.4 之后 @<path> 不自动转 image block，但 LLM 看到路径会 Read。
+  if (backendName === "codebuddy") {
+    const refs = images.map((p) => `@${p}`);
+    const textWithRefs = refs.length ? (text ? `${refs.join("\n")}\n${text}` : refs.join("\n")) : text;
+    return injectViaTmuxText(target, textWithRefs, log, freshSpawn);
   }
 
   // Pump images first via clipboard+C-v so each one is attached as a separate
@@ -1106,6 +1225,12 @@ const injectViaTmux = async (target: string, text: string, images: string[], log
     return e.ok ? { ok: true } : { ok: false, reason: `tmux send-keys Enter failed: ${e.stderr.slice(-200)}` };
   }
 
+  return injectViaTmuxText(target, text, log, freshSpawn);
+};
+
+// 文本 paste + Enter 提交 + 自校验。从 injectViaTmux 抽出来，让 codebuddy
+// 后端的 @<path> 回退路径也能复用同样的 paste-verify 逻辑。
+const injectViaTmuxText = async (target: string, text: string, log: Logger, freshSpawn: boolean): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
   // Warm pane: tight timings, low latency. Fresh spawn (claude --resume just
   // started, transcript still loading): extended timings — bracketed-paste
   // end can take 4-7s to be honored on a cold TUI. Only the fresh-spawn path
@@ -1224,7 +1349,8 @@ const injectViaTmux = async (target: string, text: string, images: string[], log
 };
 
 const injectViaSpawn = (args: InjectArgs): Promise<{ ok: boolean; reason?: string }> => {
-  const { text, images = [], cfg, log, sessionId } = args;
+  const { text, images = [], cfg, log, sessionId, jsonlPath } = args;
+  const bin = backendForPath(jsonlPath).bin;
   // Spawn-mode (no live TTY) can't do clipboard+C-v — fall back to `@<path>`,
   // which Claude parses at submit time and inlines as image content blocks
   // without a model-decided Read tool turn.
@@ -1240,9 +1366,9 @@ const injectViaSpawn = (args: InjectArgs): Promise<{ ok: boolean; reason?: strin
     "--verbose",
     ...cfg.wrc.extraArgs,
   ];
-  log.info({ sessionId, claudeBin: cfg.wrc.claudeBin, len: text.length }, "mirror inject");
+  log.info({ sessionId, bin, len: text.length }, "mirror inject");
   return new Promise((resolve) => {
-    const proc = spawn(cfg.wrc.claudeBin, cliArgs, {
+    const proc = spawn(bin, cliArgs, {
       cwd: expandHome(cfg.wrc.cwd),
       env: { ...process.env, PATH: augmentedPath(process.env.PATH) },
       stdio: ["ignore", "ignore", "pipe"],
@@ -1258,12 +1384,12 @@ const injectViaSpawn = (args: InjectArgs): Promise<{ ok: boolean; reason?: strin
     proc.on("close", (code) => {
       if (spawnError) {
         log.error({ err: spawnError.message }, "mirror spawn error");
-        resolve({ ok: false, reason: `spawn ${cfg.wrc.claudeBin}: ${spawnError.message}` });
+        resolve({ ok: false, reason: `spawn ${bin}: ${spawnError.message}` });
         return;
       }
       if (code !== 0) {
         log.error({ code, stderrTail: stderrTail.slice(-400) }, "mirror inject non-zero");
-        resolve({ ok: false, reason: `claude exited ${code}: ${stderrTail.slice(-300)}` });
+        resolve({ ok: false, reason: `${bin} exited ${code}: ${stderrTail.slice(-300)}` });
         return;
       }
       resolve({ ok: true });
@@ -1273,7 +1399,9 @@ const injectViaSpawn = (args: InjectArgs): Promise<{ ok: boolean; reason?: strin
 
 const inject = (args: InjectArgs): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
   const target = (args.tmuxTarget ?? "").trim();
-  return target ? injectViaTmux(target, args.text, args.images ?? [], args.log, args.freshSpawn ?? false) : injectViaSpawn(args);
+  if (!target) return injectViaSpawn(args);
+  const backendName = backendForPath(args.jsonlPath).name;
+  return injectViaTmux(target, args.text, args.images ?? [], args.log, args.freshSpawn ?? false, backendName);
 };
 
 // ── Per-session injection queue ───────────────────────────────────────
@@ -1317,7 +1445,7 @@ export interface AttachArgs {
   target?: string; // optional override; falls back to cfg.wrc.mirror.pushChat || cfg.defaultChat
   /** tmux pane (e.g. `%5`); usually auto-discovered from caller's $TMUX_PANE. Empty → spawn-mode inject. */
   tmuxPane?: string;
-  /** tmux session name (e.g. `weclaude-xxx`). Persisted so a reload can re-derive a fresh paneId for the same session. */
+  /** tmux session name (e.g. `wezard-xxx`). Persisted so a reload can re-derive a fresh paneId for the same session. */
   tmuxSession?: string;
   /** Cwd the live pane is running in. Persisted so /pwd can show truth and
    *  /clear can detect mismatch. Empty → cfg.wrc.cwd. */
@@ -1382,7 +1510,7 @@ export interface MirrorBridge {
     expect?: { toolName: string; toolInput: unknown },
   ) => Promise<void>;
   /** Inject text into an attached mirror without an originating WeCom frame.
-   *  Used by `weclaude init` to fire a demo prompt right after auto-spawn so
+   *  Used by `wezard init` to fire a demo prompt right after auto-spawn so
    *  the user sees the full PreToolUse → approval card → assistant mirror
    *  loop end-to-end. Skips the live-stream/replyStream machinery — the tail
    *  pushes assistant output via the standalone path. */
@@ -1395,6 +1523,11 @@ export interface MirrorBridge {
    *  prompt / press-enter-to-continue, or submits the input box as-is. No-op
    *  for spawn-mode attachments (no live TTY). */
   submitPane: (target: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** Switch the most-recently-active attached tmux client to this session's
+   *  pane (session + window + pane all selected) — the WeCom-side "show me
+   *  the terminal" escape hatch. Fails with an attach hint when no tmux
+   *  client is attached anywhere. */
+  revealPane: (target: string) => Promise<{ ok: boolean; reason?: string }>;
   /** Does this Claude sessionId have a live tmux pane we could answer a native
    *  confirm on? Sync (map lookup only) — the aliveness probe happens in
    *  `answerNativeModal`. Approval uses it to decide whether the `.claude/**`
@@ -1417,7 +1550,17 @@ export interface MirrorBridge {
   /** Detach + respawn a target's pane in `cfg.wrc.cwd` or its pendingCwd
    *  override. Used by /new to give the user a fresh claude in the bound
    *  project. Returns the new attachment result. */
-  newSession: (target: string, windowName?: string) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
+  newSession: (target: string, windowName?: string, cli?: CliBackendName, opts?: { model?: string; cwd?: string }) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
+  /** Sibling sessions of `target`'s chat (default + every `#tag`), each with
+   *  liveness / busy / last-activity so an agent can see who else is working. */
+  peers: (target: string) => Promise<PeerInfo[]>;
+  /** Live tmux pane tail of `target` — what that agent's terminal shows right
+   *  now, including in-flight tool calls the transcript hasn't recorded yet. */
+  peekPane: (target: string, rows?: number) => Promise<{ ok: boolean; reason?: string; pane?: string; busy?: boolean }>;
+  /** Mid-turn check for one target. False for cold/dead panes (nothing running). */
+  isBusy: (target: string) => Promise<boolean>;
+  /** Latest assistant message of `target` — the handoff payload between agents. */
+  lastText: (target: string) => string;
 }
 
 interface ToolEntry {
@@ -1425,6 +1568,23 @@ interface ToolEntry {
   name: string;
   input: unknown;
   result?: string;
+}
+
+/** Brief turn 的 loading 气泡 —— 起始以 "…" (finish=false) 挂住不关闭。turn 收口时
+ *  才定最终内容: 无工具→直接把结论写进这个气泡; 有工具→写详情链接 (结论另发
+ *  standalone)。hardTimer 兜底 WeCom ~6min stream 窗口, 到点强制收口。 */
+interface BriefBubble {
+  frame: WsFrameHeaders;
+  streamId: string;
+  hardTimer: NodeJS.Timeout;
+  done: boolean;
+}
+
+/** 已经 ack 过 (气泡挂出去了)、turn 记录也建好了, 但还没轮到它当活跃 turn。 */
+interface QueuedTurn {
+  turnId: string;
+  bubble: BriefBubble;
+  isSlash: boolean;
 }
 
 interface ActiveStream {
@@ -1472,6 +1632,13 @@ interface AttachState {
   /** Debounce buffer for the standalone fallback path. liveStream 活时为 undefined,
    *  fallback 落入时累积 item.body, debounce 窗口结束统一发出, 抑制工具调用刷屏。 */
   standaloneBuf?: { parts: string[]; timer: NodeJS.Timeout };
+  /** 刚由 newSession 铸出的 pane —— TUI 只有 TUI_SETTLE_MS 那么大。首条 inject
+   *  必须用冷启动时序,否则 paste 校验会在 TUI 抓到 pty 之前超时并重贴一次,
+   *  两次 paste 最终都落进输入框 = 提示词重复。一次性,由第一次 dispatch 消费。 */
+  justSpawned?: boolean;
+  /** 待记账的上下文断点 (`/clear` 注入 / `/new` 铸盘 / 观测到 /clear 轮换)。由下一次
+   *  recordTurnStart 消费一次 —— 断点属于"断点之后的第一轮", 那才是读不到上文的一轮。 */
+  ctxCut?: CtxCut;
   /** Set when `/clear` was injected: the next user prompt will land in a fresh
    *  jsonl with a new sessionId. A watcher polls the project dir to migrate
    *  this attachment onto the new file. Cleared once migration completes or
@@ -1494,11 +1661,24 @@ interface AttachState {
   /** Brief turn 的 loading 气泡 —— 起始以 "…" (finish=false) 挂住不关闭。turn 收口
    *  时才定最终内容: 无工具→直接把结论写进这个气泡; 有工具→写详情链接 (结论另发
    *  standalone)。hardTimer 兜底 WeCom ~6min stream 窗口, 到点强制收口。 */
-  briefBubble?: { frame: WsFrameHeaders; streamId: string; hardTimer: NodeJS.Timeout; done: boolean };
+  briefBubble?: BriefBubble;
+  /** 尚未激活的 turn。上一 turn 还在跑时又收到 WeCom 消息 —— CC 会把它排进自己的队列,
+   *  要等当前轮结束才处理, 所以这边也必须排队: 强关当前 turn 会把仍在产出的后半轮
+   *  改挂到新 turn 上 (旧 turn 页提前变「已完成」)。closeBriefTurn 顺序放行。 */
+  briefQueue?: QueuedTurn[];
   /** 本 turn 是否出现过 tool_use —— 决定气泡收口写结论还是写详情链接。 */
   briefHadTool?: boolean;
   /** 本 turn 由 slash 命令 (/context…) 触发 —— 其 skill_output 即答案, 写进气泡而非 standalone。 */
   briefIsSlash?: boolean;
+  /** 本 turn 的结论是否已经落地 (写进气泡或发了 standalone), 防止软收口重复推送。 */
+  briefConcluded?: boolean;
+  /** 本 turn 最近一条 assistant text。软收口没有"终句"标记, 收口时拿它当结论。 */
+  briefLastText?: string;
+  /** 软收口的静默期计时器 —— 任何新 item 到达即撤销。 */
+  softEnd?: NodeJS.Timeout;
+  /** CLI 侧最近一条用户输入, 用作下一个"无气泡 turn"(ensureBriefTurn) 的 userQuery。
+   *  WeCom 发起的 turn 直接从 dispatch 拿到原文, 用不到它。 */
+  pendingBriefQuery?: string;
   /** True while a `/goal` is active (session-scoped Stop hook self-driving the
    *  model). Goal runs never emit a terminal stop_reason, so brief-mode's
    *  turn_end-gated flush would swallow the whole run into the turn store while
@@ -1607,6 +1787,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // for >60s mid-turn and we don't want to drop the bubble while it's chewing.
   const FLUSH_MS = 250;
   const HARD_TIMEOUT_MS = 350_000;
+  /** 软收口静默期。后端只能说"这条消息写完了"(codebuddy) 时, 等这么久没有新 item
+   *  才认定一轮结束。取值只需盖住"叙述消息落盘 → 紧随其后的 function_call 落盘"
+   *  这一段, 与模型思考/工具执行时长无关。 */
+  const SOFT_TURN_END_MS = 4_000;
   const STREAM_SOFT_CAP = 18_000;
   const TOOL_DETAIL_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -1707,8 +1891,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // pushes from a single mirror stay ordered; different mirrors run in parallel.
   const sendStandalone = (a: AttachState, content: string): void => {
     const chatId = stripPrincipalPrefix(a.target);
-    const tagged = withSessionTag(a.target, content);
-    const chunks = splitChunks(tagged, cfg.wrc.mirror.chunkChars);
+    // Tag AFTER splitting — one header per bubble, so chunk 2..N stay
+    // attributable to the session instead of arriving anonymous.
+    const pieces = splitChunks(content, Math.max(200, cfg.wrc.mirror.chunkChars - TAG_HEADER_BUDGET));
+    const chunks = pieces.map((p, i) =>
+      withSessionTag(a.target, p, pieces.length > 1 ? `${i + 1}/${pieces.length}` : undefined));
     a.standalonePending = a.standalonePending
       .then(async () => {
         for (const c of chunks) {
@@ -1929,7 +2116,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // Skill outputs (e.g. /model) bypass deferred filtering — emit directly
     // as a standalone bubble so the user sees the result immediately.
     if (item.kind === "skill_output") {
-      enqueueStandalone(a, item.body);
+      if (!item.quiet) enqueueStandalone(a, item.body);
       return;
     }
     const wasEmpty = out.buf.length === 0;
@@ -1950,16 +2137,21 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   //   • 无工具 → 直接把 Claude 最终文本 (或 slash 命令的 skill_output) 写进这条气泡。
   //   • 有工具 → 气泡收成 "✴️ 详情链接", 最终文本另发一条 standalone。
   // 其它所有 item 只写入 turn detail store。
-  const briefDetailLink = (turnId: string): string =>
-    `✴️ [View turn details](${buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId)})`;
+  // 能证明"assistant 已经在产出"的 item —— 见到它们才补开无气泡 turn。
+  const BRIEF_TURN_OPENERS = new Set<RenderItem["kind"]>(["text", "tool_use", "tool_result", "skill_output"]);
 
-  // 收口 loading 气泡: finish=true 写入最终内容, 只生效一次。发送失败则退回 standalone。
-  const finishBriefBubble = async (a: AttachState, content: string): Promise<void> => {
-    const b = a.briefBubble;
+  // 链接落到 chat 视图: 默认选中本 turn 所属的 #tag, 贴底显示整条会话。turnId 依旧
+  // 是凭据 (不可枚举), 只是页面从"一个 turn"扩成"这个 chat 的全部会话"。
+  const briefDetailLink = (turnId: string): string =>
+    `✴️ [View chat details](${buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId)})`;
+
+  // 收口一条 loading 气泡: finish=true 写入最终内容, 只生效一次。发送失败退回 standalone。
+  // 排队中的 turn 也持有气泡, 所以气泡是显式入参而不是从 a 上取。
+  const finishBubble = async (a: AttachState, b: BriefBubble | undefined, content: string): Promise<void> => {
     if (!b || b.done) return;
     b.done = true;
     clearTimeout(b.hardTimer);
-    a.briefBubble = undefined;
+    if (a.briefBubble === b) a.briefBubble = undefined;
     try {
       await client.replyStream(b.frame, b.streamId, withSessionTag(a.target, content || " "), true);
     } catch (e) {
@@ -1968,25 +2160,76 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
   };
 
-  const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string, isSlash = false, userQuery = ""): Promise<void> => {
-    if (a.briefTurnId) closeBriefTurn(a); // 上一 turn 未收尾, 强制关掉再开新的
-    const turnId = newTurnId();
-    a.briefTurnId = turnId;
+  const finishBriefBubble = (a: AttachState, content: string): Promise<void> => finishBubble(a, a.briefBubble, content);
+
+  // 让一个已建好记录的 turn 成为活跃 turn。turn 级状态在这里统一归零 —— 唯一入口。
+  const openBriefTurn = (a: AttachState, q: QueuedTurn): void => {
+    a.briefTurnId = q.turnId;
+    a.briefBubble = q.bubble;
+    a.briefIsSlash = q.isSlash;
     a.briefHadTool = false;
-    a.briefIsSlash = isSlash;
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: userQuery.trim() || undefined });
-    // hardTimer 兜底: turn 若无 final text / turn_end 收口 (卡死/漏收), 到点仍收气泡。
-    const hardTimer = setTimeout(
-      () => void finishBriefBubble(a, briefDetailLink(turnId)),
-      HARD_TIMEOUT_MS,
-    );
-    a.briefBubble = { frame, streamId, hardTimer, done: false };
+    a.briefConcluded = false;
+    a.briefLastText = undefined;
+    log.info({ sessionId: a.sessionId, turnId: q.turnId, isSlash: q.isSlash }, "brief: turn started");
+  };
+
+  // WeCom 侧发起一个 turn: 立刻挂 loading 气泡当 ack, 再决定是马上激活还是排队。
+  // 上一 turn 还在跑时绝不能强关它 —— CC 那边新消息也是排队的, 当前轮的后半段还会
+  // 继续落盘, 强关会把它们改挂到新 turn 上, 旧 turn 页则提前变「已完成」。
+  // 断点是一次性的: 只归给断点后的第一轮, 之后的轮次上下文又连续了。
+  const consumeCut = (a: AttachState): CtxCut | undefined => {
+    const cut = a.ctxCut;
+    a.ctxCut = undefined;
+    return cut;
+  };
+
+  const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string, isSlash = false, userQuery = ""): Promise<void> => {
+    const turnId = newTurnId();
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: userQuery.trim() || undefined, cut: consumeCut(a) });
+    // hardTimer 兜底: turn 若无终句 / turn_end 收口 (卡死/漏收), 到点仍收气泡。
+    const bubble: BriefBubble = { frame, streamId, hardTimer: undefined as unknown as NodeJS.Timeout, done: false };
+    const q: QueuedTurn = { turnId, bubble, isSlash };
+    bubble.hardTimer = setTimeout(() => {
+      // 到点还在排队 = 前一个 turn 卡死或漏收 turn_end。强关它放行 —— 队列必须能自愈,
+      // 否则这条消息的产出会一直记到那个僵尸 turn 上。气泡此时已过 WeCom 更新窗口,
+      // 收成详情链接即可, 真正要紧的是让本 turn 激活。
+      if (a.briefQueue?.includes(q)) {
+        log.warn({ sessionId: a.sessionId, turnId }, "brief: queued turn timed out — force-closing the stuck one");
+        closeBriefTurn(a);
+      }
+      void finishBubble(a, bubble, briefDetailLink(turnId));
+    }, HARD_TIMEOUT_MS);
+    if (a.briefTurnId) {
+      (a.briefQueue ??= []).push(q);
+      log.info({ sessionId: a.sessionId, turnId, queued: a.briefQueue.length }, "brief: turn queued (previous still running)");
+    } else {
+      openBriefTurn(a, q);
+    }
     try {
       await client.replyStream(frame, streamId, withSessionTag(a.target, "…"), false); // 挂住 loading 气泡, 不关闭
     } catch (e) {
       log.warn({ sessionId: a.sessionId, turnId, err: (e as Error).message }, "brief: turn ack failed");
     }
-    log.info({ sessionId: a.sessionId, turnId, isSlash }, "brief: turn started");
+  };
+
+  // 无气泡 turn。CLI 侧自己开的一轮 (WeCom 从没发过消息, 拿不到 frame/streamId), 以及
+  // 收口后仍有 item 补写进来的情况, 都要有一个 turn 承接 —— 否则每条 tool/text 都掉进
+  // fallback standalone, 一轮工具密集的对话能在群里刷出几十条散装气泡。这里只推一条
+  // 详情链接当入口, 其余全部收进 turn 页, 与 WeCom 侧发起的 turn 表现一致。
+  const ensureBriefTurn = (a: AttachState): void => {
+    if (a.briefTurnId) return;
+    const turnId = newTurnId();
+    const query = a.pendingBriefQuery?.replace(/^> ?/gm, "").trim();
+    a.pendingBriefQuery = undefined;
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: query || undefined, cut: consumeCut(a) });
+    a.briefTurnId = turnId;
+    a.briefBubble = undefined;
+    a.briefIsSlash = false;
+    a.briefHadTool = false;
+    a.briefConcluded = false;
+    a.briefLastText = undefined;
+    enqueueStandalone(a, briefDetailLink(turnId));
+    log.info({ sessionId: a.sessionId, turnId }, "brief: turn started (CLI-side, no bubble)");
   };
 
   // 本轮一旦出现工具调用 / tool_result / 非 final 文本, 就说明这不是"一句话答完"的
@@ -1999,18 +2242,42 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     void finishBriefBubble(a, briefDetailLink(a.briefTurnId));
   };
 
-  const closeBriefTurn = (a: AttachState): void => {
+  // 本轮结论落地, 只生效一次:
+  //   • 无工具 → 结论 + 详情链接一并写进 loading 气泡 (仍是一条消息);
+  //   • 有工具 / 无气泡 turn → 气泡留给 closeBriefTurn 收详情链接, 结论另发 standalone。
+  // 每个 turn 都必须留一个可回溯入口, 单句回答也要带链接。
+  const concludeBriefTurn = (a: AttachState, body: string): void => {
+    const turnId = a.briefTurnId;
+    if (!turnId || a.briefConcluded || !body.trim()) return;
+    a.briefConcluded = true;
+    if (a.briefHadTool || !a.briefBubble) sendStandalone(a, body);
+    else void finishBriefBubble(a, `${body}\n\n${briefDetailLink(turnId)}`);
+    // 排队中的 turn 已经建了记录但还没跑, 不能被这把扫帚扫成「已完成」。
+    const keep = [turnId, ...(a.briefQueue ?? []).map((q) => q.turnId)];
+    recordCloseOpenTurns({ target: a.target, sessionId: a.sessionId, exceptIds: keep });
+  };
+
+  /** soft=true: 收口信号来自静默期确认 (后端无终句标记), 拿本轮最后一句 text 当结论。
+   *  硬信号路径上结论早已由 final text 落地, briefConcluded 会挡住重复推送。 */
+  const closeBriefTurn = (a: AttachState, soft = false): void => {
     if (!a.briefTurnId) return;
-    // 气泡还开着 (有工具的 turn: final text 只发了 standalone, 气泡留到这里收链接;
-    // 或空 turn 无 final text) —— 收口: 统一写详情链接, 保证每个 turn 都有可点入口。
+    if (soft) concludeBriefTurn(a, a.briefLastText ?? "");
+    // 气泡还开着 (有工具的 turn: 结论只发了 standalone, 气泡留到这里收链接; 或空 turn
+    // 没有结论) —— 收口: 统一写详情链接, 保证每个 turn 都有可点入口。
     if (a.briefBubble && !a.briefBubble.done) {
       void finishBriefBubble(a, briefDetailLink(a.briefTurnId));
     }
     recordTurnClose(a.briefTurnId);
     log.info({ sessionId: a.sessionId, turnId: a.briefTurnId }, "brief: turn closed");
     a.briefTurnId = undefined;
+    a.briefBubble = undefined;
     a.briefHadTool = false;
     a.briefIsSlash = false;
+    a.briefConcluded = false;
+    a.briefLastText = undefined;
+    // 放行下一个排队的 turn —— 它的气泡早在 ack 时就挂出去了, 这里只是激活。
+    const next = a.briefQueue?.shift();
+    if (next) openBriefTurn(a, next);
   };
 
   // Route one RenderItem into the turn store. final text 会额外作为 standalone 发群。
@@ -2049,19 +2316,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
     if (item.kind === "text") {
       recordTurnItem(turnId, { t: "text", body: item.body, ts: now, final: item.final === true });
-      if (item.final !== true) earlyLinkBubble(a); // 非 final 中间输出 → 立刻推链接
-      if (item.final === true) {
-        // 收口结论: 无工具 → 答案 + 详情链接一并写进 loading 气泡 (仍是一条消息);
-        // 有工具 → 气泡留给 closeBriefTurn 收详情链接, 结论另发 standalone。
-        // 每个 turn 都必须留一个可回溯入口, 单句回答也要带链接。
-        if (a.briefHadTool) sendStandalone(a, item.body);
-        else void finishBriefBubble(a, `${item.body}\n\n${briefDetailLink(turnId)}`);
-        recordCloseOpenTurns(a.target, turnId);
-      }
+      a.briefLastText = item.body; // 软收口时拿它当结论 (那条路径上没有 final 标记)
+      // final===false 才是"确知的中途输出"; undefined 是后端说不清, 不能据此提前收气泡。
+      if (item.final === false) earlyLinkBubble(a);
+      if (item.final === true) concludeBriefTurn(a, item.body);
       return;
     }
     if (item.kind === "turn_end") {
-      closeBriefTurn(a);
+      closeBriefTurn(a, item.soft === true);
       return;
     }
     if (item.kind === "turn_usage") {
@@ -2070,8 +2332,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
     if (item.kind === "skill_output") {
       recordTurnItem(turnId, { t: "text", body: item.body, ts: now });
+      // quiet (subagent 回执): 只留在 turn/detail 页, 不占一条聊天消息。
+      if (item.quiet) return;
       // slash 命令 (/context…) 的 skill_output 即本轮答案 (无 final text 收口) —— 写进
-      // loading 气泡。非 slash 场景的 skill_output (task 通知等) 是中间反馈, 照旧 standalone。
+      // loading 气泡。非 slash 场景的 skill_output 是中间反馈, 照旧 standalone。
       if (a.briefIsSlash && !a.briefHadTool && a.briefBubble && !a.briefBubble.done) {
         void finishBriefBubble(a, item.body);
       } else {
@@ -2096,7 +2360,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const banner = goalBanner(condition);
     if (a.briefBubble && !a.briefBubble.done) void finishBriefBubble(a, banner);
     else enqueueStandalone(a, banner);
-    if (a.briefTurnId) closeBriefTurn(a); // bubble now done → closeBriefTurn skips re-finalizing
+    // 连同排队中的 turn 一起收掉: goal 期间所有 item 走 handleGoalItem, 排队的 turn
+    // 永远等不到自己的产出。closeBriefTurn 会逐个放行再关闭, 每个都留下详情链接。
+    while (a.briefTurnId) closeBriefTurn(a); // bubble now done → closeBriefTurn skips re-finalizing
     a.goalActive = true;
     log.info({ sessionId: a.sessionId, target: a.target, condition }, "goal: entered progress mode");
   };
@@ -2107,7 +2373,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // chat with hundreds of tool bubbles. turn_end = the goal auto-cleared and the
   // model finally stopped → leave goal mode; normal brief resumes next turn.
   const handleGoalItem = (a: AttachState, item: RenderItem): void => {
-    if (item.kind === "text" || item.kind === "skill_output") { enqueueStandalone(a, item.body); return; }
+    if (item.kind === "text" || item.kind === "skill_output") {
+      if (item.kind !== "skill_output" || !item.quiet) enqueueStandalone(a, item.body);
+      return;
+    }
     if (item.kind === "turn_end") {
       a.goalActive = false;
       log.info({ sessionId: a.sessionId, target: a.target }, "goal: cleared (turn ended)");
@@ -2116,7 +2385,26 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // tool_use / tool_result / user_text / turn_usage: recorded to detail store; no bubble.
   };
 
+  // 软收口到点: 静默期内没有新 item, 确认这一轮真的结束了。
+  const fireSoftTurnEnd = (a: AttachState): void => {
+    a.softEnd = undefined;
+    log.debug({ sessionId: a.sessionId, turnId: a.briefTurnId }, "soft turn_end confirmed");
+    if (a.goalActive) { handleGoalItem(a, { kind: "turn_end" }); return; }
+    if (cfg.wrc.mirror.brief && a.briefTurnId) { closeBriefTurn(a, true); return; }
+    if (a.liveStream && !a.liveStream.closed) void finalizeStream(a, a.liveStream);
+  };
+
   const onItem = (a: AttachState, item: RenderItem): void => {
+    // 任何新 item 到达 = 上一条"消息写完了"并不代表这一轮结束 → 撤销待确认的软收口。
+    // 硬信号 (end_turn / turn_duration) 的后端永远不会走到这里。
+    if (a.softEnd) { clearTimeout(a.softEnd); a.softEnd = undefined; }
+    if (item.kind === "turn_end" && item.soft === true) {
+      a.softEnd = setTimeout(() => fireSoftTurnEnd(a), SOFT_TURN_END_MS);
+      return;
+    }
+    // codebuddy: ExitPlanMode 若被本地先答, result 落盘即作废挂着的计划审批卡
+    // (卡 pending 期间 model 阻塞在本地对话框, 不可能有其它 tool_result)。
+    if (item.kind === "tool_result") mootMirrorPlan(a.sessionId);
     // Record tool_use signatures unconditionally (before any state branching),
     // so flushBeforeCard's poll-drain can detect that the to-be-approved tool
     // is now persisted in the jsonl regardless of DEFERRED/STREAMING/IDLE.
@@ -2130,6 +2418,79 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           if (oldest === undefined) break;
           a.recentToolSigs.delete(oldest);
         }
+        // codebuddy 的 ExitPlanMode 完全不过 PreToolUse hook (实测: 由
+        // interruption-service 本地对话框裁决, HookExecutor 零调用)。mirror 从
+        // jsonl 看到 function_call → 发计划审批卡; 点选后 send-keys 裁决本地
+        // 对话框 (Enter=同意, 默认高亮 Yes / Escape=选项 2 标注的快捷键)。
+        // claude 系 hook 即时触发, 不走此路 (否则双重发卡)。
+        if (
+          c.name === "ExitPlanMode"
+          && backendForPath(a.jsonlPath).name === "codebuddy"
+          && !hasMirrorPlan(a.sessionId)
+        ) {
+          void runMirrorPlanFlow({
+            log: log.child({ sessionId: a.sessionId }),
+            client,
+            sessionId: a.sessionId,
+            chatKey: a.target,
+            cwd: a.runningCwd,
+            jsonlPath: a.jsonlPath,
+            voteTimeoutMs: cfg.approval.longPollSec * 1000,
+            sendKey: async (key) => {
+              if (!a.tmuxPane) return { ok: false, reason: "no_live_pane" };
+              if (!(await tmuxPaneAlive(a.tmuxPane))) return { ok: false, reason: "pane_dead" };
+              const r = await tmuxRun(["send-keys", "-t", a.tmuxPane, key]);
+              return r.code === 0 ? { ok: true } : { ok: false, reason: `send-keys ${key} failed: ${r.stdout.slice(-200) || r.code}` };
+            },
+          });
+        }
+        // codebuddy 对 AskUserQuestion 不在提问时触发 PreToolUse hook — 先弹本地
+        // 面板, hook 只在面板被提交后才到达 (实测可延迟数小时)。这里从 jsonl 提前
+        // 看到 function_call, 直接驱动 vote 卡让远端可答; 点选后注入一段触发文本
+        // 提交本地面板, hook 到达时以 deny+reason 覆盖答案, 与 claude 路径同产物。
+        // claude 系 hook 即时触发, 不走此路 (否则双重发卡)。
+        if (
+          c.name === "AskUserQuestion"
+          && backendForPath(a.jsonlPath).name === "codebuddy"
+          && !hasMirrorAskq(a.sessionId)
+        ) {
+          void runMirrorAskqFlow({
+            log: log.child({ sessionId: a.sessionId }),
+            client,
+            sessionId: a.sessionId,
+            chatKey: a.target,
+            toolInput: c.input,
+            voteTimeoutMs: cfg.wrc.mirror.askqVoteTimeoutSec * 1000,
+            drive: async (acts) => {
+              // 面板只活在 TTY 里 — 无 pane 无法驱动 (spawn 注入会变成新 prompt)。
+              if (!a.tmuxPane) return { ok: false, reason: "no_live_pane" };
+              if (!(await tmuxPaneAlive(a.tmuxPane))) return { ok: false, reason: "pane_dead" };
+              for (const act of acts) {
+                if (act.kind === "text") {
+                  // 贴文本到自定义输入行: 复用 inject 的 bracketed-paste + Enter。
+                  const r = await inject({
+                    text: act.text,
+                    cfg,
+                    log: log.child({ principal: a.target, sessionId: a.sessionId }),
+                    sessionId: a.sessionId,
+                    jsonlPath: a.jsonlPath,
+                    tmuxTarget: a.tmuxPane,
+                    freshSpawn: false,
+                  });
+                  if (!r.ok) return r;
+                } else {
+                  for (const key of act.keys) {
+                    const r = await tmuxRun(["send-keys", "-t", a.tmuxPane!, key]);
+                    if (r.code !== 0) return { ok: false, reason: `send-keys ${key}: ${r.stdout.slice(-200) || r.code}` };
+                    await sleepMs(120); // 键间距 — 等 TUI 重渲染, 防吞键
+                  }
+                }
+                await sleepMs(300); // 题间/阶段间隔 — 等面板翻页
+              }
+              return { ok: true };
+            },
+          });
+        }
       }
     }
     // /goal mode overrides everything below: the session-scoped Stop hook
@@ -2140,6 +2501,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // turn_end. Placed before the brief short-circuit so goal wins over brief.
     if (item.kind === "goal_start") { enterGoalMode(a, item.condition); return; }
     if (a.goalActive) { handleGoalItem(a, item); return; }
+    // Brief 模式下没有活跃 turn 时, 任何 assistant 侧产出都补开一个无气泡 turn ——
+    // 覆盖 CLI 侧直接开的新一轮 (WeCom 没参与, 拿不到 frame) 与收口后的零星补写。
+    // user_text 只记下来当下一轮的 query, 不开 turn (CLI 敲字 ≠ 一定有回复)。
+    if (cfg.wrc.mirror.brief && !a.briefTurnId) {
+      if (item.kind === "user_text") a.pendingBriefQuery = item.body;
+      else if (BRIEF_TURN_OPENERS.has(item.kind)) ensureBriefTurn(a);
+    }
     // Usage snapshots never flow into WeCom bubbles — brief 分支下 handleBriefItem
     // 会把它写进 turn store, 非 brief 下直接吞掉, 保持 onItem 主流程只处理有渲染
     // 输出的 item 类型。
@@ -2189,7 +2557,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // Skill outputs (e.g. /model) always emit as standalone — never append to
     // an active stream so the result is independently visible.
     if (item.kind === "skill_output") {
-      enqueueStandalone(a, item.body);
+      if (!item.quiet) enqueueStandalone(a, item.body);
       return;
     }
     // Assistant turn truly ended (stop_reason terminal). Finalize the live
@@ -2250,7 +2618,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (a.migrationWatcher) { a.migrationWatcher.cancel(); a.migrationWatcher = undefined; }
     if (a.outbound?.kind === "deferred") clearTimeout(a.outbound.timer);
     a.outbound = undefined;
-    if (a.briefTurnId) closeBriefTurn(a);
+    if (a.softEnd) { clearTimeout(a.softEnd); a.softEnd = undefined; }
+    while (a.briefTurnId) closeBriefTurn(a); // 活跃 + 排队中的 turn 全部收掉
     if (a.liveStream && !a.liveStream.closed) void finalizeStream(a, a.liveStream);
     if (a.standaloneBuf) { clearTimeout(a.standaloneBuf.timer); flushStandalone(a); }
     a.tail.stop();
@@ -2315,6 +2684,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       detailUrlFor,
       sessionId,
       target,
+      // Dialect comes from the transcript's own root, not defaultCli — that is
+      // what lets a claude session and a codebuddy session be mirrored at once.
+      normalizeLine: backendForPath(jsonlPath).normalizeTranscriptLine,
     });
     bySessionId.set(sessionId, a);
     byTarget.set(target, a);
@@ -2367,8 +2739,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // tail then follows it natively. Must precede the latestJsonlForCwd heal,
       // which would otherwise grab whatever session is newest in the original
       // cwd's dir (usually a *different* chat) and cross-wire the mirror.
-      const projectsRoot = expandHome(cfg.wrc.mirror.projectsDir);
-      const relocated = findJsonlBySid(projectsRoot, rec.sessionId);
+      const owner = backendForPath(expandHome(rec.jsonlPath));
+      const relocated = findJsonlBySid(rec.sessionId, owner);
       if (relocated) {
         log.info({ principal, sessionId: rec.sessionId, from: rec.jsonlPath, to: relocated }, "mirror restore: sid relocated (worktree), re-homed");
         rec.jsonlPath = relocated;
@@ -2381,7 +2753,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // project dir; heal onto it instead of dropping the binding, else the
         // chat silently loses all further responses. Fail-closed drop only when
         // the project dir is truly empty.
-        const healed = latestJsonlForCwd(cfg, rec.cwd || cfg.wrc.cwd);
+        const healed = latestJsonlForCwd(rec.cwd || cfg.wrc.cwd, owner);
         if (!healed) {
           log.warn({ principal, jsonlPath: rec.jsonlPath }, "mirror restore: jsonl missing and no sibling, dropping entry");
           deps.store.drop(principal);
@@ -2397,7 +2769,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // Prefer the stored pane id and validate via display-message. Pane ids
     // (`%N`) are monotonic per tmux server lifetime, so they're stable across
     // daemon reloads as long as the tmux server didn't restart. With the
-    // shared `weclaude` session hosting many chats, listing panes by session
+    // shared `wezard` session hosting many chats, listing panes by session
     // name would mis-route to whichever window happens to be first — never
     // do that. If the stored pane is dead, leave tmuxPane empty and let
     // dispatch's respawn check reincarnate via `claude --resume <sid>`.
@@ -2416,10 +2788,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const cwdRes = await tmuxRun(["display-message", "-p", "-t", livePane, "#{pane_current_path}"]);
       const paneCwd = cwdRes.stdout.trim();
       if (paneCwd) {
-        const projectsRoot = expandHome(cfg.wrc.mirror.projectsDir);
-        const paneDir = join(projectsRoot, encodeProjectDir(expandHome(paneCwd)));
+        // Encode under the backend that owns the bound transcript — comparing
+        // with the primary dialect would report a phantom drift for every
+        // session belonging to a non-primary CLI.
+        const paneDir = projectDirFor(jsonlAbs, expandHome(paneCwd));
         if (paneDir !== dirname(jsonlAbs)) {
-          const live = liveSessionForCwd(projectsRoot, paneCwd);
+          const live = liveSessionForCwd(paneCwd, backendForPath(jsonlAbs));
           if (live && live.sessionId !== rec.sessionId) {
             log.info({ principal, from: rec.sessionId, to: live.sessionId, paneCwd }, "mirror restore: pane in worktree, re-homed to live session");
             rec.sessionId = live.sessionId;
@@ -2490,7 +2864,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       );
     }
     const merged = parts.join("\n\n---\n\n");
-    return splitChunks(merged, cfg.wrc.mirror.chunkChars);
+    return splitChunks(merged, Math.max(200, cfg.wrc.mirror.chunkChars - TAG_HEADER_BUDGET));
   };
 
   const resolveToolDetail = (turnId: string): { target: string; markdown: string[] } | undefined => {
@@ -2537,9 +2911,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       for (const line of text.split("\n")) {
         if (!line.trim()) continue;
         try {
-          const j = JSON.parse(line) as TranscriptLine;
-          if (j.type !== "user" || j.isMeta || j.isSidechain) continue;
+          const j = normalizeForPath(path, JSON.parse(line));
+          if (!j || j.type !== "user" || j.isMeta || j.isSidechain) continue;
           const c = j.message?.content;
+          // codebuddy writes the caveat + /clear + stdout as sibling plain user
+          // messages — skip the noise so the DECIDING line is the first real
+          // one, same as Claude's isMeta-filtered stream.
+          if (isLocalCommandNoise(c)) continue;
           // First non-meta user line decides: /clear → match; anything else → reject.
           return typeof c === "string" && SLASH_CLEAR_USER_RE.test(c);
         } catch { /* partial line */ }
@@ -2565,8 +2943,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       for (const line of buf.toString("utf8").split("\n")) {
         if (!line.trim()) continue;
         try {
-          const j = JSON.parse(line) as TranscriptLine;
-          if (j.type === "user" && !j.isMeta && !j.isSidechain && typeof j.uuid === "string") return j.uuid;
+          const j = normalizeForPath(path, JSON.parse(line));
+          if (j?.type === "user" && !j.isMeta && !j.isSidechain && !isLocalCommandNoise(j.message?.content) && typeof j.uuid === "string") return j.uuid;
         } catch { /* partial line */ }
       }
     } catch { /* unreadable */ }
@@ -2580,6 +2958,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const migrateAttachment = (a: AttachState, newSessionId: string, newJsonlPath: string, startOffset?: number): void => {
     const oldSessionId = a.sessionId;
     const oldJsonlPath = a.jsonlPath;
+    // 迁移是所有会话轮换的唯一漏斗 (注入的 /clear、TUI 里手打的 /clear、resume fork、
+    // worktree drift)。只有目标 jsonl 首条用户行是 /clear 的那种才是真清空 —— fork /
+    // drift 上下文是延续的, 让 store 去推它那条中性的 "switch"。
+    if (jsonlIsPostClearChild(newJsonlPath)) a.ctxCut = "clear";
     a.tail.stop();
     bySessionId.delete(oldSessionId);
     a.sessionId = newSessionId;
@@ -2600,6 +2982,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       sessionId: newSessionId,
       target: a.target,
       startOffset,
+      // A migration can cross backends (rare, but the new jsonl is resolved by
+      // path, not by CLI) — re-derive the dialect from the destination.
+      normalizeLine: backendForPath(newJsonlPath).normalizeTranscriptLine,
     });
     deps.store.set(a.target, {
       sessionId: newSessionId,
@@ -2716,7 +3101,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       if (stopped) return;
       const paneCwd = r.code === 0 ? r.stdout.trim() : "";
       if (!paneCwd) { a.migrationWatcher = undefined; return; } // pane gone → dead-pane path owns it
-      const paneDir = join(expandHome(cfg.wrc.mirror.projectsDir), encodeProjectDir(expandHome(paneCwd)));
+      const paneDir = projectDirFor(boundPath, expandHome(paneCwd));
       if (paneDir !== dir) { reschedule(); return; }            // pane drifted → followPaneDrift owns it
       let names: string[] = [];
       try { names = readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { /* */ }
@@ -2762,8 +3147,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // different project dir whose live session has a different sid, migrate onto
   // it. Tail from EOF (undefined startOffset): the worktree session already
   // carries full history we don't want to re-dump to WeCom.
-  const projectsRootDir = expandHome(cfg.wrc.mirror.projectsDir);
-
   let paneDriftTicking = false;
   const followPaneDrift = async (): Promise<void> => {
     if (paneDriftTicking) return; // skip overlapping ticks (tmux call is async)
@@ -2783,9 +3166,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         if (a.liveStream && !a.liveStream.closed) continue;  // mid typewriter — don't yank the tail
         const cwd = paneCwd.get(a.tmuxPane);
         if (!cwd) continue;                                   // pane gone
-        const paneDir = join(projectsRootDir, encodeProjectDir(expandHome(cwd)));
+        const paneDir = projectDirFor(a.jsonlPath, expandHome(cwd));
         if (paneDir === dirname(a.jsonlPath)) continue;       // same project dir — no drift
-        const live = liveSessionForCwd(projectsRootDir, cwd);
+        const live = liveSessionForCwd(cwd, backendForPath(a.jsonlPath));
         if (!live || live.sessionId === a.sessionId) continue; // empty dir, or same-sid rename (tail follows it)
         a.runningCwd = expandHome(cwd);                        // migrateAttachment persists this to store
         log.info({ target: a.target, pane: a.tmuxPane, fromDir: dirname(a.jsonlPath), toDir: paneDir, oldSid: a.sessionId, newSid: live.sessionId }, "mirror: pane drifted (worktree), following live session");
@@ -2819,7 +3202,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (pending && pending !== running) {
       lines.push(`下次切换: \`${pending}\` (使用 /new 或 /clear 生效)`);
     }
-    lines.push("> 切换其他项目: 在对话中告诉 AI 调用 `cd` MCP 工具");
+    lines.push("> 切换其他项目: 在对话中告诉 AI 调用 `enter` MCP 工具");
+    // Session-boundary footer — `/new` and `/clear` are the only two callers,
+    // so the tip lands exactly once per fresh context, never mid-conversation.
+    lines.push(randomTip());
     return lines.join("\n");
   };
 
@@ -2859,7 +3245,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const newSession = async (
     target: string,
     windowName?: string,
-  ): Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }> => {
+    cli?: CliBackendName,
+    opts?: { model?: string; cwd?: string; silent?: boolean },
+  ): Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string; info?: string }> => {
     const prev = byTarget.get(target);
     // Resolution precedence (all chat-scoped except the running-cwd fallback):
     //   base.pending > target.running > base.running > default
@@ -2869,12 +3257,25 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // an already-spawned tagged pane on every base-cwd change.
     const chat = chatCwdFallback(target);
     const rec = !prev ? deps.store.get(target) : undefined;
+    // An explicit per-node cwd (graph spec) outranks every chat-scoped fallback:
+    // the point of declaring it is that this node lives in a different repo.
     const eff =
+      (opts?.cwd?.trim() ? expandHome(opts.cwd.trim()) : "") ||
       chat.pending ||
       (prev?.runningCwd?.trim()) ||
       (rec?.cwd?.trim()) ||
       chat.running ||
       expandedDefaultCwd;
+    // Inherit the outgoing session's CLI when the caller didn't name one: a
+    // `/new` (or a /clear upgraded to /new) on a codebuddy-bound chat must stay
+    // on codebuddy rather than silently reverting to `defaultCli`. Inheritance
+    // is chat-scoped like cwd — a FIRST `/new #tag` has no record of its own,
+    // so it falls back to the base session's binding instead of `defaultCli`
+    // (otherwise a tagged sibling silently forks onto a different CLI).
+    const base = basePrincipalOf(target);
+    const baseBound = base === target ? undefined : byTarget.get(base)?.jsonlPath ?? deps.store.get(base)?.jsonlPath;
+    const boundPath = prev?.jsonlPath ?? rec?.jsonlPath ?? baseBound;
+    const effCli = cli ?? (boundPath ? backendForPath(expandHome(boundPath)).name : undefined);
     if (prev?.tmuxPane) {
       // Best-effort kill; ignore errors (pane may already be dead).
       void tmuxRun(["kill-pane", "-t", prev.tmuxPane]);
@@ -2885,6 +3286,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       log: log.child({ sub: "new-session", target }),
       windowName: windowName ?? target,
       cwdOverride: eff,
+      cli: effCli,
+      model: opts?.model,
     });
     if (!r.ok) return { ok: false, reason: r.reason };
     const att = attach({
@@ -2898,10 +3301,17 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       pendingCwd: "",
     });
     if (!att.ok) return { ok: false, reason: att.reason };
+    // 首条注入吃冷时序(injectText 走 /mirror/spawn 时已经硬编码 freshSpawn:true,
+    // dispatch 这条隐式建会话的路径此前漏了)。
+    const spawned = byTarget.get(target);
+    if (spawned) {
+      spawned.justSpawned = true;
+      // 只有换过 pane 才是断点 —— 首次 /wrc 建会话时 prev 为空, 那不是"不连续", 是开局。
+      if (prev) spawned.ctxCut = "new";
+    }
     // Clear the chat's pendingCwd on the BASE record too — the queued switch
     // has just been consumed by this respawn. Without this, a subsequent /new
     // #other would re-apply the same cd and diverge from user intent.
-    const base = basePrincipalOf(target);
     if (base !== target) {
       const baseA = byTarget.get(base);
       if (baseA?.pendingCwd) {
@@ -2997,8 +3407,86 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return { ok: false, reason: "no mirror binding for target — send a message in the WeCom chat first", runningCwd: "", pendingCwd: "" };
   };
 
+  // ── Peer graph (sibling sessions of one chat) ────────────────────────
+  // A chat's sessions are exactly the keys sharing its base principal: the
+  // untagged default plus every `#tag`. Live attachments are the truth; the
+  // persisted store fills in cold bindings so a peer nobody has talked to since
+  // the last reload is still discoverable (and revivable) rather than invisible.
+  const chatTargets = (target: string): string[] => {
+    const base = basePrincipalOf(target);
+    const keys = new Set([...byTarget.keys(), ...Object.keys(deps.store.all())]);
+    return Array.from(keys).filter((k) => basePrincipalOf(k) === base).sort();
+  };
+
+  const paneOf = (target: string): string =>
+    byTarget.get(target)?.tmuxPane || deps.store.get(target)?.tmuxPane || "";
+  const jsonlOf = (target: string): string =>
+    expandHome(byTarget.get(target)?.jsonlPath || deps.store.get(target)?.jsonlPath || "");
+
+  // Busy ≡ the pane is showing an interrupt hint. A dead or unbound pane is
+  // reported idle, not busy: "nothing is running there" is the truthful answer
+  // and it keeps a graph step from blocking forever on a session that vanished.
+  const paneBusy = async (pane: string): Promise<boolean> =>
+    !!pane && (await tmuxPaneAlive(pane)) && paneIsBusy(await capturePaneTail(pane, 12));
+
+  const isBusy = (target: string): Promise<boolean> => paneBusy(paneOf(target));
+
+  const lastText = (target: string): string => {
+    const p = jsonlOf(target);
+    return p ? lastAssistantText(p) : "";
+  };
+
+  const peers = async (target: string): Promise<PeerInfo[]> => {
+    const list = await Promise.all(
+      chatTargets(target).map(async (t): Promise<PeerInfo> => {
+        const a = byTarget.get(t);
+        const rec = deps.store.get(t);
+        const jsonlPath = jsonlOf(t);
+        const pane = paneOf(t);
+        const paneAlive = pane ? await tmuxPaneAlive(pane) : false;
+        const tag = tagOfTarget(t);
+        let lastActivity = 0;
+        try { if (jsonlPath) lastActivity = statSync(jsonlPath).mtimeMs; } catch { /* not written yet */ }
+        return {
+          target: t,
+          tag,
+          label: tag ? labelFor(tag) : "▫️",
+          sessionId: a?.sessionId || rec?.sessionId || "",
+          jsonlPath,
+          cwd: a?.runningCwd || rec?.cwd || expandedDefaultCwd,
+          cli: jsonlPath ? backendForPath(jsonlPath).name : (activeBackends()[0]?.name ?? "claude"),
+          tmuxPane: pane,
+          attached: !!a,
+          paneAlive,
+          busy: paneAlive ? paneIsBusy(await capturePaneTail(pane, 12)) : false,
+          lastActivity,
+          summary: jsonlPath ? summarizeTail(jsonlPath) : "(未绑定会话)",
+          self: t === target,
+        };
+      }),
+    );
+    return list.sort((x, y) => y.lastActivity - x.lastActivity);
+  };
+
+  // Capture a few extra rows then compact away the TUI's blank padding, so
+  // `rows` counts lines the user actually cares about.
+  const peekPane = async (
+    target: string,
+    rows = 24,
+  ): Promise<{ ok: boolean; reason?: string; pane?: string; busy?: boolean }> => {
+    const pane = paneOf(target);
+    if (!pane) return { ok: false, reason: "no tmux pane bound for target" };
+    if (!(await tmuxPaneAlive(pane))) return { ok: false, reason: "tmux pane no longer alive — the session needs /new or a respawn" };
+    const raw = await capturePaneTail(pane, Math.max(8, rows) + 12);
+    return { ok: true, pane: compactPane(raw, rows), busy: paneIsBusy(raw) };
+  };
+
   return {
     attach,
+    peers,
+    peekPane,
+    isBusy,
+    lastText,
     status: () => {
       const list = Array.from(bySessionId.values()).map((a) => ({
         sessionId: a.sessionId,
@@ -3134,7 +3622,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       }
     },
     injectText: async (target, text) => {
-      const a = byTarget.get(target);
+      // Lazy restore, same as dispatch: a peer session that hasn't been talked
+      // to in this process lifetime (or any session after a reload) has an empty
+      // in-memory slot but a perfectly good persisted binding. Without this, an
+      // agent driving a cold sibling gets "not attached" for a live pane.
+      const a = byTarget.get(target) ?? (await restoreFromStore(target));
       if (!a) return { ok: false, reason: "no mirror attached for target" };
       if (!text.trim()) return { ok: false, reason: "empty text" };
       // Pre-record so the tail's user-line emission is suppressed by the
@@ -3148,7 +3640,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // Same resume-fork hazard as dispatch: snapshot before spawn, re-bind
         // onto the forked jsonl once it appears (EOF offset — fork is seeded).
         const resumeBaseline = listJsonls(dirname(a.jsonlPath));
-        const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn-init", sessionId: sid }), resumeSessionId: sid, windowName: tagOfTarget(target) || target, cwdOverride: a.runningCwd });
+        const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn-init", sessionId: sid }), resumeSessionId: sid, windowName: tagOfTarget(target) || target, cwdOverride: a.runningCwd, cli: backendForPath(a.jsonlPath).name });
         if (!r.ok || !r.tmuxPane) return { ok: false, reason: `respawn failed: ${r.reason ?? "unknown"}` };
         a.tmuxPane = r.tmuxPane;
         a.tmuxSession = r.tmuxSession ?? a.tmuxSession;
@@ -3160,7 +3652,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // is still warming up so the verifier in injectViaTmux needs the slack.
       return await inject({
         text, images: [], cfg, log: log.child({ principal: target, sessionId: sid, sub: "init-demo" }),
-        sessionId: sid, tmuxTarget: a.tmuxPane, freshSpawn: true,
+        sessionId: sid, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane, freshSpawn: true,
       });
     },
     interruptPane: async (target) => {
@@ -3183,6 +3675,32 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const r = await tmuxRun(["send-keys", "-t", a.tmuxPane, "Enter"]);
       if (r.code !== 0) return { ok: false, reason: `send-keys Enter failed: ${r.stdout.slice(-200) || r.code}` };
       log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /n — Enter sent to pane");
+      return { ok: true };
+    },
+    revealPane: async (target) => {
+      // paneOf (not byTarget.get) so a cold binding surviving only in the
+      // persisted store can still be revealed after a daemon reload.
+      const pane = paneOf(target);
+      if (!pane) return { ok: false, reason: "no tmux pane bound for target" };
+      if (!(await tmuxPaneAlive(pane))) return { ok: false, reason: "tmux pane no longer alive — the session needs /new or a respawn" };
+      // Only clients already attached to the pane's OWN session are candidates:
+      // switching a client that sits on an unrelated session would yank the
+      // user's other terminal window into wezard. Most-recently-active wins —
+      // switch-client with no -c is ambiguous under multiple clients.
+      const s = await tmuxRun(["display-message", "-p", "-t", pane, "#{session_name}"]);
+      const sess = s.stdout.trim() || cfg.wrc.tmuxPrefix;
+      const clients = await tmuxRun(["list-clients", "-t", sess, "-F", "#{client_activity} #{client_name}"]);
+      const best = clients.stdout.split("\n").filter(Boolean)
+        .map((l) => { const i = l.indexOf(" "); return { act: Number(l.slice(0, i)), name: l.slice(i + 1) }; })
+        .sort((x, y) => y.act - x.act)[0]?.name;
+      if (!best) {
+        // Nothing to switch; tell the user how to get a client onto the session.
+        return { ok: false, reason: `没有 attach 到 \`${sess}\` 的 tmux 客户端。先在终端执行: \`tmux attach -t ${sess}\`` };
+      }
+      // A pane target pulls session + window selection along with it.
+      const r = await tmuxRun(["switch-client", "-c", best, "-t", pane]);
+      if (r.code !== 0) return { ok: false, reason: `switch-client failed: ${r.stdout.slice(-200) || r.code}` };
+      log.info({ target, pane, client: best }, "mirror /reveal — tmux client switched");
       return { ok: true };
     },
     hasLivePane: (sessionId) => Boolean(bySessionId.get(sessionId)?.tmuxPane),
@@ -3256,7 +3774,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           await client.replyStream(
             frame,
             streamId,
-            withSessionTag(principal, "[weclaude] wecom remote control not attached — run `/wrc` inside the target Claude session"),
+            withSessionTag(principal, "[wezard] wecom remote control not attached — run `/wrc` inside the target Claude session"),
             true,
           );
         } catch {
@@ -3299,6 +3817,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // immediately — capturing baseline post-inject would already include it,
       // and the watcher would never see a "new" candidate (the bug this fixes).
       const preClearBaseline = armMigration ? listJsonls(dirname(a.jsonlPath)) : undefined;
+      // 记下断点, 由下一轮 (第一轮读不到上文的轮次) 领走。/clear 自己不建 turn,
+      // 否则这次清空在 chat 详情里毫无痕迹, 前后两轮看着还是连续的。
+      if (armMigration) a.ctxCut = "clear";
       // Drop any prior turn's outbound deferral state — a new dispatch always
       // supersedes whatever was buffered/awaiting. The old frame is dead by our
       // own choice (we won't write to it anymore); the user might still later
@@ -3334,7 +3855,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         }
       }
       if (brief) {
-        // 关闭上一 turn (若存在), 起新 turn: 立刻推详情 URL 覆盖 loading 气泡。
+        // 挂 loading 气泡并起新 turn (上一 turn 还在跑则排队, 由它收口时放行)。
         // 后续 onItem 走 handleBriefItem, 不再走 stream / defer 路径。
         await startBriefTurn(a, frame, streamId, isSlash, text);
       } else if (!armMigration && !eagerOpen) {
@@ -3351,7 +3872,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // but DON'T erase tmuxSession from store — next inbound will retry,
         // making the system self-healing instead of one-failure-permanent.
         const paneAlive = a.tmuxPane ? await tmuxPaneAlive(a.tmuxPane) : false;
-        let freshSpawn = false;
+        let freshSpawn = a.justSpawned === true;
+        a.justSpawned = false;
         if (!paneAlive) {
           log.warn({ target: a.target, sessionId: sid, oldPane: a.tmuxPane, oldSession: a.tmuxSession }, "mirror: no live tmux pane, respawning");
           // Interactive `claude --resume <sid>` does NOT keep appending to the
@@ -3364,7 +3886,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           const resumeBaseline = !armMigration ? listJsonls(dirname(a.jsonlPath)) : undefined;
           // Respawn in the binding's runningCwd (pendingCwd doesn't apply to a
           // mid-turn reincarnation — only /new and /clear-with-pending swap cwd).
-          const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn", sessionId: sid }), resumeSessionId: sid, windowName: tagOfTarget(a.target) || a.target, cwdOverride: a.runningCwd });
+          const r = await spawnTmuxClaude({ cfg, log: log.child({ sub: "respawn", sessionId: sid }), resumeSessionId: sid, windowName: tagOfTarget(a.target) || a.target, cwdOverride: a.runningCwd, cli: backendForPath(a.jsonlPath).name });
           if (r.ok && r.tmuxPane && r.tmuxSession) {
             a.tmuxPane = r.tmuxPane;
             a.tmuxSession = r.tmuxSession;
@@ -3400,7 +3922,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         rememberInject(text);
         const r = await inject({
           text, images, cfg, log: log.child({ principal, sessionId: sid }),
-          sessionId: sid, tmuxTarget: a.tmuxPane, freshSpawn,
+          sessionId: sid, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane, freshSpawn,
         });
         if (!r.ok) {
           if (s) {
@@ -3423,7 +3945,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // Inject "succeeded" but the input box never cleared — the target
         // session may be busy / not consuming input (long task, full context).
         // Hint the user once so a silently-dropped message isn't mistaken for a
-        // weclaude bug. Skip on the /clear path (armMigration), which has its
+        // wezard bug. Skip on the /clear path (armMigration), which has its
         // own "cleared" feedback below.
         //
         // OFF by default: the clear-check has a structural false-positive (the
@@ -3432,8 +3954,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // case this fires on essentially every message even though it landed
         // fine — pure noise. A genuinely dropped message still surfaces as the
         // `[mirror] ✗` hard failure above. Opt back in with
-        // WECLAUDE_WARN_UNCERTAIN_INJECT=1 if you want the (noisy) heads-up.
-        if (r.uncertain && !armMigration && process.env.WECLAUDE_WARN_UNCERTAIN_INJECT === "1") {
+        // WEZARD_WARN_UNCERTAIN_INJECT=1 if you want the (noisy) heads-up.
+        if (r.uncertain && !armMigration && process.env.WEZARD_WARN_UNCERTAIN_INJECT === "1") {
           sendStandalone(a, `[mirror] ⚠️ 消息已发送,但目标会话似乎正忙或未响应(输入框未清空),可能未被处理。可稍后重试,或用 \`/sessions\` 切到其它会话。`);
         }
         // Follow a user-initiated same-dir fork (/clear or manual restart in the
@@ -3490,9 +4012,11 @@ export const installMirrorEventListener = (
     }
     const chatId = stripPrincipalPrefix(detail.target);
     void (async () => {
-      for (const md of detail.markdown) {
+      const n = detail.markdown.length;
+      for (const [i, md] of detail.markdown.entries()) {
         try {
-          await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content: withSessionTag(detail.target, md) } });
+          const content = withSessionTag(detail.target, md, n > 1 ? `${i + 1}/${n}` : undefined);
+          await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content } });
         } catch (e) {
           log.warn({ err: (e as Error).message, turnId }, "tool detail push failed");
         }

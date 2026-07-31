@@ -68,6 +68,14 @@ export interface TurnUsage {
   ctxPeak?: number;
 }
 
+// 上下文断点 —— 本轮开始前上下文发生了什么。渲染成 turn 卡片顶部的断点条,
+// 让"这一轮读不到上一轮"这件事在时间线上可见:
+//   clear  = /clear 清空 (成因确定, 上文全丢)
+//   new    = /new 另起会话 (新 pane / 新 sid)
+//   switch = sessionId 轮换但成因未知 (resume fork / worktree drift / daemon 重启)。
+//            这些路径上下文通常是延续的, 所以只中性地标"换过会话", 不宣称已清空。
+export type CtxCut = "clear" | "new" | "switch";
+
 export interface TurnDetailRecord {
   kind: "turn";
   id: string;
@@ -77,6 +85,7 @@ export interface TurnDetailRecord {
   target?: string;
   sessionId?: string;
   userQuery?: string;  // 触发本轮的用户输入原文 (mirror 侧 dispatch 的 text)
+  cut?: CtxCut;        // 本轮之前的上下文断点; undefined = 与上一轮同一上下文
   items: TurnItem[];
   model?: string;      // 首个见到的 model 名
   modelAlt?: number;   // 与 model 不同的后续行数, 用于渲染 "+N"
@@ -102,11 +111,19 @@ export interface DetailStore {
   appendTurnItem(id: string, item: TurnItem): void;
   addTurnUsage(id: string, delta: { model?: string; messageId?: string; usage: TurnUsage }): void;
   closeTurn(id: string): void;
-  // 收尾所有仍开着的 turn (可选按 target 限定, 可选排除某一 id)。返回被关闭的 id。
-  // 用途: 新一轮发出 finish 消息时, 把此前遗留未关闭的 turn 一并标记结束。
-  closeOpenTurns(target?: string, exceptId?: string): string[];
+  // 收尾所有仍开着的 turn (可选按 target / sessionId 限定, 可选排除若干 id)。返回被
+  // 关闭的 id。用途: 新一轮发出 finish 消息时, 把此前遗留未关闭的 turn 一并标记结束。
+  // sessionId 必须传: 同一个 chat 下的多个 #tag 会话共享 target, 只按 target 收尾会
+  // 把兄弟 agent 正在跑的 turn 页面提前打成「已完成」(页面随即停止轮询, 看着像卡死)。
+  // exceptIds 是复数: 当前 turn 之外, 还要保住排队中尚未激活的 turn。
+  closeOpenTurns(scope: { target?: string; sessionId?: string; exceptIds?: readonly string[] }): string[];
   put(rec: DetailRecord): void;
   get(id: string): DetailRecord | undefined;
+  /** Live snapshot of every retained record. Callers filter/derive; never mutate. */
+  list(): DetailRecord[];
+  /** Fires after every put — the single source the SSE feed hangs off, so a
+   *  record reaching the store (locally OR via svr's POST /d) pushes identically. */
+  subscribe(fn: (rec: DetailRecord) => void): () => void;
 }
 
 const TTL_MS = 24 * 3600_000;
@@ -127,6 +144,13 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
       for (let i = 0; i < sorted.length - MAX; i++) store.delete(sorted[i]![0]);
     }
   };
+
+  const lastTurnOf = (target: string): TurnDetailRecord | undefined =>
+    [...store.values()].reduce<TurnDetailRecord | undefined>(
+      (m, r) =>
+        r.kind === "turn" && r.target === target && (!m || r.createdAt > m.createdAt) ? r : m,
+      undefined,
+    );
 
   const persist = (rec: DetailRecord): void => {
     try { appendFileSync(logPath, `${JSON.stringify(rec)}\n`); } catch { /* ignore */ }
@@ -166,16 +190,28 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
     opts.log?.info({ logPath }, "detail store: fresh log");
   }
 
+  // 订阅者异常不该拖垮写入路径 (一个断掉的 SSE 连接 ≠ 丢一条 detail)。
+  const subscribers = new Set<(rec: DetailRecord) => void>();
+  const notify = (rec: DetailRecord): void => {
+    for (const fn of subscribers) { try { fn(rec); } catch { /* ignore */ } }
+  };
+
   const put = (rec: DetailRecord): void => {
     store.set(rec.id, rec);
     if (store.size > MAX) gc();
     persist(rec);
     maybeCompact();
+    notify(rec);
   };
 
   return {
     put,
     get: (id) => store.get(id),
+    list: () => [...store.values()],
+    subscribe: (fn) => {
+      subscribers.add(fn);
+      return () => { subscribers.delete(fn); };
+    },
     recordTool: (rec) => {
       put({ kind: "tool", ...rec, createdAt: rec.createdAt ?? Date.now() });
     },
@@ -194,9 +230,14 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
     },
     startTurn: (rec) => {
       const now = Date.now();
+      // 断点成因由 caller 给 (它才知道刚注入的是 /clear 还是 /new); 没给就退回观测:
+      // 同 target 的上一轮 sid 与本轮不同 ⇒ 上下文不连续, 至少要标出来。
+      const prev = rec.target ? lastTurnOf(rec.target) : undefined;
+      const rotated = !!prev?.sessionId && !!rec.sessionId && prev.sessionId !== rec.sessionId;
       put({
         kind: "turn",
         ...rec,
+        cut: rec.cut ?? (rotated ? "switch" : undefined),
         createdAt: rec.createdAt ?? now,
         updatedAt: now,
         closed: false,
@@ -247,13 +288,15 @@ export const createDetailStore = (opts: { stateDir: string; log?: Logger }): Det
       if (!r || r.kind !== "turn" || r.closed) return;
       put({ ...r, closed: true, updatedAt: Date.now() });
     },
-    closeOpenTurns: (target, exceptId) => {
+    closeOpenTurns: ({ target, sessionId, exceptIds }) => {
       const now = Date.now();
+      const keep = new Set(exceptIds ?? []);
       const closed: string[] = [];
       for (const [id, r] of store) {
         if (r.kind !== "turn" || r.closed) continue;
-        if (id === exceptId) continue;
+        if (keep.has(id)) continue;
         if (target && r.target !== target) continue;
+        if (sessionId && r.sessionId !== sessionId) continue;
         put({ ...r, closed: true, updatedAt: now });
         closed.push(id);
       }

@@ -1,5 +1,5 @@
-// Declarative config for weclaude. Copy to ~/.weclaude/config.jsonc and edit.
-// All paths support `~`. Secrets (botId/secret) can also live in ~/.weclaude/secrets.json
+// Declarative config for wezard. Copy to ~/.wezard/config.jsonc and edit.
+// All paths support `~`. Secrets (botId/secret) can also live in ~/.wezard/secrets.json
 // (same shape, deep-merged on top — keep secrets out of dotfile repos).
 {
   "$schema": "./schema.json",
@@ -19,8 +19,8 @@
   "daemon": {
     "host": "127.0.0.1",
     "port": 17890,
-    "stateDir": "~/.weclaude/state",
-    "logFile": "~/.weclaude/daemon.log",
+    "stateDir": "~/.wezard/state",
+    "logFile": "~/.wezard/daemon.log",
     "logLevel": "info"           // trace|debug|info|warn|error
   },
 
@@ -34,8 +34,16 @@
     //          jsonl, pushing live assistant output to WeCom.
     "mode": "headless",
     "claudeBin": "claude",
+    // CLI backend selection. Three built-ins: "claude" / "claude-internal" /
+    // "codebuddy". Empty/omitted → inferred from claudeBin basename (back-compat).
+    "defaultCli": "claude",
+    // Per-backend binary overrides (when the executable isn't on $PATH under
+    // its canonical name). Missing entry → built-in default.
+    // "cliBackends": {
+    //   "codebuddy": { "bin": "/usr/local/bin/codebuddy" }
+    // },
     "cwd": "~",                  // workdir (mirror: must match the running claude's cwd)
-    "sessionMapFile": "~/.weclaude/sessions.json",
+    "sessionMapFile": "~/.wezard/sessions.json",
     "extraArgs": [],             // appended to `claude -p`
     "mirror": {
       // Pin a session id; empty → auto-pick latest .jsonl mtime under
@@ -54,6 +62,7 @@
   // ── PreToolUse approval (all tools → button card; align with auth-helper) ─
   "approval": {
     "enabled": true,
+    "mode": "all",               // all = 每次调用都发卡；danger = 只有命中下面危险名单的才发卡，其余静默放行
     "matcher": ".*",             // 全量拦截；Bash 只读命令(grep/ls/cat/...)走脚本 fast-path
     // Claude-Code 风格放行规则(语法子集): 命中的调用跳过发卡直接放行。与 matcher
     // 的分工: matcher 按工具名圈定审批范围, allowRules 在范围内做细粒度豁免 ——
@@ -69,6 +78,10 @@
     // denyRules 命中直接拒绝不发卡(Bash 复合命令任一段命中即拒);
     // askRules 命中必发卡, 压过 allowRules / ⏱自动放行窗口 / 会话缓存 —— 给
     // 危险前缀兜底, 窗口开着也逐条确认。
+    // 完整判定链(下面的 danger 名单 = "出厂自带的 askRules", 与 askRules 同层):
+    //   denyRules → danger → askRules → .claude 守卫 → allowRules → ⏱窗口 → cache → 发卡
+    // 即: 再宽的 allowRules(如 "Bash(git *)")也不会让 danger 名单失效; 要豁免
+    // 危险判定只能用 danger.allowPatterns —— 那是唯一压得过名单的开关。
     "denyRules": [],             // 例: ["Bash(rm -rf /*)", "Bash(mkfs *)"]
     "askRules": [],              // 例: ["Bash(rm *)", "Bash(sudo *)", "Bash(git push *)"]
     // `.claude/**` 写守卫: 改动 Claude 自己的配置面(settings/hooks/skills/…)会触发
@@ -77,34 +90,60 @@
     // 则 Esc 取消并把原因注入会话(模型会改走实体路径)。仅镜像会话(有活 pane)生效。
     "claudeConfigGuard": true,
     "claudeConfigModalWaitMs": 4000,  // 批准后等那个框出现的最长时间(轮询步进 200ms)
+    // 审批卡引用区(命令/参数体)的最大字符数。企微对 quote_text 无长度限制, 但手机端
+    // 实测只渲染前 2~3 行 —— 超出部分靠引用区点击进详情页, 或右上角「⋯」菜单的
+    // 「📄 展开完整命令」按需在群里发全文。发送失败会自动缩到 600 重试一次。
+    "cardQuoteMaxChars": 1200,
+    // 长命令是否在发卡前**无条件**先推一条完整命令的文本消息。0 = 关闭(默认,
+    // 靠上面两条按需路径)。设正数恢复旧行为, 值为前置消息总字数上限。
+    "fullCommandPreludeChars": 0,
     "approvers": [],             // ["user:zhangsan"] empty → defaultChat
     "hookTimeoutSec": 43210,     // hook curl --max-time (12h + 10s)
     "longPollSec": 43200,        // daemon long-poll (12h)
     "sessionCacheMinutes": 30,   // (session_id, tool, cmd_prefix_hash) → decision
     "windowMinutes": 5,          // 「⏱ N 分钟」按钮：开窗口期间所有请求自动 allow
     "sensitiveArgRedact": true,  // mask password/token-like values before sending to IM
-    "fallbackOnError": "ask"     // never "deny" — never break workflow
+    "fallbackOnError": "ask",    // never "deny" — never break workflow
+
+    // 危险名单：命中者强制逐次单独审批 —— 不吃自动窗口、不吃 session cache、
+    // 不参与批量合流、卡上没有「N 分钟全过」按钮、超时降级 ask 不静默放行。
+    // 内置覆盖 rm/git push/kubectl delete/DROP TABLE/敏感路径等；下面三组正则
+    // (大小写不敏感) 追加自定义规则，allowPatterns 优先级最高。
+    "danger": {
+      "enabled": true,
+      "builtin": true,
+      "commandPatterns": [],     // 例: ["\\bpm2\\s+delete\\b"]
+      "toolPatterns": [],        // 例: ["^mcp__prod__"]
+      "pathPatterns": [],        // 例: ["/prod/"]
+      "allowPatterns": []        // 例: ["\\brm\\s+-rf\\s+node_modules\\b"]
+    }
   },
 
-  // ── claude-internal wrapper sync ──────────────────────────────────
-  // `weclaude sync` writes hooks/MCP/permissions into target settings.json.
+  // ── claude / codebuddy wrapper sync ───────────────────────────────
+  // `wezard sync` writes hooks/MCP/permissions into every target settings.json
+  // listed below. Multi-CLI setups (claude + codebuddy 同时装) 列多项即可。
+  // kind: "claude" (含 claude-internal 等 fork) | "codebuddy"
+  //   • claude-internal 通过 settingsPath: "~/.claude-internal/settings.json" 表达
   "sync": {
     "targets": [
       {
-        "kind": "claude-internal",
+        "kind": "claude",
         "settingsPath": "~/.claude/settings.json",
         "scope": "user"          // user | project | local
       }
+      // 多 CLI 并存示例 (取消注释即可):
+      // ,{ "kind": "codebuddy", "settingsPath": "~/.codebuddy/settings.json", "scope": "user" }
+      // ,{ "kind": "claude", "settingsPath": "~/.claude-internal/settings.json", "scope": "user" }
     ]
   },
 
-  // ── Standalone detail relay (weclaude svr) ────────────────────────
-  // `weclaude svr` 读这里作为默认参数, CLI --host/--port 仍可覆盖。省略整段等于
+  // ── Standalone detail relay (wezard svr) ────────────────────────
+  // `wezard svr` 读这里作为默认参数, CLI --host/--port 仍可覆盖。省略整段等于
   // 用硬编码兜底 (0.0.0.0:17891)。改到 80 让详情页 URL 用标准端口 (需 root)。
   "svr": {
     "host": "0.0.0.0",
     "port": 17891,
-    "stateDir": "~/.weclaude/svr",
-    "tokenFile": "~/.weclaude/svr-token"
+    "stateDir": "~/.wezard/svr",
+    "tokenFile": "~/.wezard/svr-token"
   }
 }

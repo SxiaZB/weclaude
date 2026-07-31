@@ -1,0 +1,175 @@
+// Chat-level derivations over the detail store — pure, no IO.
+//
+// A WeCom chat hosts one default session plus any number of `#tag` siblings
+// (see session-label). The store already stamps every turn with its `target`
+// (`chat:xxx#fix`), so "what does this chat look like right now" is a fold over
+// the turn records sharing a base principal: group by target → a chat list,
+// order one group by time → a thread, sum the usages → a status bar.
+//
+// Nothing here touches tmux or the mirror bridge, so the standalone svr derives
+// exactly the same view from the records that were POSTed to it.
+import { baseOfKey, labelFor, tagOfKey } from "./session-label.js";
+import type { DetailRecord, TurnDetailRecord, TurnUsage } from "./detail-store.js";
+
+export interface AggUsage extends TurnUsage {
+  /** Wall-clock covered by the aggregated turns (sum of per-turn spans). */
+  durationMs: number;
+  turns: number;
+  tools: number;
+}
+
+const ZERO: AggUsage = {
+  input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0,
+  ctxPeak: 0, durationMs: 0, turns: 0, tools: 0,
+};
+
+export interface TagSummary {
+  target: string;
+  /** `#tag` suffix; "" for the chat's default session. */
+  tag: string;
+  /** Stable animal emoji, keyed on the tag string (survives /clear). */
+  label: string;
+  sessionId?: string;
+  model?: string;
+  turns: number;
+  lastTs: number;
+  running: boolean;
+  /** Wall-clock at which `running` decays to false with no further writes —
+   *  lets the client expire the badge on its own timer (see staleAt). */
+  runningUntil: number;
+  /** One-line "what happened last", for the chat-list row. */
+  preview: string;
+  usage: AggUsage;
+}
+
+export interface ChatSummary {
+  base: string;
+  /** Server clock when this snapshot was derived — the client ticks off it. */
+  at: number;
+  tags: TagSummary[];
+  usage: AggUsage;
+}
+
+// ── turn 结束判定 ─────────────────────────────────────────────────────
+// 三种证据, 由强到弱: closed (收口信号) → final text (closeTurn 可能滞后, 但
+// final 就是最后一条) → 静默超时。第三条是唯一的兜底: daemon 重启 / 漏收
+// turn_end 会把 turn 永久留在 open 态, 侧栏于是永远「运行中」, 而页脚耗时
+// (open turn 的 span 按 now 算) 会一路累加到几十小时。
+//
+// 静默阈值分两档, 因为"没有新 item"有两种截然不同的含义:
+//   • 尾项是已闭合的文本/工具结果 → agent 真的停了, 2 分钟足够;
+//   • 尾项是未回的 tool_use 或未决的 approval → 它在**等**, 一次 build 或一次
+//     人工点按可以耗掉很久, 按短档判死会让页面在任务跑到一半时变「已完成」。
+const IDLE_MS = 120_000;
+const IDLE_AWAIT_MS = 3600_000;
+
+const lastItemOf = (r: TurnDetailRecord): TurnDetailRecord["items"][number] | undefined =>
+  r.items.reduce<TurnDetailRecord["items"][number] | undefined>(
+    (m, it) => (!m || it.ts >= m.ts ? it : m),
+    undefined,
+  );
+
+/** 尾项还挂着未回的工具 / 未决的审批 —— 静默是「在等」, 不是「结束了」。 */
+const awaitingReply = (r: TurnDetailRecord): boolean => {
+  const last = lastItemOf(r);
+  if (!last) return false;
+  if (last.t === "approval") return last.decision === undefined;
+  if (last.t === "tool_use") {
+    return !r.items.some((it) => it.t === "tool_result" && it.toolUseId === last.toolUseId);
+  }
+  return false;
+};
+
+/** 该 turn 若再无写入, 到这个时刻就算结束。0 = 已经结束。 */
+export const staleAt = (r: TurnDetailRecord): number =>
+  r.closed || r.items.some((it) => it.t === "text" && it.final === true)
+    ? 0
+    : r.updatedAt + (awaitingReply(r) ? IDLE_AWAIT_MS : IDLE_MS);
+
+export const turnDone = (r: TurnDetailRecord, now: number): boolean => {
+  const until = staleAt(r);
+  return until === 0 || now > until;
+};
+
+/** 空壳 turn: 记录建了, 但一条 item、一次 usage 都没落地 —— ack 之后队列被强关 /
+ *  daemon 重启 / 注入失败都会留下它。刚建的几秒内是正常的 ack 态, 过了静默期就是
+ *  垃圾: 计进轮数与耗时只会污染统计, 渲染出来是个空的 turn 分组。 */
+export const isGhostTurn = (r: TurnDetailRecord, now: number): boolean =>
+  r.items.length === 0 && !r.usage && now - r.updatedAt > IDLE_MS;
+
+const turnSpan = (r: TurnDetailRecord, now: number): number =>
+  (turnDone(r, now) ? r.updatedAt : now) - r.createdAt;
+
+const addUsage = (a: AggUsage, r: TurnDetailRecord, now: number): AggUsage => {
+  const u = r.usage;
+  const ctx = u ? (u.ctxPeak ?? u.input + u.cacheRead + u.cacheWrite) : 0;
+  return {
+    input: a.input + (u?.input ?? 0),
+    output: a.output + (u?.output ?? 0),
+    cacheRead: a.cacheRead + (u?.cacheRead ?? 0),
+    cacheWrite: a.cacheWrite + (u?.cacheWrite ?? 0),
+    calls: a.calls + (u?.calls ?? 0),
+    serviceTier: a.serviceTier ?? u?.serviceTier,
+    ctxPeak: Math.max(a.ctxPeak ?? 0, ctx),
+    durationMs: a.durationMs + turnSpan(r, now),
+    turns: a.turns + 1,
+    tools: a.tools + r.items.filter((it) => it.t === "tool_use").length,
+  };
+};
+
+export const aggregate = (turns: readonly TurnDetailRecord[], now: number): AggUsage =>
+  turns.reduce((a, r) => addUsage(a, r, now), ZERO);
+
+const stripMd = (s: string): string => s.replace(/[`*_~|#>]/g, "").replace(/\s+/g, " ").trim();
+
+/** Last assistant prose of a turn, else the query that opened it. */
+const previewOf = (r: TurnDetailRecord): string => {
+  const texts = r.items.filter((it): it is Extract<typeof it, { t: "text" }> => it.t === "text");
+  const last = texts[texts.length - 1]?.body ?? "";
+  const src = last || r.userQuery || "";
+  return stripMd(src).slice(0, 120);
+};
+
+export const isTurn = (r: DetailRecord): r is TurnDetailRecord => r.kind === "turn";
+
+/** Real turns of one chat — every ghost dropped exactly once, up front, so the
+ *  list / thread / status bar can never disagree about what counts. */
+const liveTurns = (records: readonly DetailRecord[], now: number): TurnDetailRecord[] =>
+  records.filter(isTurn).filter((r) => !isGhostTurn(r, now));
+
+/** Turns of one session key, oldest first — the thread order. */
+export const threadOf = (records: readonly DetailRecord[], target: string, now: number): TurnDetailRecord[] =>
+  liveTurns(records, now).filter((r) => r.target === target).sort((a, b) => a.createdAt - b.createdAt);
+
+const summarizeTag = (target: string, turns: readonly TurnDetailRecord[], now: number): TagSummary => {
+  const last = turns[turns.length - 1];
+  const tag = tagOfKey(target);
+  const until = turns.reduce((m, r) => Math.max(m, staleAt(r)), 0);
+  return {
+    target,
+    tag,
+    label: labelFor(tag || target),
+    sessionId: last?.sessionId,
+    model: [...turns].reverse().find((r) => r.model)?.model,
+    turns: turns.length,
+    lastTs: turns.reduce((m, r) => Math.max(m, r.updatedAt), 0),
+    running: until > now,
+    runningUntil: until > now ? until : 0,
+    preview: last ? previewOf(last) : "",
+    usage: aggregate(turns, now),
+  };
+};
+
+/** Group every turn of one chat by session key → the chat list. Most recently
+ *  active tag first; the running ones naturally float up. */
+export const chatSummary = (records: readonly DetailRecord[], base: string, now: number): ChatSummary => {
+  const mine = liveTurns(records, now).filter((r) => r.target && baseOfKey(r.target) === base);
+  const byTarget = mine.reduce((m, r) => {
+    const k = r.target!;
+    return m.set(k, [...(m.get(k) ?? []), r]);
+  }, new Map<string, TurnDetailRecord[]>());
+  const tags = [...byTarget.entries()]
+    .map(([target, turns]) => summarizeTag(target, [...turns].sort((a, b) => a.createdAt - b.createdAt), now))
+    .sort((a, b) => b.lastTs - a.lastTs);
+  return { base, at: now, tags, usage: aggregate(mine, now) };
+};

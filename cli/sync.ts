@@ -1,6 +1,6 @@
-// `weclaude sync` — write weclaude's hooks / MCP / env into target settings.json files
+// `wezard sync` — write wezard's hooks / MCP / env into target settings.json files
 // (e.g. ~/.claude/settings.json so claude-internal wrappers pick them up).
-// Idempotent + reversible via per-target lock manifest in ~/.weclaude/sync.lock.json.
+// Idempotent + reversible via per-target lock manifest in ~/.wezard/sync.lock.json.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,8 +14,14 @@ const here = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = pathResolve(here, "..", "..");
 
 const MCP_ENTRY = `${PLUGIN_ROOT}/dist/mcp/server.js`;
-const LOCK_FILE = expandHome("~/.weclaude/sync.lock.json");
-const MARKER = "weclaude";
+const HOOK_SCRIPT = `${PLUGIN_ROOT}/hooks/pre-tool-use.sh`;
+const LOCK_FILE = expandHome("~/.wezard/sync.lock.json");
+const MARKER = "wezard";
+// Pre-rename installs stamped `_managedBy: "weclaude"` (and, further back,
+// "wecom"). Strip on any of them so a `wezard migrate` / re-sync cleans the
+// old block instead of leaving a second hook + MCP entry behind.
+const MANAGED_BY = new Set([MARKER, "weclaude"]);
+const isOurs = (v: unknown): boolean => typeof v === "string" && MANAGED_BY.has(v);
 
 interface Lock {
   targets: Record<string, { wroteHooks: boolean; wroteMcp: boolean; wroteEnv: string[] }>;
@@ -46,7 +52,7 @@ const writeJson = (p: string, obj: unknown): void => {
 
 // ── Hook strip ───────────────────────────────────────────────────────
 // Hook registration is owned by the Claude Code plugin (`hooks/hooks.json`
-// + `${CLAUDE_PLUGIN_ROOT}`). `weclaude init` runs `claude plugin install`
+// + `${CLAUDE_PLUGIN_ROOT}`). `wezard init` runs `claude plugin install`
 // to wire it up. We keep stripHooks only to clean up legacy settings.json
 // entries from earlier installs — leaving both registered fires the hook
 // twice per tool call → duplicate approval cards.
@@ -60,17 +66,35 @@ const stripHooks = (settings: Record<string, unknown>): void => {
   const hooks = settings.hooks as Record<string, unknown> | undefined;
   if (!hooks) return;
   const list = (hooks.PreToolUse as HookEntry[] | undefined) ?? [];
-  hooks.PreToolUse = list.filter((e) => e._managedBy !== MARKER);
+  hooks.PreToolUse = list.filter((e) => !isOurs(e._managedBy));
   if ((hooks.PreToolUse as HookEntry[]).length === 0) delete hooks.PreToolUse;
+};
+
+// CodeBuddy 不走 Claude Code 的 plugin marketplace (wezard 插件不会装上),
+// settings.json 是唯一注册点; Claude 家族由 plugin 的 hooks/hooks.json 提供,
+// 不在此写入 (否则双重触发 → 重复卡片)。
+const upsertHook = (settings: Record<string, unknown>, timeoutSec: number): void => {
+  const hooks = ((settings.hooks as Record<string, unknown>) ??= {});
+  const list = ((hooks.PreToolUse as HookEntry[]) ??= []);
+  list.push({
+    matcher: ".*",
+    hooks: [{
+      type: "command",
+      command: HOOK_SCRIPT,
+      // 严格大于 daemon 的 longPollSec (= envVals.hookTimeoutSec) + 一点余量,
+      // 与 hooks.json 的 timeout 语义对齐 — 否则 curl 先死, 用户点击写进死 socket。
+      timeout: timeoutSec + 10,
+    }],
+    _managedBy: MARKER,
+  });
 };
 
 // ── MCP upsert ────────────────────────────────────────────────────────
 const upsertMcp = (settings: Record<string, unknown>): void => {
   const m = ((settings.mcpServers as Record<string, unknown>) ??= {});
-  // strip legacy `wecom` entry from earlier installs (renamed to weclaude).
-  const legacy = m.wecom as Record<string, unknown> | undefined;
-  if (legacy?._managedBy === MARKER) delete m.wecom;
-  m.weclaude = {
+  // drop entries from earlier install generations (`wecom` → `weclaude` → `wezard`).
+  stripMcp(settings);
+  m.wezard = {
     command: "node",
     args: [MCP_ENTRY],
     _managedBy: MARKER,
@@ -79,20 +103,23 @@ const upsertMcp = (settings: Record<string, unknown>): void => {
 const stripMcp = (settings: Record<string, unknown>): void => {
   const m = settings.mcpServers as Record<string, unknown> | undefined;
   if (!m) return;
-  for (const k of ["weclaude", "wecom"]) {
+  for (const k of ["wezard", "weclaude", "wecom"]) {
     const cur = m[k] as Record<string, unknown> | undefined;
-    if (cur?._managedBy === MARKER) delete m[k];
+    if (isOurs(cur?._managedBy)) delete m[k];
   }
 };
 
 // ── Env upsert ────────────────────────────────────────────────────────
 const ENV_KEYS = [
-  "WECLAUDE_DAEMON_BASE",
-  "WECLAUDE_DAEMON_URL",
-  "WECLAUDE_STATE_DIR",
-  "WECLAUDE_HOOK_FALLBACK",
-  "WECLAUDE_HOOK_TIMEOUT",
+  "WEZARD_DAEMON_BASE",
+  "WEZARD_DAEMON_URL",
+  "WEZARD_STATE_DIR",
+  "WEZARD_HOOK_FALLBACK",
+  "WEZARD_HOOK_TIMEOUT",
 ];
+// Same keys under the pre-rename prefix — stripped on every sync so a migrated
+// settings.json doesn't keep pointing the old hook at the old state dir.
+const LEGACY_ENV_KEYS = ENV_KEYS.map((k) => k.replace(/^WEZARD_/, "WECLAUDE_"));
 interface EnvVals {
   base: string;
   stateDir: string;
@@ -101,18 +128,19 @@ interface EnvVals {
 }
 const upsertEnv = (settings: Record<string, unknown>, v: EnvVals): string[] => {
   const env = ((settings.env as Record<string, unknown>) ??= {});
-  env.WECLAUDE_DAEMON_BASE = v.base;
-  env.WECLAUDE_DAEMON_URL = `${v.base}/approve`;
-  env.WECLAUDE_STATE_DIR = expandHome(v.stateDir);
-  env.WECLAUDE_HOOK_FALLBACK = v.hookFallback;
+  for (const k of LEGACY_ENV_KEYS) delete env[k];
+  env.WEZARD_DAEMON_BASE = v.base;
+  env.WEZARD_DAEMON_URL = `${v.base}/approve`;
+  env.WEZARD_STATE_DIR = expandHome(v.stateDir);
+  env.WEZARD_HOOK_FALLBACK = v.hookFallback;
   // curl --max-time: 严格大于 longPollSec, 否则长挂的卡在用户点击前就断线。
-  env.WECLAUDE_HOOK_TIMEOUT = String(v.hookTimeoutSec);
+  env.WEZARD_HOOK_TIMEOUT = String(v.hookTimeoutSec);
   return ENV_KEYS;
 };
 const stripEnv = (settings: Record<string, unknown>): void => {
   const env = settings.env as Record<string, unknown> | undefined;
   if (!env) return;
-  for (const k of ENV_KEYS) delete env[k];
+  for (const k of [...ENV_KEYS, ...LEGACY_ENV_KEYS]) delete env[k];
 };
 
 // ── Drivers ───────────────────────────────────────────────────────────
@@ -120,7 +148,13 @@ const targetKey = (path: string): string => expandHome(path);
 
 interface SyncOpts { remove?: boolean }
 
-const syncOne = (settingsPath: string, opts: SyncOpts, lock: Lock, env: EnvVals): void => {
+const syncOne = (
+  settingsPath: string,
+  kind: "claude" | "codebuddy",
+  opts: SyncOpts,
+  lock: Lock,
+  env: EnvVals,
+): void => {
   const abs = expandHome(settingsPath);
   const settings = readJson(abs);
 
@@ -135,7 +169,13 @@ const syncOne = (settingsPath: string, opts: SyncOpts, lock: Lock, env: EnvVals)
   } else {
     upsertMcp(settings);
     const wroteEnv = upsertEnv(settings, env);
-    lock.targets[targetKey(settingsPath)] = { wroteHooks: false, wroteMcp: true, wroteEnv };
+    // CodeBuddy 无 plugin 路径, settings.json 注册 hook; Claude 家族由 plugin 提供。
+    let wroteHooks = false;
+    if (kind === "codebuddy") {
+      upsertHook(settings, env.hookTimeoutSec);
+      wroteHooks = true;
+    }
+    lock.targets[targetKey(settingsPath)] = { wroteHooks, wroteMcp: true, wroteEnv };
   }
   writeJson(abs, settings);
 };
@@ -163,13 +203,13 @@ const main = (): void => {
   for (const t of targets) {
     const action = remove ? "remove" : "upsert";
     // eslint-disable-next-line no-console
-    console.log(`[weclaude-sync] ${action} ${t.kind} → ${t.settingsPath}`);
+    console.log(`[wezard-sync] ${action} ${t.kind} → ${t.settingsPath}`);
     if (dryRun) continue;
-    syncOne(t.settingsPath, { remove }, lock, envVals);
+    syncOne(t.settingsPath, t.kind, { remove }, lock, envVals);
   }
   if (!dryRun) writeLock(lock);
   // eslint-disable-next-line no-console
-  console.log(remove ? "[weclaude-sync] removed." : "[weclaude-sync] synced.");
+  console.log(remove ? "[wezard-sync] removed." : "[wezard-sync] synced.");
 };
 
 main();

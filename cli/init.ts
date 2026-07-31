@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// `weclaude init` — interactive onboarding for new users.
+// `wezard init` — interactive onboarding for new users.
 // Flow:
 //   1. Prompt creds + agent kind + hook toggle.
-//   2. Write ~/.weclaude/config.jsonc + secrets.json (split secrets).
-//   3. Build (if needed), run `weclaude sync` against chosen agent settings.json,
+//   2. Write ~/.wezard/config.jsonc + secrets.json (split secrets).
+//   3. Build (if needed), run `wezard sync` against chosen agent settings.json,
 //      install resident daemon.
 //   4. Arm bootstrap claim. Wait for the user to send a magic phrase in IM.
 //      That message bypasses allowFrom, sets defaultChat, and adds the sender.
@@ -12,17 +12,24 @@ import { existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { input, password, select, confirm } from "@inquirer/prompts";
+import { input, password, select, confirm, checkbox } from "@inquirer/prompts";
+import { parse as parseJsonc } from "jsonc-parser";
 import { appendUnique, patchJsonc } from "../shared/config-writer.js";
 import { mapClaudePermissions, readClaudePermissions } from "../shared/claude-permissions.js";
 import { expandHome } from "../shared/paths.js";
+import { resolvePublicHost } from "../shared/lan-ip.js";
+import { loadOrCreateSvrToken } from "../shared/svr-token.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO = pathResolve(here, "..", "..");
 
-const CONFIG = "~/.weclaude/config.jsonc";
-const SECRETS = "~/.weclaude/secrets.json";
+const CONFIG = "~/.wezard/config.jsonc";
+const SECRETS = "~/.wezard/secrets.json";
 const CLAIM_PHRASE = "将本对话设置为默认会话";
+const SVR_HOST = "0.0.0.0";
+const SVR_PORT = 17891;
+const SVR_STATE = "~/.wezard/svr";
+const SVR_TOKEN_FILE = "~/.wezard/svr-token";
 
 // ── Pretty output (no ink — keep deps light) ─────────────────────────
 const c = {
@@ -38,17 +45,30 @@ const step = (n: number, title: string): void =>
   log(`\n${c.cyan(`[${n}/3]`)} ${c.bold(title)}`);
 
 // ── Agent kind → settings.json path ──────────────────────────────────
-type AgentKind = "claude" | "claude-internal" | "custom";
+// sync.targets 可多选: 每个 agent 一个 target, 全部注入 hook/MCP/env。
+// wrc.defaultCli 是单值, 由第一个选中项决定 —— 它只决定「新会话默认用哪个 CLI 起」。
+// daemon 会同时 tail 所有已安装 CLI 的 projectsDir (backend 由 transcript 路径反推),
+// 所以 claude 和 codebuddy 的会话可以并存、各自镜像到不同的 WeCom 会话。
+type AgentKind = "claude" | "claude-internal" | "codebuddy";
 type WrcMode = "headless" | "mirror";
-const settingsPathFor = (kind: AgentKind, custom?: string): string => {
+const settingsPathFor = (kind: AgentKind): string => {
   switch (kind) {
     case "claude": return "~/.claude/settings.json";
     case "claude-internal": return "~/.claude-internal/settings.json";
-    case "custom": return custom ?? "";
+    case "codebuddy": return "~/.codebuddy/settings.json";
   }
 };
-const claudeBinFor = (kind: AgentKind): string =>
-  kind === "claude-internal" ? "claude-internal" : "claude";
+const claudeBinFor = (kind: AgentKind): string => {
+  if (kind === "claude-internal") return "claude-internal";
+  if (kind === "codebuddy") return "codebuddy";
+  return "claude";
+};
+// sync.targets[].kind: "claude-internal" 是 claude 家族的特例,
+// collapse 为 "claude" (settingsPath 已表达 internal 语义)。
+const syncKindFor = (kind: AgentKind): "claude" | "codebuddy" =>
+  kind === "codebuddy" ? "codebuddy" : "claude";
+// wrc.defaultCli: daemon active backend。与 sync.targets 多值独立。
+const backendNameFor = (kind: AgentKind): "claude" | "claude-internal" | "codebuddy" => kind;
 
 // ── HTTP helpers (talk to local daemon) ──────────────────────────────
 const DAEMON = "http://127.0.0.1:17890";
@@ -66,6 +86,25 @@ const post = async (p: string, body: unknown): Promise<unknown> => {
 };
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+// ── Existing credentials ─────────────────────────────────────────────
+// secrets.json 是 botId/secret 的唯一落盘点 (config.jsonc 只留非敏感字段)。
+// 重跑 init 最常见的场景是换 agent / 换模式, 凭证没变 —— 每次重敲一遍 secret
+// 既烦又容易敲错, 所以检测到已有值就默认复用。
+interface BotCreds { botId?: string; secret?: string }
+const readBotCreds = (): BotCreds => {
+  const p = expandHome(SECRETS);
+  if (!existsSync(p)) return {};
+  try {
+    const bot = (parseJsonc(readFileSync(p, "utf8")) as { bot?: BotCreds } | undefined)?.bot;
+    return bot ?? {};
+  } catch {
+    return {};
+  }
+};
+// 只露头尾, 中间省略 —— 足够用户确认"是这个机器人", 又不把凭证打进终端 scrollback。
+const mask = (s: string): string =>
+  s.length <= 10 ? `${s.slice(0, 2)}***` : `${s.slice(0, 6)}***${s.slice(-4)}`;
+
 // ── Build + install + reload daemon ──────────────────────────────────
 const ensureBuild = (): void => {
   if (existsSync(`${REPO}/dist/daemon/index.js`)) return;
@@ -82,33 +121,87 @@ const runSync = (): void => {
 
 const installDaemon = (): void => {
   log(c.dim("  installing resident daemon..."));
-  const r = spawnSync("bash", [`${REPO}/scripts/install.sh`], { stdio: "inherit" });
+  const r = spawnSync("bash", [`${REPO}/scripts/install.sh`, "daemon"], { stdio: "inherit" });
   if (r.status !== 0) throw new Error("install.sh failed");
 };
 
+// ── Detail relay (svr) ───────────────────────────────────────────────
+// 卡片里的 chat/detail 链接根不能是回环 —— 用户点开是在手机/企微内置浏览器里,
+// 回环指向的是他自己的设备。所以链接用本机 LAN IP,同网段即可直连。
+// svr 与 daemon 同机也值得独立跑: 记录经 POST /d 转发, 日后把 svr 挪到公网机器
+// 只需改 daemon.detailRemoteBase, daemon 侧零改动。
+const installSvr = (): void => {
+  log(c.dim("  installing detail relay (svr)..."));
+  const r = spawnSync("bash", [`${REPO}/scripts/install.sh`, "svr"], { stdio: "inherit" });
+  if (r.status !== 0) throw new Error("install.sh svr failed");
+};
+
+// 探活走回环 —— svr 绑 0.0.0.0, 本机 curl 得到的是同一个监听。LAN IP 只用于链接文案。
+const waitSvrReady = async (port: number, timeoutMs: number): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ok = await fetch(`http://127.0.0.1:${port}/healthz`)
+      .then((r) => r.ok)
+      .catch(() => false);
+    if (ok) return;
+    await sleep(500);
+  }
+  throw new Error(
+    `svr did not answer /healthz on :${port} — 查看 ~/.wezard/svr.stderr.log (端口占用?)`,
+  );
+};
+
+// 回环通 ≠ 链接可用: macOS 应用防火墙的 block-all 模式放行 loopback, 却把 LAN
+// 入连接建连后直接掐断 (curl 表现为 "Empty reply from server")。等用户点开卡片
+// 链接才发现是死链就太晚了 —— init 阶段按最终链接根实测一次。
+const warnIfLanBlocked = async (base: string, ip: string): Promise<void> => {
+  if (ip === "127.0.0.1") return;
+  const ok = await fetch(`${base}/healthz`, { signal: AbortSignal.timeout(3000) })
+    .then((r) => r.ok)
+    .catch(() => false);
+  if (ok) return;
+  log(c.yellow(`  ⚠ ${base} 回环可达但内网不可达 — 手机/企微里点开链接会打不开。`));
+  if (process.platform === "darwin") {
+    log(c.yellow("    macOS 应用防火墙拦了 node 的入连接，放行后即可:"));
+    log(c.dim("      sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setblockall off"));
+    log(c.dim(`      sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$(command -v node)"`));
+  } else {
+    log(c.yellow(`    检查防火墙是否放行 ${SVR_PORT}/tcp。`));
+  }
+};
+
 // Register the local repo as a Claude Code marketplace and install the
-// `weclaude` plugin from it. This is what wires up `hooks/hooks.json` (so
+// `wezard` plugin from it. This is what wires up `hooks/hooks.json` (so
 // `${CLAUDE_PLUGIN_ROOT}` resolves) + `commands/wrc.md` + the MCP server
 // declared in `.claude-plugin/plugin.json`. Idempotent: marketplace add
 // re-uses the existing entry, install upgrades in place.
 //
 // 失败即 throw — 没装上 hook 等于整套授权链路废掉,继续往下跑只会让用户看到
 // 假的"✅ 引导完成",再被 auto mode 拦截一脸懵。
+// status 为 null 的两种真实原因: spawn 失败 (error, 多为 ENOENT —— bin 是
+// alias/函数或不在继承的 PATH 里) 或进程被信号杀死。两者都不是「退出码」,
+// 必须分开报,否则用户拿到 null 一脸懵。
+const describeSpawn = (r: ReturnType<typeof spawnSync>): string =>
+  r.error ? `无法启动 (${r.error.message})`
+  : r.signal ? `被信号 ${r.signal} 杀死`
+  : `退出码 ${r.status}`;
+
 const installPlugin = (claudeBin: string): void => {
   log(c.dim(`  注册 marketplace + 安装插件 (${claudeBin}) ...`));
   const m = spawnSync(claudeBin, ["plugin", "marketplace", "add", REPO], { stdio: "inherit" });
   if (m.status !== 0) {
     throw new Error(
-      `plugin marketplace add 失败 (退出码 ${m.status}) — hook 无法注册。\n` +
+      `plugin marketplace add 失败 (${describeSpawn(m)}) — hook 无法注册。\n` +
+      `  若提示无法启动: ${claudeBin} 不在 PATH 或是 shell alias/函数, 请用绝对路径重试。\n` +
       `  手动: ${claudeBin} plugin marketplace add ${REPO}`,
     );
   }
-  const i = spawnSync(claudeBin, ["plugin", "install", "weclaude@weclaude-local", "--scope", "user"], { stdio: "inherit" });
+  const i = spawnSync(claudeBin, ["plugin", "install", "wezard@wezard-local", "--scope", "user"], { stdio: "inherit" });
   if (i.status !== 0) {
     throw new Error(
-      `plugin install 失败 (退出码 ${i.status}) — hook 无法注册。\n` +
+      `plugin install 失败 (${describeSpawn(i)}) — hook 无法注册。\n` +
       `  常见原因: ${claudeBin} 版本过旧,不支持当前插件源类型 — 请先升级 ${claudeBin} 后重试 init。\n` +
-      `  手动: ${claudeBin} plugin install weclaude@weclaude-local --scope user`,
+      `  手动: ${claudeBin} plugin install wezard@wezard-local --scope user`,
     );
   }
 };
@@ -162,7 +255,7 @@ const importClaudePerms = async (settingsPath: string, interactive: boolean): Pr
 
 // ── Main flow ────────────────────────────────────────────────────────
 const main = async (): Promise<void> => {
-  log(c.bold("\nweclaude · 新用户引导\n"));
+  log(c.bold("\nwezard · 新用户引导\n"));
   log(c.dim("  目标：3 步内完成 → IM 授权转发 + 远程 CC 控制可用。\n"));
 
   if (existsSync(expandHome(CONFIG))) {
@@ -178,21 +271,30 @@ const main = async (): Promise<void> => {
 
   // ── Step 1: prompts ────────────────────────────────────────────
   step(1, "采集配置");
-  const botId = await input({ message: "智能机器人 botId:", required: true });
-  const secret = await password({ message: "机器人 secret:", mask: "•" });
-  const agentKind = (await select({
-    message: "选择 Claude agent：",
+  const existing = readBotCreds();
+  const reuseCreds = existing.botId
+    ? await confirm({
+        message: `检测到已有凭证 botId=${mask(existing.botId)}${existing.secret ? " (含 secret)" : ""}，复用？`,
+        default: true,
+      })
+    : false;
+  const botId = reuseCreds && existing.botId
+    ? existing.botId
+    : await input({ message: "智能机器人 botId:", required: true });
+  // 复用 botId 但 secrets.json 里没有 secret (老配置手写过 config.jsonc) 时仍要问。
+  const secret = reuseCreds && existing.secret
+    ? existing.secret
+    : await password({ message: "机器人 secret:", mask: "•" });
+  const agentKinds = (await checkbox({
+    message: "选择 Claude agent (空格多选, 至少一个 — hook/MCP/env 会注入到每个选中项):",
     choices: [
-      { name: "claude (Anthropic 官方)", value: "claude" },
+      { name: "claude (Anthropic 官方)", value: "claude", checked: true },
       { name: "claude-internal (Tencent 内部)", value: "claude-internal" },
-      { name: "自定义路径", value: "custom" },
+      { name: "codebuddy (Tencent CodeBuddy)", value: "codebuddy" },
     ],
-    default: "claude",
-  })) as AgentKind;
-  const customSettings =
-    agentKind === "custom"
-      ? await input({ message: "settings.json 绝对路径:", required: true })
-      : "";
+    required: true,
+    loop: false,
+  })) as AgentKind[];
   const wrcMode = (await select({
     message: "选择 wrc 模式：",
     choices: [
@@ -212,34 +314,81 @@ const main = async (): Promise<void> => {
     default: true,
   });
 
-  const settings = settingsPathFor(agentKind, customSettings);
-  const claudeBin = claudeBinFor(agentKind);
+  const targets = agentKinds.map((k) => ({
+    kind: syncKindFor(k),
+    settingsPath: settingsPathFor(k),
+    scope: "user" as const,
+  }));
+  // 第一个选中项决定 wrc.defaultCli —— 新会话 (/new, sessions/new) 的默认 CLI。
+  // 其余已安装的 CLI 依然会被 daemon 镜像, 无需额外配置。
+  // checkbox required:true 保证非空, 但 TS 不感知, 这里 narrow 一下。
+  const [primary] = agentKinds;
+  if (!primary) {
+    log(c.red("  ✗ 未选择任何 agent"));
+    process.exit(1);
+  }
+  const claudeBin = claudeBinFor(primary);
 
   // ── Step 1b: write configs ─────────────────────────────────────
+  // svr 的 base/token 必须在 daemon 起来之前落盘 —— daemon 只在 boot 时读一次
+  // detailRemoteBase/Token, 晚写等于第一轮链接全指向回环。
+  const svrIP = resolvePublicHost(SVR_HOST);
+  const svrBase = `http://${svrIP}:${SVR_PORT}`;
+  const svrToken = loadOrCreateSvrToken(SVR_TOKEN_FILE);
+  if (svrIP === "127.0.0.1") {
+    log(c.yellow("  ⚠ 未探测到内网 IP，详情链接将只在本机可打开 (可稍后改 daemon.detailPublicBase)"));
+  }
+
   log(c.dim(`  写入 ${CONFIG} ...`));
   patchJsonc(CONFIG, [
     { path: ["bot", "websocketUrl"], value: "wss://openws.work.weixin.qq.com" },
     { path: ["defaultChat"], value: "" },
     { path: ["wrc", "mode"], value: wrcMode },
     { path: ["wrc", "claudeBin"], value: claudeBin },
-    { path: ["wrc", "cwd"], value: "~/.weclaude/workspace" },
+    { path: ["wrc", "defaultCli"], value: backendNameFor(primary) },
+    { path: ["wrc", "cwd"], value: "~/.wezard/workspace" },
     { path: ["wrc", "allowFrom"], value: [] },
     { path: ["approval", "enabled"], value: enableHook },
     { path: ["approval", "matcher"], value: ".*" },
-    { path: ["sync", "targets"], value: [{ kind: agentKind, settingsPath: settings, scope: "user" }] },
+    { path: ["sync", "targets"], value: targets },
+    { path: ["svr", "host"], value: SVR_HOST },
+    { path: ["svr", "port"], value: SVR_PORT },
+    { path: ["svr", "stateDir"], value: SVR_STATE },
+    { path: ["svr", "tokenFile"], value: SVR_TOKEN_FILE },
+    { path: ["daemon", "detailRemoteBase"], value: svrBase },
   ]);
-  log(c.dim(`  写入 ${SECRETS} ...`));
+  // token 走 secrets.json 而不是 config.jsonc —— 后者常被丢进 dotfile 仓库。
+  const credsChanged = botId !== existing.botId || secret !== existing.secret;
+  if (!credsChanged) log(c.dim(`  复用 ${SECRETS} 中的凭证 (未改写)`));
+  else log(c.dim(`  写入 ${SECRETS} ...`));
   patchJsonc(SECRETS, [
-    { path: ["bot", "botId"], value: botId },
-    { path: ["bot", "secret"], value: secret },
+    ...(credsChanged
+      ? [
+          { path: ["bot", "botId"], value: botId },
+          { path: ["bot", "secret"], value: secret },
+        ]
+      : []),
+    { path: ["daemon", "detailRemoteToken"], value: svrToken },
   ]);
 
   // ── Step 1c: 一次性导入 Claude permissions → approval 规则 ───────
-  if (enableHook) await importClaudePerms(settings, true);
+  // 多后端场景只读主后端 (agentKinds 的第一项) 的 settings.json: 导入是交互式的,
+  // 逐个后端问一遍等于把引导流程拖成 N 轮; 其余后端的规则可事后用
+  // `wezard-init --import-claude-permissions <path>` 增量补进来 (内部去重)。
+  if (enableHook) await importClaudePerms(settingsPathFor(primary), true);
 
   ensureBuild();
   if (enableHook) runSync();
-  if (enableHook) installPlugin(claudeBin);
+  // marketplace 插件只存在于 claude 家族; codebuddy 的 hook 由 sync 直接
+  // 写进 ~/.codebuddy/settings.json (插件未发布到其市场), 装插件必然失败。
+  if (enableHook) {
+    const pluginBins = [...new Set(agentKinds.filter((k) => k !== "codebuddy").map(claudeBinFor))];
+    for (const bin of pluginBins) installPlugin(bin);
+  }
+  installSvr();
+  await waitSvrReady(SVR_PORT, 20_000);
+  log(c.green(`  ✓ svr ready — 详情/会话链接根: ${c.bold(svrBase)}`));
+  await warnIfLanBlocked(svrBase, svrIP);
   installDaemon();
 
   log(c.dim("  等待 daemon 上线..."));
@@ -263,7 +412,7 @@ const main = async (): Promise<void> => {
   // ── Step 3: spin up mirror pane ────────────────────────────────
   step(3, "拉起 mirror 会话");
   if (!enableHook || wrcMode !== "mirror") {
-    log(c.green("\n✅ 引导完成。后续可用 `weclaude status` / `weclaude logs -f` 观察。"));
+    log(c.green("\n✅ 引导完成。后续可用 `wezard status` / `wezard logs -f` 观察。"));
     return;
   }
   // Mirror 路径:拉起 tmux+claude pane,然后让用户在 WeCom 发首条消息。
@@ -275,14 +424,14 @@ const main = async (): Promise<void> => {
   };
   if (!r.ok) {
     log(c.red(`  ✗ /mirror/spawn 失败: ${r.reason ?? "unknown"}`));
-    log(c.yellow("  可手动: tmux new-session -s weclaude 后跑 claude;或在 WeCom 发任意消息触发 auto-spawn。"));
+    log(c.yellow("  可手动: tmux new-session -s wezard 后跑 claude;或在 WeCom 发任意消息触发 auto-spawn。"));
     return;
   }
   log(c.green(`  ✓ tmux session=${c.bold(r.tmuxSession ?? "")} pane=${r.tmuxPane ?? ""} sid=${r.sessionId ?? ""}`));
-  log(c.dim(`  附加: tmux attach -t ${r.tmuxSession ?? "weclaude"}`));
+  log(c.dim(`  附加: tmux attach -t ${r.tmuxSession ?? "wezard"}`));
   log(`\n  ${c.bold("→ 现在去 WeCom 给机器人发一条消息(比如 \"hi\"):")}`);
   log(c.dim("    inbound → openStream → 注入 tmux pane → 输出回流为打字机气泡"));
-  log(c.green("\n✅ 引导完成。后续可用 `weclaude status` / `weclaude logs -f` 观察。"));
+  log(c.green("\n✅ 引导完成。后续可用 `wezard status` / `wezard logs -f` 观察。"));
 };
 
 const pollClaim = async (timeoutMs: number): Promise<string | undefined> => {
@@ -309,7 +458,7 @@ const entry = importFlagIdx >= 0
 
 entry.catch((e) => {
   // eslint-disable-next-line no-console
-  console.error(c.red(`\n[weclaude-init] ${(e as Error).message}`));
+  console.error(c.red(`\n[wezard-init] ${(e as Error).message}`));
   process.exit(1);
 });
 

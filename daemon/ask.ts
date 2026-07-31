@@ -4,6 +4,7 @@ import type { Logger } from "pino";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
 import { createPending, resolvePending } from "./pending.js";
+import { tagBadge } from "../shared/session-label.js";
 
 const stripPrefix = (s: string): string => {
   const i = s.indexOf(":");
@@ -81,7 +82,8 @@ export const makeAskHandler = (client: WSClient, log: Logger): Handler => {
 
     const card: TemplateCard = {
       card_type: "button_interaction",
-      main_title: { title: TRUNC(title, 26) },
+      // 与审批卡同规: 绑到 tagged 会话的卡片标题带该会话的 emoji 徽标。
+      main_title: { title: TRUNC(`${tagBadge(chat)}${title}`, 26) },
       sub_title_text: body.detail ? TRUNC(body.detail, 480) : undefined,
       task_id: reqId,
       button_list: opts.map((o) => ({ text: TRUNC(o.label, 10), style: o.style ?? 1, key: askKey(reqId, o.key) })),

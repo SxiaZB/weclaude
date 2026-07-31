@@ -1,4 +1,4 @@
-// Surgical edits to ~/.weclaude/config.jsonc and secrets.json — preserves
+// Surgical edits to ~/.wezard/config.jsonc and secrets.json — preserves
 // comments + formatting via jsonc-parser's `modify` patches.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";

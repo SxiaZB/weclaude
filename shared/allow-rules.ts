@@ -155,17 +155,64 @@ export const splitSegments = (cmd: string): string[] | undefined => {
   return segs.map((s) => s.trim());
 };
 
-const bashCommandAllowed = (bashSpecs: Array<string | undefined>, command: string): string[] | undefined => {
+// 段首 token 必须长得像命令 (字母数字/路径字符); 括号引号等异形首 token 一律放弃。
+const TOKEN_RE = /^[A-Za-z0-9_.~/+-]+$/;
+
+/**
+ * 单段 → 「✅总是」会为它生成的规则。undefined = 该段提炼不出可靠前缀
+ * (异形段首、或解释器头部拿不到子命令 —— 后者生成出来等于任意代码执行全放行)。
+ * alwaysAllowRulesFor 与 DenyReason 共用它, 避免两处前缀逻辑漂移。
+ */
+export const ruleForSegment = (rawSeg: string): string | undefined => {
+  const seg = stripEnvPrefix(norm(rawSeg));
+  if (!seg) return undefined;
+  const toks = seg.split(" ");
+  const head = toks[0]!;
+  if (!TOKEN_RE.test(head)) return undefined;
+  // 第二个 token 只有长得像子命令/路径时才纳入前缀 (flag、引号值等退化为单命令)。
+  const second = toks[1];
+  const useSecond = Boolean(second && !second.startsWith("-") && TOKEN_RE.test(second));
+  if (!useSecond && INTERPRETER_HEADS.has(head.split("/").pop() ?? head)) return undefined;
+  return `Bash(${useSecond ? `${head} ${second}` : head} *)`;
+};
+
+/** 未放行的具体原因 —— 卡片上「审核」那一行的数据源。 */
+export type DenyReason =
+  /** 复合命令里第 index/total 段没命中任何规则。rule = 「总是」会为它生成的
+   *  规则 (拿不到可靠前缀时 undefined)。这是最常见、也最该告诉用户的一种。 */
+  | { kind: "segment_unmatched"; index: number; total: number; segment: string; rule?: string }
+  /** 含 $() / 反引号 —— 实际行为取决于运行时展开, 字面规则描述不了。 */
+  | { kind: "substitution" }
+  /** 引号未闭合 / 孤立 & / 不可剥离的 heredoc / 空段 —— 分不出段就不敢放行。 */
+  | { kind: "unparsable" }
+  /** 非 Bash 工具, 工具名不在白名单里。 */
+  | { kind: "tool_not_listed"; tool: string }
+  /** 交互卡工具硬保护 (AskUserQuestion / ExitPlanMode / EnterPlanMode)。 */
+  | { kind: "never_allow"; tool: string }
+  /** 压根没配相关规则 —— 用户没在用白名单模式, 卡上不必提示。 */
+  | { kind: "no_rules" };
+
+export type AllowVerdict =
+  | { allowed: true; hits: string[] }
+  | { allowed: false; reason: DenyReason };
+
+const bashCommandAllowed = (
+  bashSpecs: Array<string | undefined>,
+  command: string,
+): AllowVerdict => {
   const stripped = stripQuotedHeredocs(command);
-  if (stripped === undefined) return undefined;
+  if (stripped === undefined) return { allowed: false, reason: { kind: "unparsable" } };
   // 剥离后再查命令替换: 带引号 heredoc 正文里的 $() 是惰性数据, 不该连坐
-  if (HAS_SUBSTITUTION.test(stripped)) return undefined;
+  if (HAS_SUBSTITUTION.test(stripped)) return { allowed: false, reason: { kind: "substitution" } };
   const segments = splitSegments(stripped);
-  if (segments === undefined || segments.length === 0) return undefined;
+  if (segments === undefined || segments.length === 0) {
+    return { allowed: false, reason: { kind: "unparsable" } };
+  }
   const hits: string[] = [];
-  for (const seg of segments) {
+  for (const [i, seg] of segments.entries()) {
     if (isPureAssignment(seg)) continue; // 纯赋值段无执行能力, 不计入未命中
-    if (!seg) return undefined; // 空段 (如 "a && && b") 视为异常, 交回发卡
+    // 空段 (如 "a && && b") 视为异常, 交回发卡
+    if (!seg) return { allowed: false, reason: { kind: "unparsable" } };
     let matched: string | undefined;
     for (const spec of bashSpecs) {
       if (spec === undefined) {
@@ -177,24 +224,39 @@ const bashCommandAllowed = (bashSpecs: Array<string | undefined>, command: strin
         break;
       }
     }
-    if (!matched) return undefined;
+    if (!matched) {
+      return {
+        allowed: false,
+        reason: {
+          kind: "segment_unmatched",
+          index: i + 1,
+          total: segments.length,
+          segment: seg,
+          rule: ruleForSegment(seg),
+        },
+      };
+    }
     hits.push(matched);
   }
   // 全是赋值段 (`f=1; g=2`): 没有任何段被规则覆盖过, 不作放行凭据, 保守发卡。
-  return hits.length > 0 ? hits : undefined;
+  return hits.length > 0
+    ? { allowed: true, hits }
+    : { allowed: false, reason: { kind: "unparsable" } };
 };
 
 /**
  * 判定 (toolName, toolInput) 是否被 allowRules 放行。
  * 返回命中说明 (用于日志/审计 reason), 未命中返回 undefined。
  */
-export const ruleAllows = (
+export const evaluateAllow = (
   rules: string[],
   toolName: string,
   toolInput: unknown,
-): string | undefined => {
-  if (rules.length === 0) return undefined;
-  if (NEVER_RULE_ALLOW.has(toolName)) return undefined;
+): AllowVerdict => {
+  if (NEVER_RULE_ALLOW.has(toolName)) {
+    return { allowed: false, reason: { kind: "never_allow", tool: toolName } };
+  }
+  if (rules.length === 0) return { allowed: false, reason: { kind: "no_rules" } };
 
   const parsed = rules.map(parseRule).filter((r): r is ParsedRule => r !== undefined);
 
@@ -202,20 +264,34 @@ export const ruleAllows = (
     const cmd = toolInput && typeof toolInput === "object"
       ? (toolInput as Record<string, unknown>).command
       : undefined;
-    if (typeof cmd !== "string" || !cmd.trim()) return undefined;
+    if (typeof cmd !== "string" || !cmd.trim()) {
+      return { allowed: false, reason: { kind: "unparsable" } };
+    }
     const bashSpecs = parsed.filter((r) => r.tool === "Bash").map((r) => r.spec);
-    if (bashSpecs.length === 0) return undefined;
-    const hits = bashCommandAllowed(bashSpecs, cmd);
-    return hits ? [...new Set(hits)].join(" + ") : undefined;
+    if (bashSpecs.length === 0) return { allowed: false, reason: { kind: "no_rules" } };
+    return bashCommandAllowed(bashSpecs, cmd);
   }
 
   for (const r of parsed) {
     if (r.spec !== undefined) continue; // 非 Bash 工具不支持 specifier
-    if (r.tool === toolName) return r.tool;
+    if (r.tool === toolName) return { allowed: true, hits: [r.tool] };
     // MCP server 级规则: "mcp__server" 覆盖 "mcp__server__*"
-    if (r.tool.startsWith("mcp__") && toolName.startsWith(`${r.tool}__`)) return r.tool;
+    if (r.tool.startsWith("mcp__") && toolName.startsWith(`${r.tool}__`)) {
+      return { allowed: true, hits: [r.tool] };
+    }
   }
-  return undefined;
+  return { allowed: false, reason: { kind: "tool_not_listed", tool: toolName } };
+};
+
+/** 旧签名薄包装: 命中返回规则说明串, 未命中 undefined。调用方只关心"放不放行"
+ *  时用它; 要向用户解释"为什么不放行"时用 evaluateAllow。 */
+export const ruleAllows = (
+  rules: string[],
+  toolName: string,
+  toolInput: unknown,
+): string | undefined => {
+  const v = evaluateAllow(rules, toolName, toolInput);
+  return v.allowed ? [...new Set(v.hits)].join(" + ") : undefined;
 };
 
 /**
@@ -307,18 +383,9 @@ export const alwaysAllowRulesFor = (
     if (!seg) return []; // 空段异常, 整体放弃生成
     // 已被现有规则覆盖的段不再生成 (避免 `Bash(cd service *)` 这类冗余堆积)
     if (existingBashSpecs.some((s) => s === undefined || bashSpecMatches(s, seg))) continue;
-    const toks = seg.split(" ");
-    const head = toks[0]!;
-    // 段首必须长得像命令 (字母数字/路径字符); 括号引号等异形首 token 一律放弃。
-    const TOKEN_RE = /^[A-Za-z0-9_.~/+-]+$/;
-    if (!TOKEN_RE.test(head)) return [];
-    // 第二个 token 只有长得像子命令/路径时才纳入前缀 (flag、引号值等退化为单命令)。
-    const second = toks[1];
-    const useSecond = second && !second.startsWith("-") && TOKEN_RE.test(second);
-    // 解释器头部若拿不到子命令/路径, 生成出来就是任意代码执行级别的全放行 → 整体放弃。
-    if (!useSecond && INTERPRETER_HEADS.has(head.split("/").pop() ?? head)) return [];
-    const prefix = useSecond ? `${head} ${second}` : head;
-    rules.push(`Bash(${prefix} *)`);
+    const rule = ruleForSegment(seg);
+    if (!rule) return []; // 异形段首 / 解释器无子命令 —— 整体放弃生成
+    rules.push(rule);
   }
   return [...new Set(rules)];
 };

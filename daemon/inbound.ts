@@ -7,14 +7,17 @@ import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import type { Bridge } from "./cc-bridge.js";
 import type { MirrorBridge } from "./mirror-bridge.js";
+import type { PeerInfo } from "./peers.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
+import type { CliBackendName } from "../shared/cli-backends.js";
 import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim } from "./claim.js";
 import { getLastResponse } from "./last-response.js";
 import { scanClaudeSessions, type SessionInfo } from "./session-scan.js";
 import { computeUsage, renderUsageReport } from "./usage.js";
 import { computeAuditReport } from "./audit.js";
+import { syncProjectConfig, renderSyncReport } from "./cfg-sync.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
-import { labelFor } from "./session-label.js";
+import { tagOfKey, withTagHeader } from "../shared/session-label.js";
 import {
   parseSubscribe,
   parseUnsubscribe,
@@ -57,10 +60,7 @@ const parseTag = (text: string): { tag: string; cleaned: string } => {
 };
 
 const sessionKey = (base: string, tag: string): string => (tag ? `${base}#${tag}` : base);
-const tagOf = (who: string): string => {
-  const h = who.indexOf("#");
-  return h >= 0 ? who.slice(h + 1) : "";
-};
+const tagOf = tagOfKey;
 
 // Auth principals: any-of test against allowFrom. Tiered — allowing a user
 // grants them access in any chat; allowing a group grants every member of
@@ -73,7 +73,7 @@ const authPrincipals = (msg: BaseMessage): string[] => {
 
 // "会话id" = chat-binding (session/mirror key); "权限id" = either the group
 // OR the sender — allowFrom passes if any one of them is whitelisted.
-// Also surfaces per-id 授权状态 + 对应 `weclaude mirror` CLI 参数 (vid:/chatid:),
+// Also surfaces per-id 授权状态 + 对应 `wezard mirror` CLI 参数 (vid:/chatid:),
 // so users can copy-paste straight into a terminal to bind a Claude session.
 const renderIds = (msg: BaseMessage, cfg: Config): string => {
   const allowed = new Set(cfg.wrc.allowFrom.map((e) => sanitizeId(e)));
@@ -85,12 +85,12 @@ const renderIds = (msg: BaseMessage, cfg: Config): string => {
       `群: \`${chat}\` ${mark(chat)}`,
       `发送者: \`${sender}\` ${mark(sender)}`,
       `(allowFrom 任一通过即可)`,
-      `在已有claude会话中绑定本群聊: \`/weclaude:wrc chat:${msg.chatid}\``,
+      `在已有claude会话中绑定本群聊: \`/wezard:wrc chat:${msg.chatid}\``,
     ].join("\n");
   }
   return [
     `会话id: \`${sender}\` ${mark(sender)}`,
-    `在已有claude会话中绑定本单聊: \`/weclaude:wrc user:${msg.from.userid}\``,
+    `在已有claude会话中绑定本单聊: \`/wezard:wrc user:${msg.from.userid}\``,
   ].join("\n");
 };
 
@@ -129,10 +129,24 @@ const resolveAuditMirror = (
   }
   return mirrors.find((m) => m.target === who || m.target === chatWho);
 };
-const isNewCommand = (text: string): boolean => text.trim() === "/new";
+// `/new` optionally names which CLI to launch (`/new codebuddy`). Bare `/new`
+// keeps whatever CLI the chat's current session runs — see newSession's inherit
+// rule — so naming one is only needed to *switch* backends.
+const NEW_RE = /^\/new(?:\s+(claude-internal|claude|codebuddy))?$/i;
+const isNewCommand = (text: string): boolean => NEW_RE.test(text.trim());
+const cliOfNewCommand = (text: string): CliBackendName | undefined =>
+  NEW_RE.exec(text.trim())?.[1]?.toLowerCase() as CliBackendName | undefined;
+// `/cfgsync` (alias `/sync`) — reconcile the project's per-CLI config trees.
+// Bare form is a dry run; `apply` is the only form that writes.
+const CFGSYNC_RE = /^\/(?:cfgsync|sync)(?:\s+(apply))?$/i;
+const parseCfgSyncCommand = (text: string): { apply: boolean } | undefined => {
+  const m = CFGSYNC_RE.exec(text.trim());
+  return m ? { apply: Boolean(m[1]) } : undefined;
+};
 const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 const isEnterCommand = (text: string): boolean => text.trim() === "/n";
+const isRevealCommand = (text: string): boolean => text.trim() === "/reveal";
 const isHelpCommand = (text: string): boolean => /^\/(?:help|\?|h)$/i.test(text.trim());
 const isSkillBCommand = (text: string): boolean => text.trim() === "/skill-b";
 
@@ -141,25 +155,41 @@ const isSkillBCommand = (text: string): boolean => text.trim() === "/skill-b";
 // prompt forwarded to the bound Claude session.
 const renderHelp = (): string =>
   [
-    "*weclaude 命令*",
+    "*wezard 命令*",
     "",
     "▎会话",
-    "`/new` 新开 claude 会话并绑定本聊天",
-    "`/new #tag` 在本聊天中新开一个带标签的并行会话",
+    "`/new` 新开会话并绑定本聊天 (沿用当前会话的 CLI)",
+    "`/clear` 清空当前会话上下文 (有待切项目时自动升级为 /new)",
     "`/sessions` 列出 live 会话 · `/sessions <emoji|id>` 切换",
     "`/stop` 打断当前生成 (Esc)",
     "`/n` 向 CLI 输入回车 (Enter)",
+    "`/reveal` 把终端的 tmux 窗口切到本会话",
+    "",
+    "▎切换 CLI 后端",
+    "`/new codebuddy` 用指定 CLI 新开 (claude / claude-internal / codebuddy)",
+    "不写则沿用本会话当前的 CLI;新开 `#tag` 会话则继承本聊天的 CLI。",
+    "切换后 `/clear`、`/stop`、`--resume` 自愈都仍绑在该 CLI 上。",
     "",
     "▎多会话路由",
     "同一聊天可同时运行多个 claude:消息中任意位置带 `#tag`(如 `#docs 帮我改 README`)",
     "即路由到该标签会话;不带 tag = 默认会话。tagged 会话的回复以 `emoji #tag` 前缀标注。",
     "`/clear #tag`、`/pwd #tag`、`/stop #tag` 等命令同理按 tag 路由。",
+    "`#tag` 与 CLI 名可同时写:`/new codebuddy #docs` = 用 codebuddy 开 docs 会话。",
+    "",
+    "▎多会话协作",
+    "`/peers` 列出本聊天的所有会话及忙闲状态",
+    "同一聊天内的会话互为 peer,可以互相观察和驱动。直接说人话即可:",
+    "「看下 `#fix` 的进展,推动它直到结束」— AI 会读它的终端、注入指令、等它跑完。",
+    "「让 `#fix` 和 `#review` 互相迭代到 review 说 LGTM」— AI 会建一个 loop graph,",
+    "把多个带 tag 的会话(可各用不同 CLI / 模型)串成流水线并循环驱动。",
     "",
     "▎信息 (免授权)",
     "`/id` 查看会话/权限 id",
     "`/pwd` 当前项目路径",
     "`/usage` 真实订阅额度 %",
     "`/cost` token/成本估算",
+    "`/audit` 本会话 token/成本明细 (含 subagent) · `/audit <tag>` 指定标签会话",
+    "`/cfgsync` 预演跨 CLI 项目配置同步 · `/cfgsync apply` 执行 (需授权)",
     "`/help` 本帮助",
     "`/skill-b` 广播接口用法 (贴给 Claude)",
     "",
@@ -212,16 +242,57 @@ const parseSessionsCommand = (text: string): { arg: string } | undefined => {
 // Render the scanned session list into a WeCom-friendly markdown block. The
 // session currently mirrored to this chat's target (if any) is flagged.
 const renderSessionsList = (sessions: SessionInfo[], currentSid: string): string => {
-  if (sessions.length === 0) return "[weclaude] 未发现正在运行的 Claude 会话";
+  if (sessions.length === 0) return "[wezard] 未发现正在运行的 Claude 会话";
+  // Only annotate the CLI when the list actually spans more than one — with a
+  // single backend the tag is pure noise on every row.
+  const mixed = new Set(sessions.map((s) => s.cli)).size > 1;
   const lines = sessions.map((s) => {
     const here = s.sessionId === currentSid ? " ⬅️ 当前" : "";
     const dir = s.cwd.replace(/^.*\//, "") || s.cwd || "?";
-    return `${s.label || "▫️"} \`${s.sessionId.slice(0, 8)}\` ${dir}${here}`;
+    const cli = mixed ? ` _(${s.cli})_` : "";
+    return `${s.label || "▫️"} \`${s.sessionId.slice(0, 8)}\` ${dir}${cli}${here}`;
   });
   return [
-    "[weclaude] 正在运行的会话：",
+    "[wezard] 正在运行的会话：",
     ...lines,
     "> 切换：`/sessions <emoji 或 id>`，如 `/sessions 🐼`",
+  ].join("\n");
+};
+
+// /peers — roster of the sessions living in THIS chat (default + every `#tag`).
+// Distinct from /sessions, which sweeps the whole host: peers are the ones an
+// agent here can actually collaborate with (shared chat = shared address space).
+const isPeersCommand = (text: string): boolean => /^\/(?:peers?|agents?)$/iu.test(text.trim());
+
+const uniq = (xs: string[]): string[] => [...new Set(xs)];
+const dirOf = (p: PeerInfo): string => p.cwd.replace(/^.*\//, "") || p.cwd;
+const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+// A field with the same value on every row (project dir, CLI backend) is noise
+// repeated N times — hoist those into the header and annotate rows only where
+// they actually differ. Rows are blank-line separated so a wrapped summary can't
+// visually merge into the next peer.
+const renderPeers = (peers: PeerInfo[]): string => {
+  if (peers.length === 0) return "[wezard] 本聊天还没有会话。发消息或 `/new` 建一个。";
+  const dirs = uniq(peers.map(dirOf));
+  const clis = uniq(peers.map((p) => p.cli));
+  const shared = [dirs.length === 1 ? dirs[0] : "", clis.length === 1 ? clis[0] : ""].filter(Boolean);
+  const rows = peers.flatMap((p) => {
+    const name = p.tag ? `#${p.tag}` : "默认";
+    const state = !p.paneAlive ? "⚫️ 已关闭" : p.busy ? "🔴 忙" : "🟢 空闲";
+    const varies = [dirs.length > 1 ? dirOf(p) : "", clis.length > 1 ? p.cli : ""].filter(Boolean);
+    const me = p.self ? " ⬅️ 本会话" : "";
+    return [
+      `**${p.label} ${name}** ${state}${varies.length ? ` · ${varies.join(" · ")}` : ""}${me}`,
+      `　${clip(p.summary, 64)}`,
+      "",
+    ];
+  });
+  return [
+    `[wezard] 本聊天的会话 · ${peers.length} 个${shared.length ? ` · ${shared.join(" · ")}` : ""}`,
+    "",
+    ...rows,
+    "> 协作：直接说「看下 #fix 的进展并推动它」，AI 会读它的终端并注入指令",
   ].join("\n");
 };
 
@@ -247,13 +318,15 @@ const stripMentions = (text: string): string => {
 // DMs can't @ a bot — any "@" the user types is content (e.g. "@src/foo.ts"),
 // so we only strip mentions in group chats.
 const isGroup = (msg: BaseMessage): boolean => msg.chattype === "group" && !!msg.chatid;
-// Always kill "@weclaude" (bot's own name) regardless of chat type / @-count:
-// a DM user typing "@weclaude start …" would otherwise leak the mention into
+// Always kill "@wezard" (bot's own name) regardless of chat type / @-count:
+// a DM user typing "@wezard start …" would otherwise leak the mention into
 // Claude's prompt and get semantically parsed (e.g. spawning wrc). Word-tail
-// guard `(?![A-Za-z0-9_])` keeps identifiers like "@weclaude-foo" intact
+// guard `(?![A-Za-z0-9_])` keeps identifiers like "@wezard-foo" intact
 // while allowing CJK / punctuation right after.
+// `weclaude` stays in the alternation: the bot's WeCom display name is chosen
+// by the user, not by us, so pre-rename bots are still literally "@weclaude".
 const stripBotName = (text: string): string =>
-  text.replace(/[ \t]*@weclaude(?![A-Za-z0-9_])[ \t]*/giu, " ").replace(/[ \t]{2,}/g, " ").trim();
+  text.replace(/[ \t]*@(?:wezard|weclaude)(?![A-Za-z0-9_])[ \t]*/giu, " ").replace(/[ \t]{2,}/g, " ").trim();
 const maybeStripMentions = (msg: BaseMessage, text: string): string => {
   const cleaned = stripBotName(text);
   return isGroup(msg) ? stripMentions(cleaned) : cleaned;
@@ -309,7 +382,7 @@ const isLastResponseQuote = (target: string, quoted: string): boolean => {
 
 const withQuote = (msg: BaseMessage, text: string): string => {
   if (!msg.quote) return text;
-  // Drop the quote when the user is replying to weclaude's most recent message
+  // Drop the quote when the user is replying to wezard's most recent message
   // in this chat — claude already has that turn in its context, surfacing it
   // again is redundant noise. Older self-quotes still flow through (the user
   // is genuinely pointing back to something earlier).
@@ -323,10 +396,10 @@ const withQuote = (msg: BaseMessage, text: string): string => {
 // - Normal: strip the bot @mention, attach any quote as a markdown context prefix.
 // - Pure-quote re-trigger: when the user adds NO new text and just quotes a
 //   message, promote the quoted message to the body (strip its @mention so
-//   "@weclaude /usage" → "/usage" hits the command path). WeCom silently dedups
+//   "@wezard /usage" → "/usage" hits the command path). WeCom silently dedups
 //   identical text sends, so re-quoting the same command is the only way to
-//   re-fire it — this makes that work. Self-quotes of weclaude's own last reply
-//   are excluded (would echo weclaude's text back as a command).
+//   re-fire it — this makes that work. Self-quotes of wezard's own last reply
+//   are excluded (would echo wezard's text back as a command).
 // Also extracts the leading `#tag` (if any) from the effective body; the
 // returned `text` has the tag stripped so command matchers see clean
 // "/new"/"/pwd"/etc.
@@ -412,7 +485,7 @@ export const installInboundRouter = (
   const renderPwd = (who: string): string => {
     if ("getCwd" in bridge) {
       const { runningCwd, pendingCwd, defaultCwd } = bridge.getCwd(who);
-      const lines = [`[weclaude] 📂 当前项目: \`${runningCwd}\``];
+      const lines = [`[wezard] 📂 当前项目: \`${runningCwd}\``];
       if (pendingCwd && pendingCwd !== runningCwd) {
         lines.push(`下次切换: \`${pendingCwd}\` (使用 /new 或 /clear 生效)`);
       }
@@ -420,7 +493,7 @@ export const installInboundRouter = (
       lines.push("> 切换其他项目: 让 AI 调用 `cd` MCP 工具");
       return lines.join("\n");
     }
-    return `[weclaude] 📂 当前项目: \`${expandHome(cfg.wrc.cwd)}\` (headless mode, 全局默认)`;
+    return `[wezard] 📂 当前项目: \`${expandHome(cfg.wrc.cwd)}\` (headless mode, 全局默认)`;
   };
 
   // Mirror-only auto-spawn / /new helper. Routes through bridge.newSession
@@ -429,13 +502,35 @@ export const installInboundRouter = (
   // the user-facing one-line ack. When `who` carries a `#tag` suffix, use
   // the raw tag as the tmux window name so the pane shows readably in the
   // status bar (e.g. `#docs` → window `docs`, not the principal slug).
-  const autoSpawnAndAttach = async (who: string): Promise<string> => {
-    if (!("newSession" in bridge)) return "[weclaude] /new only available in mirror mode";
+  const spawnSession = async (who: string, cli?: CliBackendName): Promise<string> => {
+    if (!("newSession" in bridge)) return "[wezard] /new only available in mirror mode";
     const tag = tagOf(who);
-    const r = await bridge.newSession(who, tag || who);
-    if (!r.ok) return `[weclaude] /new failed: ${r.reason ?? "unknown"}`;
+    const r = await bridge.newSession(who, tag || who, cli);
+    if (!r.ok) return `[wezard] /new failed: ${r.reason ?? "unknown"}`;
     return `✅ 新会话已建立 \`${r.sessionId}\``;
   };
+
+  // 同一 `#tag` 的两条消息会并发落进 gate,双双判定「未附着」→ 双 spawn,后者
+  // newSession 会 kill 掉前者的 pane,前者的 dispatch 再 `--resume` 重生出孤儿
+  // pane,消息乱序。spawn 窗口有 3s+(TUI_SETTLE_MS),所以必须按会话串行。
+  const spawnQ = new Map<string, Promise<unknown>>();
+  const serializeSpawn = <T>(key: string, job: () => Promise<T>): Promise<T> => {
+    const next = (spawnQ.get(key) ?? Promise.resolve()).then(job, job);
+    spawnQ.set(key, next.catch(() => undefined).finally(() => {
+      if (spawnQ.get(key) === next) spawnQ.delete(key);
+    }));
+    return next;
+  };
+
+  // 显式 /new:排队但仍强制重开(用户就是要换一个)。
+  const autoSpawnAndAttach = (who: string, cli?: CliBackendName): Promise<string> =>
+    serializeSpawn(who, () => spawnSession(who, cli));
+
+  // 隐式建会话(裸 `#tag` 第一条消息):轮到自己时若前一条已经把会话建好,直接
+  // 复用,不再 respawn —— 否则先到的消息会被注入进一个刚被杀掉的 pane。
+  const ensureSession = (who: string): Promise<string> =>
+    serializeSpawn(who, async () =>
+      "hasMirrorTarget" in bridge && bridge.hasMirrorTarget(who) ? "✅ 复用已建立的会话" : await spawnSession(who));
 
   // 事件订阅 / 广播命令。授权后调用,不再走 bridge dispatch。返回 true 表示已处理。
   const topicLog = log.child({ mod: "topics" });
@@ -445,8 +540,10 @@ export const installInboundRouter = (
     who: string,
     text: string,
   ): Promise<boolean> => {
+    // 订阅/广播回执同样按会话 tag 标注 —— `#docs /subs` 的回执必须落在 `#docs`
+    // 的视觉通道里, 否则同一聊天并行会话时分不清是谁的回执。
     const reply = async (t: string): Promise<void> => {
-      try { await client.replyStream(frame, msg.msgid, t, true); } catch { /* ignore */ }
+      try { await client.replyStream(frame, msg.msgid, withTagHeader(who, t), true); } catch { /* ignore */ }
     };
     const sub = parseSubscribe(text);
     if (sub) {
@@ -506,11 +603,7 @@ export const installInboundRouter = (
   // stays visually disambiguated. Untagged (default) session passes through
   // unchanged. Emoji is derived from the tag string (not sessionId) so it
   // stays stable across /clear cycles.
-  const withTagPrefix = (who: string, text: string): string => {
-    const tag = tagOf(who);
-    if (!tag) return text;
-    return `${labelFor(tag)} \`#${tag}\`\n\n${text}`;
-  };
+  const withTagPrefix = withTagHeader;
   const replyText = async (frame: WsFrame<BaseMessage>, msg: BaseMessage, who: string, text: string): Promise<void> => {
     try { await client.replyStream(frame, msg.msgid, withTagPrefix(who, text), true); } catch { /* ignore */ }
   };
@@ -552,7 +645,7 @@ export const installInboundRouter = (
       try {
         body = renderUsageReport(computeUsage());
       } catch (e) {
-        body = `[weclaude] /cost failed: ${(e as Error).message}`;
+        body = `[wezard] /cost failed: ${(e as Error).message}`;
       }
       await replyText(frame, msg, who, body);
       return { stop: true };
@@ -575,8 +668,8 @@ export const installInboundRouter = (
       let body: string;
       if (!mirror) {
         body = audit.tag
-          ? `[weclaude] /audit: 未找到 tag \`${audit.tag}\` 对应的 Claude 会话。`
-          : `[weclaude] /audit: 未找到 ${who} 绑定的 Claude 会话。先 \`/new\` 或用 \`weclaude mirror\` 绑定后再试。`;
+          ? `[wezard] /audit: 未找到 tag \`${audit.tag}\` 对应的 Claude 会话。`
+          : `[wezard] /audit: 未找到 ${who} 绑定的 Claude 会话。先 \`/new\` 或用 \`wezard mirror\` 绑定后再试。`;
       } else {
         try {
           body = computeAuditReport({
@@ -585,7 +678,7 @@ export const installInboundRouter = (
             tag: audit.tag || undefined,
           });
         } catch (e) {
-          body = `[weclaude] /audit failed: ${(e as Error).message}`;
+          body = `[wezard] /audit failed: ${(e as Error).message}`;
         }
       }
       await replyText(frame, msg, who, body);
@@ -639,7 +732,7 @@ export const installInboundRouter = (
         body = "```\n" + renderQuotaReport(report) + "\n```";
         log.info({ who, limits: report.limits.length }, "/usage panel: done");
       } catch (e) {
-        body = `[weclaude] /usage failed: ${(e as Error).message}`;
+        body = `[wezard] /usage failed: ${(e as Error).message}`;
         log.error({ who, err: (e as Error).message }, "/usage panel: failed");
       }
       await replyText(frame, msg, who, body);
@@ -650,7 +743,7 @@ export const installInboundRouter = (
     // very first message from a fresh user. When routed with a `#tag`, the
     // tag becomes both the mirror-store key and the tmux window name.
     if (isNewCommand(text)) {
-      const reply = await autoSpawnAndAttach(who);
+      const reply = await autoSpawnAndAttach(who, cliOfNewCommand(text));
       await replyText(frame, msg, who, reply);
       return { stop: true };
     }
@@ -663,10 +756,10 @@ export const installInboundRouter = (
     // currently doing. Mirror-mode only; bails cleanly when no attachment.
     if (isStopCommand(text)) {
       if (!("interruptPane" in bridge)) {
-        await replyText(frame, msg, who, "[weclaude] /stop only available in mirror mode");
+        await replyText(frame, msg, who, "[wezard] /stop only available in mirror mode");
       } else {
         const r = await bridge.interruptPane(who);
-        await replyText(frame, msg, who, r.ok ? "✅ Esc sent" : `[weclaude] /stop failed: ${r.reason ?? "unknown"}`);
+        await replyText(frame, msg, who, r.ok ? "✅ Esc sent" : `[wezard] /stop failed: ${r.reason ?? "unknown"}`);
       }
       return { stop: true };
     }
@@ -675,11 +768,55 @@ export const installInboundRouter = (
     // the input box. Mirror-mode only; bails cleanly when no attachment.
     if (isEnterCommand(text)) {
       if (!("submitPane" in bridge)) {
-        await replyText(frame, msg, who, "[weclaude] /n only available in mirror mode");
+        await replyText(frame, msg, who, "[wezard] /n only available in mirror mode");
       } else {
         const r = await bridge.submitPane(who);
-        await replyText(frame, msg, who, r.ok ? "✅ Enter sent" : `[weclaude] /n failed: ${r.reason ?? "unknown"}`);
+        await replyText(frame, msg, who, r.ok ? "✅ Enter sent" : `[wezard] /n failed: ${r.reason ?? "unknown"}`);
       }
+      return { stop: true };
+    }
+    // Authorized `/reveal` — switch the attached tmux client to this session's
+    // pane so the user lands in the terminal showing the live TUI. Mirror-mode
+    // only; routed by `#tag` like any other session command.
+    if (isRevealCommand(text)) {
+      if (!("revealPane" in bridge)) {
+        await replyText(frame, msg, who, "[wezard] /reveal only available in mirror mode");
+      } else {
+        const r = await bridge.revealPane(who);
+        await replyText(frame, msg, who, r.ok ? "✅ 已切到本会话的 tmux 窗口" : `[wezard] /reveal failed: ${r.reason ?? "unknown"}`);
+      }
+      return { stop: true };
+    }
+    // /cfgsync [apply] — 3-way merge of the bound project's per-CLI config
+    // trees (CLAUDE.md ⇄ CODEBUDDY.md, .claude/{skills,commands,agents} ⇄
+    // .codebuddy/...). Writes files, so it sits AFTER the allowFrom gate.
+    const cs = parseCfgSyncCommand(text);
+    if (cs) {
+      const cwd = "getCwd" in bridge ? bridge.getCwd(who).runningCwd : expandHome(cfg.wrc.cwd);
+      let body: string;
+      try {
+        body = renderSyncReport(await syncProjectConfig(cwd, cs.apply));
+      } catch (e) {
+        body = `[wezard] /cfgsync failed: ${(e as Error).message}`;
+      }
+      log.info({ who, cwd, apply: cs.apply }, "/cfgsync");
+      await replyText(frame, msg, who, body);
+      return { stop: true };
+    }
+    // /peers — this chat's own session roster (default + `#tag` siblings), with
+    // live busy state. Read-only, mirror-mode only.
+    if (isPeersCommand(text)) {
+      if (!("peers" in bridge)) {
+        await replyText(frame, msg, who, "[wezard] /peers only available in mirror mode");
+        return { stop: true };
+      }
+      let body: string;
+      try {
+        body = renderPeers(await bridge.peers(who));
+      } catch (e) {
+        body = `[wezard] /peers failed: ${(e as Error).message}`;
+      }
+      await replyText(frame, msg, who, body);
       return { stop: true };
     }
     // /sessions [arg] — list live Claude sessions, or switch the mirror to one.
@@ -689,7 +826,7 @@ export const installInboundRouter = (
     const sc = parseSessionsCommand(text);
     if (sc) {
       if (!("attach" in bridge)) {
-        await replyText(frame, msg, who, "[weclaude] /sessions only available in mirror mode");
+        await replyText(frame, msg, who, "[wezard] /sessions only available in mirror mode");
         return { stop: true };
       }
       let sessions: SessionInfo[] = [];
@@ -707,11 +844,11 @@ export const installInboundRouter = (
       const hit = matchSession(sessions, sc.arg);
       if (!hit) {
         const avail = sessions.map((s) => `${s.label || "▫️"} ${s.sessionId.slice(0, 8)}`).join("、") || "无";
-        await replyText(frame, msg, who, `[weclaude] 未找到会话 \`${sc.arg}\`。可用：${avail}`);
+        await replyText(frame, msg, who, `[wezard] 未找到会话 \`${sc.arg}\`。可用：${avail}`);
         return { stop: true };
       }
       if (hit.sessionId === currentSid) {
-        await replyText(frame, msg, who, `[weclaude] 已经在该会话 ${hit.label} \`${hit.sessionId.slice(0, 8)}\``);
+        await replyText(frame, msg, who, `[wezard] 已经在该会话 ${hit.label} \`${hit.sessionId.slice(0, 8)}\``);
         return { stop: true };
       }
       const att = bridge.attach({ sessionId: hit.sessionId, jsonlPath: hit.jsonlPath, target: who, tmuxPane: hit.tmuxPane, tmuxSession: hit.tmuxSession, cwd: hit.cwd });
@@ -719,7 +856,7 @@ export const installInboundRouter = (
         frame, msg, who,
         att.ok
           ? `✅ 已切到 ${hit.label} \`${hit.sessionId.slice(0, 8)}\` (${hit.cwd})`
-          : `[weclaude] 切换失败: ${att.reason ?? "unknown"}`,
+          : `[wezard] 切换失败: ${att.reason ?? "unknown"}`,
       );
       return { stop: true };
     }
@@ -728,7 +865,7 @@ export const installInboundRouter = (
     // to auto-spawn: this inbound becomes both the binding signal and the
     // first prompt — attach, then fall through to dispatch.
     if ("hasMirrorTarget" in bridge && !bridge.hasMirrorTarget(who)) {
-      const reply = await autoSpawnAndAttach(who);
+      const reply = await ensureSession(who);
       if (!reply.startsWith("✅")) {
         await replyText(frame, msg, who, reply);
         return { stop: true };
@@ -743,7 +880,7 @@ export const installInboundRouter = (
       await bridge.dispatch({ principal: who, text, images, frame, streamId: msg.msgid });
     } catch (e) {
       log.error({ err: (e as Error).message }, "bridge dispatch failed");
-      try { await client.replyStream(frame, msg.msgid, `[weclaude] error: ${(e as Error).message}`, true); } catch { /* ignore */ }
+      try { await client.replyStream(frame, msg.msgid, withTagHeader(who, `[wezard] error: ${(e as Error).message}`), true); } catch { /* ignore */ }
     }
   };
 
@@ -768,7 +905,7 @@ export const installInboundRouter = (
     if (stop) return;
     const path = await downloadToInbox({ client, log, inboxDir }, msg.image.url, msg.image.aeskey, msg.msgid, 0);
     if (!path) {
-      try { await client.replyStream(frame, msg.msgid, "[weclaude] 图片下载失败", true); } catch { /* ignore */ }
+      try { await client.replyStream(frame, msg.msgid, "[wezard] 图片下载失败", true); } catch { /* ignore */ }
       return;
     }
     // Pass the path through the bridge's `images` channel — mirror mode pumps

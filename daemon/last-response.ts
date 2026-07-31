@@ -1,4 +1,4 @@
-// Track the last response weclaude emitted to each chat target, so the inbound
+// Track the last response wezard emitted to each chat target, so the inbound
 // router can suppress redundant `quote` blocks when the user replies to our
 // most recent message. We treat the FINAL bubble (`finish=true` of a stream)
 // AND any markdown sendMessage push as "the response" — because the standalone
@@ -10,7 +10,7 @@
 // Implemented as a one-shot SDK-level wrap rather than threading a tracker
 // through every call site (~30+) — single seam, every reply path covered.
 //
-// In-memory only by design: a `weclaude reload` clears the map; the next
+// In-memory only by design: a `wezard reload` clears the map; the next
 // inbound after reload will miss dedup once. Acceptable in production (rare
 // reloads); in dev just avoid reloading mid-conversation when testing.
 import type { WSClient, WsFrame, BaseMessage, WsFrameHeaders } from "@wecom/aibot-node-sdk";

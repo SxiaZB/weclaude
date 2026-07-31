@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { parse as parseJsonc } from "jsonc-parser";
 import { z } from "zod";
 import { expandHome } from "./paths.js";
+import { resolveCliBackend } from "./cli-backends.js";
 
 // ── Schema ──────────────────────────────────────────────────────────
 const Bot = z.object({
@@ -14,13 +15,13 @@ const Bot = z.object({
 const Daemon = z.object({
   host: z.string().default("127.0.0.1"),
   port: z.number().int().min(1).max(65535).default(17890),
-  stateDir: z.string().default("~/.weclaude/state"),
-  logFile: z.string().default("~/.weclaude/daemon.log"),
+  stateDir: z.string().default("~/.wezard/state"),
+  logFile: z.string().default("~/.wezard/daemon.log"),
   logLevel: z.enum(["trace", "debug", "info", "warn", "error"]).default("info"),
   // 工具调用 / 授权详情页 URL。空则用 http://<host>:<port> (回环)。
   // 想让手机 WeCom 也能点开, 需要在反向代理后填外网地址。桌面端用回环即可。
   detailPublicBase: z.string().default(""),
-  // 远端 detail svr (weclaude svr 起的独立服务, chat + cli 共同可达的网络里)。
+  // 远端 detail svr (wezard svr 起的独立服务, chat + cli 共同可达的网络里)。
   // 空则不转发, 详情走本机 :port/detail。非空时:
   //   • 每次 record*() 后 fire-and-forget POST 到 <base>/d, 存到远端 store。
   //   • buildDetailUrl 用 <base> 作为链接根 (chat 端浏览器打开 <base>/detail?id=...)。
@@ -32,11 +33,12 @@ const Daemon = z.object({
 });
 
 const Mirror = z.object({
-  // Where Claude Code writes per-project transcripts. Forks like `claude-internal`
-  // use a parallel dir (e.g. `~/.claude-internal/projects`). The mirror tails
-  // `<projectsDir>/<encoded(wrc.cwd)>/<sid>.jsonl`. Empty → auto-derive from
-  // `wrc.claudeBin` basename (handled by the Wrc transform below): `claude` →
-  // `~/.claude/projects`, `claude-internal` → `~/.claude-internal/projects`.
+  // Transcript root for the DEFAULT backend only — an escape hatch for a
+  // nonstandard location. Empty → auto-derived from `defaultCli` (`claude` →
+  // `~/.claude/projects`, `claude-internal` → `~/.claude-internal/projects`,
+  // `codebuddy` → `~/.codebuddy/projects`). Other installed backends always use
+  // their own built-in roots; the mirror probes all of them, so setting this
+  // does not narrow which CLIs can be mirrored.
   projectsDir: z.string().default(""),
   // Pin a specific Claude session to mirror. Empty → auto-pick latest .jsonl
   // under `<projectsDir>/<encoded(wrc.cwd)>/` by mtime.
@@ -60,11 +62,11 @@ const Mirror = z.object({
   toolUseInlineMaxChars: z.number().int().positive().default(120),
   // Where inbound images/files from WeCom get saved before being pasted into
   // the live TTY. Files persist — claude reads them by absolute path.
-  inboxDir: z.string().default("~/.weclaude/inbox"),
+  inboxDir: z.string().default("~/.wezard/inbox"),
   // Persisted mirror attachments (principal → sessionId/jsonl/tmux). Restored
   // on daemon boot + lazily on first inbound after reload — so reloading the
   // daemon doesn't re-spawn a fresh claude for an already-bound chat.
-  attachmentsFile: z.string().default("~/.weclaude/mirror-attachments.json"),
+  attachmentsFile: z.string().default("~/.wezard/mirror-attachments.json"),
   // Standalone fallback 路径(liveStream 已 closed/dead/capped) 上的防抖聚合窗口
   // (ms)。窗口内同一 attachment 的多个 item 合并为一条 markdown, 抑制连续工具
   // 调用刷屏。liveStream 仍活时不受影响——直接走 typewriter。0 = 关闭。
@@ -81,6 +83,10 @@ const Mirror = z.object({
   // 没等到的话 drain 抓空, 卡先到、思考过程后到。轮询步进 50ms。0 = 关闭等待,
   // 仅做一次同步 drain (旧行为)。
   flushBeforeCardWaitMs: z.number().int().nonnegative().default(800),
+  // codebuddy 对 AskUserQuestion 不在提问时触发 PreToolUse hook (先弹本地面板),
+  // mirror 从 jsonl 提前探测到 function_call 后直接下发 vote 卡。该卡与本地面板
+  // 竞争 — 面板本就无限期阻塞 turn, 卡对齐 longPollSec 的 12h; 本地先答会作废它。
+  askqVoteTimeoutSec: z.number().int().positive().default(43200),
   // 发卡前从活着的 tmux pane 抠出「为什么发这张卡」的 assistant 前言并先推一条。
   // 必要性: Claude Code 把以 tool_use 收尾的整个 turn 攒着, 等工具 resolve 才 flush
   // 到 jsonl —— 而工具正卡在这张授权卡上, 于是前言在发卡时点既不在 jsonl 也不在
@@ -97,29 +103,88 @@ const Mirror = z.object({
 const Wrc = z.object({
   allowFrom: z.array(z.string()).default([]),
   mode: z.enum(["headless", "mirror"]).default("headless"),
+  // Legacy pre-v0.3: single binary path. Still honored as a back-compat alias
+  // — resolveCliBackend picks it up when cliBackends.<name>.bin is unset. Kept
+  // on the schema so existing configs keep parsing without migration.
   claudeBin: z.string().default("claude"),
-  cwd: z.string().default("~/.weclaude/workspace"),
-  sessionMapFile: z.string().default("~/.weclaude/sessions.json"),
+  // DEFAULT CLI backend — the one used when there is no transcript to derive a
+  // backend from (new-session spawns, headless mode). It is NOT exclusive: the
+  // daemon mirrors sessions from every installed CLI concurrently, resolving
+  // each attachment's binary + jsonl dialect from its own transcript path
+  // (shared/cli-backends.ts bindCliBackends / backendForPath). Optional —
+  // when unset, resolveCliBackend infers from claudeBin basename (so legacy
+  // `claudeBin: "claude-internal"` configs still resolve correctly without
+  // needing to also set defaultCli). The Wrc transform below pins the inferred
+  // name back into v.defaultCli so downstream readers see a concrete value.
+  defaultCli: z.enum(["claude", "claude-internal", "codebuddy"]).optional(),
+  // Per-backend bin overrides. Missing entry → built-in default (`claude`,
+  // `claude-internal`, `codebuddy`). Example:
+  //   cliBackends: { codebuddy: { bin: "/usr/local/bin/codebuddy" } }
+  cliBackends: z
+    .object({
+      claude: z.object({ bin: z.string().optional() }).optional(),
+      "claude-internal": z.object({ bin: z.string().optional() }).optional(),
+      codebuddy: z.object({ bin: z.string().optional() }).optional(),
+    })
+    .default({}),
+  cwd: z.string().default("~/.wezard/workspace"),
+  sessionMapFile: z.string().default("~/.wezard/sessions.json"),
   extraArgs: z.array(z.string()).default([]),
   mirror: Mirror.default({}),
   // Mirror-only: tmux session name prefix for auto-spawn. Final name is
   // `${prefix}-<short>`. Auto-spawn fires when an authorized inbound finds no
   // mirror attached for that chat — allowFrom IS the authorization.
-  tmuxPrefix: z.string().default("weclaude"),
+  tmuxPrefix: z.string().default("wezard"),
 }).transform((v) => {
-  // Auto-derive projectsDir from claudeBin basename when not explicitly set.
-  // `claude` → `~/.claude/projects`, `claude-internal` → `~/.claude-internal/projects`.
-  // Without this, a user running claude-internal sees the daemon tailing the
-  // wrong dir → pane→chat silently drops every reply.
+  // Resolve the active backend once — honors defaultCli if set, otherwise
+  // infers from claudeBin basename (legacy back-compat). Pin the inferred
+  // name back into v.defaultCli so downstream readers see a concrete value
+  // and so logs / sync labels can report the effective backend.
+  const backend = resolveCliBackend(v);
+  if (!v.defaultCli) v.defaultCli = backend.name;
+  // Sync claudeBin to the resolved backend's bin so every daemon file that
+  // reads cfg.wrc.claudeBin (cc-bridge, mirror-bridge, spawn-tmux, quota)
+  // spawns the correct binary — even when the user set only `defaultCli`
+  // without an explicit `claudeBin`. Without this, defaultCli:"codebuddy"
+  // + inherited claudeBin:"claude" would spawn the wrong CLI.
+  v.claudeBin = backend.bin;
+
+  // Auto-derive projectsDir from the resolved backend when not explicitly
+  // set. Replaces the old claudeBin-basename derivation — same result for the
+  // standard cases (claude → ~/.claude/projects, claude-internal →
+  // ~/.claude-internal/projects), plus now supports codebuddy →
+  // ~/.codebuddy/projects. Explicit projectsDir still wins.
   if (!v.mirror.projectsDir) {
-    const name = v.claudeBin.split("/").pop() || "claude";
-    v.mirror.projectsDir = `~/.${name}/projects`;
+    v.mirror.projectsDir = backend.projectsDir;
   }
   return v;
 });
 
+// 危险操作名单 (daemon/danger.ts)。命中者强制单次审批: 不吃 auto-window、
+// 不吃 session cache、不参与批量合流、卡上没有「全过」按钮、超时不静默放行。
+// patterns 都是 JS 正则源码串, 大小写不敏感; allowPatterns 优先级最高。
+const Danger = z.object({
+  enabled: z.boolean().default(true),
+  // true = 命中危险名单也直接放行 (显式的「跳过 danger」开关)。相当于对危险操作
+  // 完全免卡 —— 与 enabled=false 的区别: 名单仍会计算 (日志/redact 用得到),
+  // 只是不再拦。默认 false。
+  skip: z.boolean().default(false),
+  // false = 丢掉内置名单, 只用下面三组自定义规则。
+  builtin: z.boolean().default(true),
+  commandPatterns: z.array(z.string()).default([]),
+  toolPatterns: z.array(z.string()).default([]),
+  pathPatterns: z.array(z.string()).default([]),
+  allowPatterns: z.array(z.string()).default([]),
+});
+
 const Approval = z.object({
   enabled: z.boolean().default(true),
+  // 审批粒度:
+  //   "all"    — 每个命中 matcher 的工具调用都发卡 (默认, 现状)。
+  //   "danger" — 只有命中危险名单 (approval.danger) 的调用才发卡, 其余静默 allow。
+  //              名单被关掉 (danger.enabled=false) 时该模式自动退回 "all" —— 否则
+  //              就成了「全放行」, 与 approval.enabled=false 语义重合且更隐蔽。
+  mode: z.enum(["all", "danger"]).default("all"),
   matcher: z.string().default(".*"),
   approvers: z.array(z.string()).default([]),
   hookTimeoutSec: z.number().int().positive().default(43210),
@@ -136,6 +201,7 @@ const Approval = z.object({
   // plan mode、直接干活。用户仍可在本地 Shift+Tab 手动进 plan mode(那条路径
   // 不过 hook)。默认 true。设 false 恢复原行为(允许模型自动进 plan mode)。
   blockAutoPlanMode: z.boolean().default(true),
+  danger: Danger.default({}),
   // Claude-Code 风格的放行规则 (语法子集见 shared/allow-rules.ts): 命中的调用
   // 跳过发卡直接 allow。例:
   //   "Bash(git log *)"  "Bash(python3 .claude/skills/*)"  "mcp__server__tool"
@@ -164,16 +230,24 @@ const Approval = z.object({
   // 批准后等原生确认框出现的最长时间 (ms)。CC 在 hook 返回后才渲染它, 轮询步进 200ms。
   // 太短会误判成 no_modal (框随后才出现, 于是没人按, 退回死锁), 4s 覆盖实测抖动。
   claudeConfigModalWaitMs: z.number().int().nonnegative().default(4000),
-  // Bash 命令超过 ~200 字 (卡片手机端可见极限) 时, 发卡前先推一条含完整命令的
-  // markdown 消息 (普通气泡可展开, 无卡片渲染截断)。此值为前置消息的总字数上限
-  // (超出截断并注明; 按 1800 字/条分块发送)。0 = 关闭前置消息。
-  fullCommandPreludeChars: z.number().int().nonnegative().default(3600),
+  // Bash 命令超过 ~200 字 (卡片手机端可见极限) 时, 发卡前**无条件**先推一条含完整
+  // 命令的 markdown 消息。默认 0 = 关闭 —— 长命令现在由卡片自己承载: 引用区可点
+  // 进详情页, 右上角「⋯」菜单有「📄 展开完整命令」按需在群里发全文。设成正数可
+  // 恢复旧行为 (客户端不渲染 action_menu、或就是要全文无条件落在群里时用)。
+  // 此值为前置消息的总字数上限 (超出截断并注明; 按 1800 字/条分块发送)。
+  fullCommandPreludeChars: z.number().int().nonnegative().default(0),
 });
 
+// sync.targets[].kind 的合法值。claude-internal / custom 等旧值自动 collapse
+// 为 "claude" (preprocess) — settingsPath 已经表达了具体 fork, kind 只表达家族。
+const SYNC_KIND_LEGACY_TO_CLAUDE = new Set(["claude-internal", "custom"]);
+const normalizeSyncKind = (v: unknown): unknown =>
+  typeof v === "string" && SYNC_KIND_LEGACY_TO_CLAUDE.has(v) ? "claude" : v;
+
 const SyncTarget = z.object({
-  // 仅作为 sync 日志里的标签使用; 真正决定写入位置的是 settingsPath。
-  // 留成自由字符串以兼容 claude / claude-internal / custom 等任何 fork。
-  kind: z.string().default("claude"),
+  // CLI 家族标签: "claude" (含 claude-internal 等 fork) 或 "codebuddy"。
+  // 仅用于 sync 日志; 真正决定写入位置的是 settingsPath。
+  kind: z.preprocess(normalizeSyncKind, z.enum(["claude", "codebuddy"])).default("claude"),
   settingsPath: z.string(),
   scope: z.enum(["user", "project", "local"]).default("user"),
 });
@@ -181,14 +255,14 @@ const Sync = z.object({
   targets: z.array(SyncTarget).default([]),
 });
 
-// 独立 detail 中转服务 (weclaude svr) 的默认参数。CLI 参数 (--host/--port/…) 仍可覆盖,
+// 独立 detail 中转服务 (wezard svr) 的默认参数。CLI 参数 (--host/--port/…) 仍可覆盖,
 // 空则退回硬编码默认 (0.0.0.0:17891)。放在 top-level 而不是塞进 daemon: svr 是独立进程,
 // 与 daemon 生命周期解耦。
 const Svr = z.object({
   host: z.string().default("0.0.0.0"),
   port: z.number().int().min(1).max(65535).default(17891),
-  stateDir: z.string().default("~/.weclaude/svr"),
-  tokenFile: z.string().default("~/.weclaude/svr-token"),
+  stateDir: z.string().default("~/.wezard/svr"),
+  tokenFile: z.string().default("~/.wezard/svr-token"),
   token: z.string().default(""),
   logLevel: z.enum(["trace", "debug", "info", "warn", "error"]).default("info"),
 });
@@ -224,10 +298,10 @@ export type Config = z.infer<typeof ConfigSchema>;
 
 // ── Loader ──────────────────────────────────────────────────────────
 const DEFAULT_CONFIG_PATHS = [
-  "~/.weclaude/config.jsonc",
-  "~/.weclaude/config.json",
+  "~/.wezard/config.jsonc",
+  "~/.wezard/config.json",
 ];
-const SECRETS_PATH = "~/.weclaude/secrets.json";
+const SECRETS_PATH = "~/.wezard/secrets.json";
 
 const readJsoncIfExists = (p: string): unknown | undefined => {
   const abs = expandHome(p);
@@ -249,10 +323,10 @@ const deepMerge = <T extends Record<string, unknown>>(a: T, b: Partial<T>): T =>
   return out as T;
 };
 
-/** Resolve config path: explicit > $WECLAUDE_CONFIG > defaults. */
+/** Resolve config path: explicit > $WEZARD_CONFIG > defaults. */
 const resolveConfigPath = (explicit?: string): string | undefined => {
   if (explicit) return explicit;
-  if (process.env.WECLAUDE_CONFIG) return process.env.WECLAUDE_CONFIG;
+  if (process.env.WEZARD_CONFIG) return process.env.WEZARD_CONFIG;
   for (const p of DEFAULT_CONFIG_PATHS) {
     if (existsSync(expandHome(p))) return p;
   }
@@ -268,7 +342,7 @@ export const loadConfig = (explicitPath?: string): LoadResult => {
   const sourcePath = resolveConfigPath(explicitPath);
   if (!sourcePath) {
     throw new Error(
-      `weclaude config not found. Create ~/.weclaude/config.jsonc (see config.example.jsonc) or set $WECLAUDE_CONFIG.`,
+      `wezard config not found. Create ~/.wezard/config.jsonc (see config.example.jsonc) or set $WEZARD_CONFIG.`,
     );
   }
   const base = (readJsoncIfExists(sourcePath) ?? {}) as Record<string, unknown>;
@@ -280,7 +354,7 @@ export const loadConfig = (explicitPath?: string): LoadResult => {
     const issues = parsed.error.issues
       .map((i) => `  - ${i.path.join(".") || "<root>"}: ${i.message}`)
       .join("\n");
-    throw new Error(`weclaude config invalid (${sourcePath}):\n${issues}`);
+    throw new Error(`wezard config invalid (${sourcePath}):\n${issues}`);
   }
   return { config: parsed.data, sourcePath: expandHome(sourcePath) };
 };

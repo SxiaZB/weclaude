@@ -8,8 +8,9 @@ import type {
   TemplateCardEventData,
 } from "@wecom/aibot-node-sdk";
 import type { Logger } from "pino";
+import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import type { Config } from "../shared/config.js";
-import { createPending, getPending, getResolvedSnapshot, resolvePending, resolvePendingsByChat, failPending, type Decision } from "./pending.js";
+import { createPending, getPending, getResolvedSnapshot, resolvePending, resolvePendingsByChat, failPending, stashResolved, markCardSent, isReloadError, type Decision } from "./pending.js";
 import {
   cacheGet,
   cachePut,
@@ -20,15 +21,17 @@ import {
   clearAutoWindow,
   getWindowMeta,
 } from "./session-cache.js";
-import { NEVER_RULE_ALLOW, alwaysAllowRulesFor, ruleAllows, ruleMatchesAny, splitSegments } from "../shared/allow-rules.js";
+import { NEVER_RULE_ALLOW, alwaysAllowRulesFor, evaluateAllow, ruleMatchesAny, splitSegments, type DenyReason } from "../shared/allow-rules.js";
 import { claudeConfigWrite, type ClaudeConfigHit } from "../shared/claude-config-path.js";
 import type { NativeModalAnswer } from "./mirror-bridge.js";
 import { appendUnique } from "../shared/config-writer.js";
 import { redact } from "./redact.js";
-import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";
+import { dangerOf, dangerEarlyExit, type DangerHit } from "./danger.js";
+import { recordApproval, recordApprovalDecision, buildDetailUrl, getDetail } from "./detail.js";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
-import { labelFor } from "./session-label.js";
+import { tagBadge, tagOfKey, withTagHeader } from "../shared/session-label.js";
+import { sessionNameFor } from "./session-name.js";
 
 // ── Routing helpers ────────────────────────────────────────────────────
 const targetChatId = (principal: string): string => {
@@ -65,6 +68,12 @@ interface CardArgs {
   transcriptTail: string;
   windowMinutes: number;
   detailUrl?: string;  // 空则不渲染 jump_list
+  /** 命中危险名单的规则名。非空 → 卡片去掉「全过」按钮, 必须单次确认。 */
+  danger?: string;
+  /** 会话名 (#tag / CC 会话名 / 首条用户消息 / 短 id) — 发卡时算好, resolved 卡复用。 */
+  sessionName?: string;
+  /** 未命中 allowRules 的具体原因 — 渲染到「审核」行。 */
+  denyReason?: DenyReason;
 }
 
 const TRUNC = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -86,17 +95,17 @@ const EDIT_SNIPPET_LEN = 160;
 const WRITE_PREVIEW_LINES = 4;
 const WRITE_PREVIEW_CHARS = 200;
 
-const SOURCE_BASE = {
-  icon_url: "https://wwcdn.weixin.qq.com/node/wework/images/3d-claude-ai-logo.bce0ddae70.jpg",
-  desc: "Claude Code",
-  desc_color: 0,
-};
+const SOURCE_ICON = "https://wwcdn.weixin.qq.com/node/wework/images/3d-claude-ai-logo.bce0ddae70.jpg";
 
-// Source bar sits ABOVE main_title — only place we can hoist transcript context.
-const buildSource = (tail: string): TemplateCard["source"] => {
-  const desc = tail ? TRUNC(tail, 80) : SOURCE_BASE.desc;
-  return { ...SOURCE_BASE, desc } as TemplateCard["source"];
-};
+// Source 行 = 会话身份位: 放会话名 (谁在请求), 让 main_title 整块 13×2 字腾给
+// "想干什么"。危险卡只把这行文字变红 (desc_color: 2), 不换文案不加图标 ——
+// 红色本身就是信号。会话名缺失时回落品牌名, 不留空行。
+const buildSource = (danger?: string, sessionName?: string): TemplateCard["source"] =>
+  ({
+    icon_url: SOURCE_ICON,
+    desc: TRUNC(sessionName || "Claude Code", 13),
+    desc_color: danger ? 2 : 0,
+  }) as TemplateCard["source"];
 
 interface Rendered {
   body: string;  // wrapped in quote_area as the parameters block
@@ -109,13 +118,20 @@ const prefixLines = (s: string, prefix: string): string =>
 // Flat key:val summary for unknown tools — never dump raw JSON.
 const UNKNOWN_VAL_LEN = 140;
 const UNKNOWN_TOTAL_LEN = 480;
-const summarizeUnknown = (i: Record<string, unknown>): string => {
+// Path values (Glob target_directory, open_result_view target_file, …) get
+// cwd/home-collapsed first, then LEFT-truncated — the filename is the
+// informative tail; right-truncation cuts it off mid-path.
+const TRUNC_LEFT = (s: string, n: number): string =>
+  s.length > n ? `…${s.slice(s.length - (n - 1))}` : s;
+const summarizeUnknown = (i: Record<string, unknown>, cwd: string): string => {
   const lines: string[] = [];
   let total = 0;
   for (const [k, v] of Object.entries(i)) {
     if (total >= UNKNOWN_TOTAL_LEN) { lines.push("…"); break; }
     const s = typeof v === "string" ? v : JSON.stringify(v);
-    const line = `${k}: ${TRUNC(oneLine(s), UNKNOWN_VAL_LEN)}`;
+    const isPath = typeof v === "string" && v.startsWith("/");
+    const shown = isPath ? TRUNC_LEFT(relToCwd(v, cwd), UNKNOWN_VAL_LEN) : TRUNC(oneLine(s), UNKNOWN_VAL_LEN);
+    const line = `${k}: ${shown}`;
     lines.push(line);
     total += line.length;
   }
@@ -127,10 +143,19 @@ const summarizeUnknown = (i: Record<string, unknown>): string => {
 let QUOTE_MAX = 600;
 export const setCardQuoteMax = (n: number): void => { QUOTE_MAX = n; };
 const SAFE_QUOTE_MAX = 600;
+// 发送失败缩容重试: 正文主体如今在 sub_title_text (v2 布局), quote_area 仅存于
+// 历史路径 —— 两处都缩, 保住审批流比保住展示量重要。
 const shrinkQuote = (c: TemplateCard): TemplateCard => {
+  let out = c;
   const q = (c as { quote_area?: { type: number; quote_text?: string } }).quote_area;
-  if (!q?.quote_text || q.quote_text.length <= SAFE_QUOTE_MAX) return c;
-  return { ...c, quote_area: { ...q, quote_text: TRUNC(q.quote_text, SAFE_QUOTE_MAX) } } as TemplateCard;
+  if (q?.quote_text && q.quote_text.length > SAFE_QUOTE_MAX) {
+    out = { ...out, quote_area: { ...q, quote_text: TRUNC(q.quote_text, SAFE_QUOTE_MAX) } } as TemplateCard;
+  }
+  const st = out.sub_title_text;
+  if (st && st.length > SAFE_QUOTE_MAX) {
+    out = { ...out, sub_title_text: TRUNC(st, SAFE_QUOTE_MAX) };
+  }
+  return out;
 };
 const join = (...parts: string[]): string => parts.filter(Boolean).join("\n");
 
@@ -190,11 +215,15 @@ const renderInput = (
     const head = [sa, desc].filter(Boolean).join(": ");
     return { body: TRUNC(prompt, QUOTE_MAX), desc: head || undefined };
   }
-  return { body: summarizeUnknown(i) };
+  return { body: summarizeUnknown(i, cwd) };
 };
 
-const quoteArea = (text: string): TemplateCard["quote_area"] =>
-  ({ type: 0, quote_text: text } as TemplateCard["quote_area"]);
+// Bash/Shell 的原始命令 — 判断卡片正文是否被截断、以及「展开完整命令」取哪一段。
+const commandOf = (toolName: string, toolInput: unknown): string => {
+  if (toolName !== "Bash" && toolName !== "Shell") return "";
+  const i = toolInput as Record<string, unknown> | null;
+  return i && typeof i.command === "string" ? i.command : "";
+};
 
 const MAIN_DESC_MAX = 30;
 const mainTitle = (title: string, desc?: string): TemplateCard["main_title"] =>
@@ -202,8 +231,9 @@ const mainTitle = (title: string, desc?: string): TemplateCard["main_title"] =>
 
 const dirName = (cwd: string): string => cwd.replace(/^.*\//, "") || cwd;
 
+// quote_area 弃用后, jump_list 是卡上唯一的 PC 跳转位 (13 字上限)。
 const detailJumpList = (url?: string): TemplateCard["jump_list"] | undefined =>
-  url ? [{ type: 1, title: "🔍 详情", url }] : undefined;
+  url ? [{ type: 1, title: "🔍 完整命令 · 详情", url }] : undefined;
 
 // Stable per-session animal emoji, matching list_claude_sessions, so the user
 // can tell which session a card belongs to when several un-mirrored sessions
@@ -216,35 +246,128 @@ const detailJumpList = (url?: string): TemplateCard["jump_list"] | undefined =>
 // keyed on the tag STRING (not sessionId) so it matches the `emoji #tag`
 // prefix that outbound mirror bubbles carry — one visual per tag, regardless
 // of how many times `/clear` rotates the underlying sessionId.
-const tagStringOf = (target: string | undefined): string => {
-  if (!target) return "";
-  const h = target.indexOf("#");
-  return h >= 0 ? target.slice(h + 1) : "";
+const emojiFor = tagBadge;
+
+// ── v3 布局 (2026-07-31 两轮真机反馈后定稿) ──────────────────────────
+// 信息优先级: 谁在问(会话名) > 想干什么(desc) > 具体命令 > 上下文。
+//   source        品牌位; 危险卡文字变红 (仅变色, 不换文案)
+//   main_title    <会话名> · <工具> — 无锁/无 emoji, 纯文字
+//   quote_area    命令主体 — 无标题, 整块可点跳详情页 (PC); 3 行截断由
+//                 右上⋯展开与详情页兜底
+//   horizontal    上文 (最近用户消息); 危险卡多一行规则名
+//   jump_list     「🔍 完整命令·详情」
+// 会话名: #tag (企微发起) > CC 会话名 (本地发起, sessions 注册表) > 首条消息。
+const HMETA_VAL_MAX = 26;
+
+// 一级标题 = Claude 自己写的意图 (tool_input.description), 回答"想干什么" ——
+// 13×2 字里最值钱的内容。没有 description 的工具 (Read/Write/Edit…) 回落
+// 「工具 · 目录/」, 因为具体路径在下面的引用区里已经有了。
+const cardTitle = (a: CardArgs, r: Rendered): string =>
+  r.desc || `${shortTool(a.toolName)} · ${dirName(a.cwd)}/`;
+
+// 「审核」行: 说清这条命令为什么没被白名单放行 —— 与「危险」行同一种表达方式。
+// 能算出「总是」将生成的规则时直接给规则 (点总是会发生什么), 否则给段落定位。
+const denyReasonText = (d: DenyReason): string | undefined => {
+  switch (d.kind) {
+    case "segment_unmatched":
+      return d.rule
+        ? `${d.index}/${d.total}段 → ${d.rule}`
+        : `${d.index}/${d.total}段 ${d.segment}`;
+    case "substitution": return "含 $() 动态构造，无法白名单";
+    case "unparsable": return "引号未闭合或含后台符 &";
+    case "tool_not_listed": return `${shortTool(d.tool)} 未在白名单`;
+    case "never_allow": return "交互工具，永不免审";
+    // 没配白名单规则 = 用户没在用这套机制, 每张卡都挂这行纯噪声。
+    case "no_rules": return undefined;
+  }
 };
-const emojiFor = (target: string | undefined): string => {
-  const tag = tagStringOf(target);
-  return tag ? `${labelFor(tag)} ` : "";
+
+// mcp__server__tool → server:tool — 标题里的长工具名压短。
+const shortTool = (toolName: string): string =>
+  TRUNC(toolName.replace(/^mcp__/, "").replace(/__/g, ":"), 16);
+
+const metaRows = (a: CardArgs): TemplateCard["horizontal_content_list"] => {
+  const rows: Array<{ keyname: string; value: string }> = [];
+  const tail = oneLine(a.transcriptTail).trim();
+  if (tail) rows.push({ keyname: "上文", value: TRUNC(tail, HMETA_VAL_MAX) });
+  // 为什么要人来点这一下 —— 优先级 危险 > 未白名单。danger 命中时命令很可能
+  // 本来就在白名单里, 再报"未放行"是误导。
+  if (a.danger) {
+    rows.push({ keyname: "危险", value: TRUNC(`命中「${a.danger}」`, HMETA_VAL_MAX) });
+  } else if (a.denyReason) {
+    const why = denyReasonText(a.denyReason);
+    if (why) rows.push({ keyname: "审核", value: TRUNC(why, HMETA_VAL_MAX) });
+  }
+  return rows.length > 0 ? (rows as TemplateCard["horizontal_content_list"]) : undefined;
 };
-const tagOf = (a: CardArgs): string => emojiFor(a.chatKey);
+
+// 命令主体 (引用区, 可点) + 元信息行, 各卡共用的中段。
+const bodyBlocks = (a: CardArgs, r: Rendered): Partial<TemplateCard> => {
+  const rows = metaRows(a);
+  return {
+    ...(r.body ? { quote_area: quoteArea(r.body, a.detailUrl) } : {}),
+    ...(rows ? { horizontal_content_list: rows } : {}),
+  };
+};
+
+// 引用区: 无标题 (省一行), 挂 type:1 + url 整块可点 → 详情页看全文 (PC 好用;
+// 回环链接手机打不开是已知取舍, 手机走右上⋯展开)。
+const quoteArea = (text: string, url?: string): TemplateCard["quote_area"] =>
+  (url
+    ? { type: 1, url, quote_text: text }
+    : { type: 0, quote_text: text }) as TemplateCard["quote_area"];
+
+// 危险卡: 只有 ❌ / ✅ — 不给「N 分钟全过」「✅总是」的入口, 否则一次点击就把
+// 后续所有危险操作也放行了, 名单等于失效。
+const approveButtons = (a: CardArgs): TemplateCard["button_list"] =>
+  a.danger
+    ? [
+        { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
+        { text: "✅ 确认执行", style: 4, key: encodeKey(a.reqId, "allow") },
+      ]
+    : [
+        { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
+        { text: fmtWindow(a.windowMinutes), style: 3, key: encodeKey(a.reqId, "allow_window") },
+        { text: "✅总是", style: 4, key: encodeKey(a.reqId, "allow_always") },
+        { text: "✅", style: 4, key: encodeKey(a.reqId, "allow") },
+      ];
+
+// 正文放不下时的两条出路, 都挂在卡片自己身上 (不再额外发一条完整命令的文本消息):
+//   • 引用区可点 → 详情页 (HTML, 有高亮, 但要跳浏览器)
+//   • 右上角「⋯」菜单「📄 展开完整命令」→ 按需在群里发全文 (不跳出企微)
+// action_menu 只在正文确实被截断时才挂, 免得短命令的卡也多一个没用的入口。
+const FULLCMD_PREFIX = "FULLCMD|";
+const encodeFullCmdKey = (reqId: string): string => `${FULLCMD_PREFIX}${reqId}`;
+// WeCom markdown 单条上限约 2048 字节, 留出标题与 tag 头的余量。
+const FULLCMD_CHUNK_CHARS = 1800;
+const chunkText = (s: string, size: number): string[] => {
+  const out: string[] = [];
+  for (let i = 0; i < s.length; i += size) out.push(s.slice(i, i + size));
+  return out.length > 0 ? out : [""];
+};
+
+/** 带命令的卡一律给「看全文」入口, 待决卡与已决卡共用 (已决卡也要能回看批了
+ *  什么), 不按长度区分 —— 短命令多一个菜单项无害。
+ *  右上「⋯」→ 群里发全文 (哪端都能用); jump_list「🔍 完整命令·详情」→ 详情页
+ *  (PC 端好用, 回环链接手机打不开是已知取舍)。 */
+const fullCmdMenu = (a: CardArgs): TemplateCard["action_menu"] | undefined =>
+  commandOf(a.toolName, a.toolInput)
+    ? { desc: "更多", action_list: [{ text: "📄 展开完整命令", key: encodeFullCmdKey(a.reqId) }] }
+    : undefined;
 
 const buildCard = (a: CardArgs): TemplateCard => {
   const r = renderInput(a.toolName, a.toolInput, a.toolInputStr, a.cwd);
-  const dir = dirName(a.cwd);
-  const tail = oneLine(a.transcriptTail).trim();
   const jl = detailJumpList(a.detailUrl);
+  const menu = fullCmdMenu(a);
   return {
     card_type: "button_interaction",
-    source: buildSource(tail),
-    main_title: mainTitle(`🔐 授权 · ${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
-    ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
+    source: buildSource(a.danger, a.sessionName),
+    main_title: { title: TRUNC(cardTitle(a, r), 26) },
+    ...bodyBlocks(a, r),
+    ...(menu ? { action_menu: menu } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
-    button_list: [
-      { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
-      { text: fmtWindow(a.windowMinutes), style: 3, key: encodeKey(a.reqId, "allow_window") },
-      { text: "✅总是", style: 4, key: encodeKey(a.reqId, "allow_always") },
-      { text: "✅", style: 4, key: encodeKey(a.reqId, "allow") },
-    ],
+    button_list: approveButtons(a),
   };
 };
 
@@ -288,14 +411,16 @@ const buildResolvedCard = (
   a: CardArgs & { decision: Decision; by: string },
 ): TemplateCard => {
   const r = renderInput(a.toolName, a.toolInput, a.toolInputStr, a.cwd);
-  const dir = dirName(a.cwd);
-  const tail = oneLine(a.transcriptTail).trim();
   const jl = detailJumpList(a.detailUrl);
+  // 已决卡同样保留「看全文」入口 —— 回头想确认"我刚才批的到底是什么"是常态,
+  // 而 detail 记录留存 24h, 点了照样能展开。
+  const menu = fullCmdMenu(a);
   return {
     card_type: "button_interaction",
-    source: buildSource(tail),
-    main_title: mainTitle(`${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
-    ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
+    source: buildSource(a.danger, a.sessionName),
+    main_title: { title: TRUNC(cardTitle(a, r), 26) },
+    ...bodyBlocks(a, r),
+    ...(menu ? { action_menu: menu } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
     button_list: [resolvedButton(a.decision, a.windowMinutes, a.reqId, a.chatKey ?? "")],
@@ -304,14 +429,12 @@ const buildResolvedCard = (
 
 const buildCancelledCard = (a: CardArgs): TemplateCard => {
   const r = renderInput(a.toolName, a.toolInput, a.toolInputStr, a.cwd);
-  const dir = dirName(a.cwd);
-  const tail = oneLine(a.transcriptTail).trim();
   const jl = detailJumpList(a.detailUrl);
   return {
     card_type: "button_interaction",
-    source: buildSource(tail),
-    main_title: mainTitle(`${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
-    ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
+    source: buildSource(a.danger, a.sessionName),
+    main_title: { title: TRUNC(cardTitle(a, r), 26) },
+    ...bodyBlocks(a, r),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
     button_list: [
@@ -323,14 +446,12 @@ const buildCancelledCard = (a: CardArgs): TemplateCard => {
 // 已 resolved 的卡再次被点击 — 仅作视觉反馈, 不改变任何状态。
 const buildAlreadyResolvedCard = (a: CardArgs): TemplateCard => {
   const r = renderInput(a.toolName, a.toolInput, a.toolInputStr, a.cwd);
-  const dir = dirName(a.cwd);
-  const tail = oneLine(a.transcriptTail).trim();
   const jl = detailJumpList(a.detailUrl);
   return {
     card_type: "button_interaction",
-    source: buildSource(tail),
-    main_title: mainTitle(`${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
-    ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
+    source: buildSource(a.danger, a.sessionName),
+    main_title: { title: TRUNC(cardTitle(a, r), 26) },
+    ...bodyBlocks(a, r),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
     button_list: [{ text: "已经放行", style: 4, key: `noop:${a.reqId}` }],
@@ -359,6 +480,13 @@ interface ActiveBatch {
   toolName: string;
   approver: string;
   windowMinutes: number;
+  /** 危险名单规则名。危险请求永远是单成员批次 (不注册进 activeBatches,
+   *  没人能 join), 只为复用 flushBatch 的发卡/失败路径。 */
+  danger?: string;
+  /** 会话名 (同 CardArgs.sessionName) — 批次内成员同 session, 开批时算一次。 */
+  sessionName?: string;
+  /** 未命中 allowRules 的原因 (同 CardArgs.denyReason)。 */
+  denyReason?: DenyReason;
   members: BatchMember[];
   flushTimer: NodeJS.Timeout;
   flushed: boolean;
@@ -395,32 +523,39 @@ const renderBatchBody = (batch: ActiveBatch): string => {
   return TRUNC(lines.join("\n"), QUOTE_MAX);
 };
 
-const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCard => {
-  const dir = dirName(batch.members[0]?.cwd ?? "");
+// 批量卡的标题/中段与单卡同构 (会话名 + 工具×N / 成员列表进引用区)。
+const batchTitle = (batch: ActiveBatch): string =>
+  `${batch.sessionName || batch.sessionId.slice(-8)} · ${shortTool(batch.toolName)} ×${batch.members.length}`;
+const batchBlocks = (batch: ActiveBatch, transcriptTail: string): Partial<TemplateCard> => {
+  const rows: Array<{ keyname: string; value: string }> = [];
   const tail = oneLine(transcriptTail).trim();
-  const emoji = emojiFor(batch.approver);
+  if (tail) rows.push({ keyname: "上文", value: TRUNC(tail, HMETA_VAL_MAX) });
+  if (batch.danger) rows.push({ keyname: "危险", value: TRUNC(`命中「${batch.danger}」`, HMETA_VAL_MAX) });
   return {
-    card_type: "button_interaction",
-    source: buildSource(tail),
-    main_title: { title: `🔐 授权 · ${emoji}${batch.toolName} ×${batch.members.length} · ${dir}/` },
     quote_area: quoteArea(renderBatchBody(batch)),
-    task_id: batch.batchId,
-    button_list: [
-      { text: "❌", style: 4, key: encodeBatchKey(batch.batchId, "deny") },
-      { text: fmtWindow(batch.windowMinutes), style: 3, key: encodeBatchKey(batch.batchId, "allow_window") },
-      { text: "✅总是", style: 4, key: encodeBatchKey(batch.batchId, "allow_always") },
-      { text: "✅", style: 4, key: encodeBatchKey(batch.batchId, "allow") },
-    ],
+    ...(rows.length > 0 ? { horizontal_content_list: rows as TemplateCard["horizontal_content_list"] } : {}),
   };
 };
+
+const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCard => ({
+  card_type: "button_interaction",
+  source: buildSource(batch.danger, batch.sessionName),
+  main_title: { title: batchTitle(batch) },
+  ...batchBlocks(batch, transcriptTail),
+  task_id: batch.batchId,
+  button_list: [
+    { text: "❌", style: 4, key: encodeBatchKey(batch.batchId, "deny") },
+    { text: fmtWindow(batch.windowMinutes), style: 3, key: encodeBatchKey(batch.batchId, "allow_window") },
+    { text: "✅总是", style: 4, key: encodeBatchKey(batch.batchId, "allow_always") },
+    { text: `✅ ×${batch.members.length}`, style: 4, key: encodeBatchKey(batch.batchId, "allow") },
+  ],
+});
 
 const buildBatchResolvedCard = (
   batch: ActiveBatch,
   decision: Decision,
   transcriptTail: string,
 ): TemplateCard => {
-  const dir = dirName(batch.members[0]?.cwd ?? "");
-  const tail = oneLine(transcriptTail).trim();
   const button = decision === "allow_window"
     ? {
         text: `${verbOf(decision, batch.windowMinutes)} · 点击取消`,
@@ -434,26 +569,22 @@ const buildBatchResolvedCard = (
       };
   return {
     card_type: "button_interaction",
-    source: buildSource(tail),
-    main_title: { title: `${emojiFor(batch.approver)}${batch.toolName} ×${batch.members.length} · ${dir}/` },
-    quote_area: quoteArea(renderBatchBody(batch)),
+    source: buildSource(batch.danger, batch.sessionName),
+    main_title: { title: batchTitle(batch) },
+    ...batchBlocks(batch, transcriptTail),
     task_id: batch.batchId,
     button_list: [button],
   };
 };
 
-const buildBatchAlreadyResolvedCard = (batch: ActiveBatch, transcriptTail: string): TemplateCard => {
-  const dir = dirName(batch.members[0]?.cwd ?? "");
-  const tail = oneLine(transcriptTail).trim();
-  return {
-    card_type: "button_interaction",
-    source: buildSource(tail),
-    main_title: { title: `${emojiFor(batch.approver)}${batch.toolName} ×${batch.members.length} · ${dir}/` },
-    quote_area: quoteArea(renderBatchBody(batch)),
-    task_id: batch.batchId,
-    button_list: [{ text: "已经放行", style: 4, key: encodeBatchNoopKey(batch.batchId) }],
-  };
-};
+const buildBatchAlreadyResolvedCard = (batch: ActiveBatch, transcriptTail: string): TemplateCard => ({
+  card_type: "button_interaction",
+  source: buildSource(batch.danger, batch.sessionName),
+  main_title: { title: batchTitle(batch) },
+  ...batchBlocks(batch, transcriptTail),
+  task_id: batch.batchId,
+  button_list: [{ text: "已经放行", style: 4, key: encodeBatchNoopKey(batch.batchId) }],
+});
 
 const encodeKey = (reqId: string, decision: Decision): string => `${reqId}|${decision}`;
 const NOOP_PREFIX = "noop:";
@@ -515,15 +646,15 @@ const decodeAskqKey = (
 const decodeAskqNoopKey = (key: string): string | undefined =>
   key.startsWith(ASKQ_NOOP_PREFIX) ? key.slice(ASKQ_NOOP_PREFIX.length) : undefined;
 
-interface AskqOption { label: string; description?: string }
-interface AskqQuestion {
+export interface AskqOption { label: string; description?: string }
+export interface AskqQuestion {
   question: string;
   header: string;
   multiSelect: boolean;
   options: AskqOption[];
 }
 
-const parseAskqInput = (i: unknown): AskqQuestion[] | undefined => {
+export const parseAskqInput = (i: unknown): AskqQuestion[] | undefined => {
   if (!i || typeof i !== "object") return undefined;
   const qs = (i as { questions?: unknown }).questions;
   if (!Array.isArray(qs)) return undefined;
@@ -554,7 +685,7 @@ const askqLabel = (idx: number): string => ASKQ_LETTERS[idx] ?? String(idx + 1);
 
 // vote_interaction 只支持 card_type/source/main_title/checkbox/submit_button/task_id,
 // sub_title_text/quote_area 等会被静默吞掉 → 题目和选项必须走前置 markdown 消息。
-const buildAskqMarkdown = (q: AskqQuestion, prefix = ""): string => {
+export const buildAskqMarkdown = (q: AskqQuestion, prefix = ""): string => {
   const title = q.question || q.header || "请选择";
   const head = `**🤔 ${prefix}${title}**`;
   const opts = q.options.map((o, idx) => {
@@ -564,12 +695,12 @@ const buildAskqMarkdown = (q: AskqQuestion, prefix = ""): string => {
   return [head, "", ...opts].join("\n");
 };
 
-const buildAskqCard = (reqId: string, q: AskqQuestion, transcriptTail: string): TemplateCard => {
+export const buildAskqCard = (reqId: string, q: AskqQuestion, transcriptTail: string, approver?: string): TemplateCard => {
   const tail = oneLine(transcriptTail).trim();
   return {
     card_type: "vote_interaction",
     source: buildSource(tail),
-    main_title: { title: TRUNC(`🤔 ${q.header || "请选择"}`, ASKQ_TITLE_MAX) },
+    main_title: { title: TRUNC(`🤔 ${emojiFor(approver)}${q.header || "请选择"}`, ASKQ_TITLE_MAX) },
     task_id: reqId,
     checkbox: {
       question_key: "q",
@@ -598,6 +729,7 @@ const buildAskqResolvedCard = (
   q: AskqQuestion,
   outcome: AskqOutcome,
   transcriptTail: string,
+  approver?: string,
 ): TemplateCard => {
   const summary = outcome.kind === "cli"
     ? "🖥️ 已转 CLI 中处理"
@@ -610,7 +742,7 @@ const buildAskqResolvedCard = (
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: TRUNC(`🤔 ${q.header || "已回答"}`, ASKQ_TITLE_MAX) },
+    main_title: { title: TRUNC(`🤔 ${emojiFor(approver)}${q.header || "已回答"}`, ASKQ_TITLE_MAX) },
     sub_title_text: TRUNC(q.question, ASKQ_SUB_MAX),
     task_id: reqId,
     button_list: [{ text: TRUNC(summary, 30), style: 4, key: encodeAskqNoopKey(reqId) }],
@@ -646,6 +778,51 @@ const parsePlanInput = (i: unknown): string => {
   return typeof p === "string" ? p : "";
 };
 
+// CodeBuddy 的 ExitPlanMode 不带 plan 正文 (arguments=="{}"); plan 写在
+// ~/.codebuddy/plans/<slug>.md (plan mode 系统消息指定, 模型用 Write/Edit 逐步
+// 成型)。从 transcript 尾部倒查最后一次指向 plans 目录的 file_path, 再读文件
+// 取最新内容。arguments 是转义后的内嵌 JSON 串 (\"file_path\":\"...\") 且嵌着
+// 整份 plan (单行可能数百 KB), 用正则抠路径 (\\? 兼容转义/未转义), 不做 parse。
+const PLAN_PATH_RE = /\\?"file_path\\?"\s*:\s*\\?"([^"\\]*\/\.codebuddy\/plans\/[^"\\]+\.md)\\?"/;
+const TRANSCRIPT_TAIL_BYTES = 256 * 1024;
+const PLAN_FILE_CAP = 64 * 1024;
+
+const tailText = (p: string, bytes: number): string => {
+  const fd = openSync(p, "r");
+  try {
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - bytes);
+    const buf = Buffer.alloc(size - start);
+    readSync(fd, buf, 0, buf.length, start);
+    return buf.toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+};
+
+const planPathFromTranscript = (transcriptPath: string): string | undefined => {
+  const lines = tailText(transcriptPath, TRANSCRIPT_TAIL_BYTES).split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = PLAN_PATH_RE.exec(lines[i]!);
+    if (m) return m[1];
+  }
+  return undefined;
+};
+
+// tool_input.plan (Claude) → transcript 定位 plans 文件 (CodeBuddy) → ""。
+const resolvePlanText = (toolInput: unknown, transcriptPath?: string): string => {
+  const direct = parsePlanInput(toolInput);
+  if (direct) return direct;
+  if (!transcriptPath) return "";
+  try {
+    const p = planPathFromTranscript(transcriptPath);
+    if (!p) return "";
+    return readFileSync(p, "utf8").slice(0, PLAN_FILE_CAP);
+  } catch {
+    return "";
+  }
+};
+
 const PLAN_TITLE_MAX = 26;
 const PLAN_PREVIEW_LINES = 25;
 const PLAN_PREVIEW_CHARS = 1500;
@@ -660,7 +837,7 @@ const buildPlanMarkdown = (plan: string): string => {
   return `**📋 计划待审批**\n\n${body}`;
 };
 
-const buildPlanCard = (reqId: string, _sessionId: string, cwd: string, transcriptTail: string, approver: string): TemplateCard => {
+const buildPlanCard = (reqId: string, _sessionId: string, cwd: string, transcriptTail: string, approver: string, hasPlan: boolean): TemplateCard => {
   const tail = oneLine(transcriptTail).trim();
   const tag = emojiFor(approver);
   const dir = dirName(cwd);
@@ -668,7 +845,9 @@ const buildPlanCard = (reqId: string, _sessionId: string, cwd: string, transcrip
     card_type: "button_interaction",
     source: buildSource(tail),
     main_title: { title: TRUNC(`📋 计划审批 · ${tag}${dir}/`, PLAN_TITLE_MAX + 12) },
-    sub_title_text: "审阅上方计划后选择:同意开始执行,或让 Claude 继续完善。",
+    sub_title_text: hasPlan
+      ? "审阅上方计划后选择:同意开始执行,或让 Claude 继续完善。"
+      : "完整计划见 CLI。选择:同意开始执行,或继续完善。",
     task_id: reqId,
     button_list: [
       { text: "✏️ 继续改", style: 4, key: encodePlanKey(reqId, "revise") },
@@ -682,6 +861,7 @@ const buildPlanResolvedCard = (
   action: PlanAction,
   cwd: string,
   transcriptTail: string,
+  approver?: string,
 ): TemplateCard => {
   const tail = oneLine(transcriptTail).trim();
   const dir = dirName(cwd);
@@ -689,7 +869,7 @@ const buildPlanResolvedCard = (
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
-    main_title: { title: TRUNC(`📋 计划 · ${dir}/`, PLAN_TITLE_MAX + 12) },
+    main_title: { title: TRUNC(`📋 计划 · ${emojiFor(approver)}${dir}/`, PLAN_TITLE_MAX + 12) },
     task_id: reqId,
     button_list: [{ text: summary, style: 4, key: encodePlanNoopKey(reqId) }],
   };
@@ -705,6 +885,8 @@ interface PlanHandleArgs {
 }
 
 const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flushBeforeCard }: PlanHandleArgs): Promise<ApproveResp> => {
+  // 此分支只服务 Claude 家族 (hook 即时触发, tool_input.plan 带正文)。
+  // codebuddy 的 ExitPlanMode 不过 hook → 见 runMirrorPlanFlow。
   const plan = parsePlanInput(body.tool_input);
   if (!plan) return { decision: "ask", reason: "plan_unparsable" };
 
@@ -721,6 +903,10 @@ const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flu
       toolInput: body.tool_input,
       cwd: body.cwd,
       sessionId: body.session_id,
+      // kind:"generic" keeps this out of the allow_window sweep; chatKey is
+      // carried purely so the click listener can re-render the resolved card
+      // with the same `#tag` emoji the live card showed.
+      chatKey: approver,
       transcriptTail: body.transcript_tail ?? "",
     },
     timeoutMs: longPollMs,
@@ -733,17 +919,19 @@ const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flu
     try { await flushBeforeCard?.(body.session_id, { toolName: "ExitPlanMode", toolInput: body.tool_input }); } catch (e) {
       log.warn({ err: (e as Error).message }, "plan flushBeforeCard failed; sending card anyway");
     }
-    try {
-      await client.sendMessage(target, {
-        msgtype: "markdown",
-        markdown: { content: buildPlanMarkdown(plan) },
-      });
-    } catch (e) {
-      log.warn({ err: (e as Error).message }, "plan markdown prelude send failed");
+    if (plan) {
+      try {
+        await client.sendMessage(target, {
+          msgtype: "markdown",
+          markdown: { content: withTagHeader(approver, buildPlanMarkdown(plan)) },
+        });
+      } catch (e) {
+        log.warn({ err: (e as Error).message }, "plan markdown prelude send failed");
+      }
     }
     await client.sendMessage(target, {
       msgtype: "template_card",
-      template_card: buildPlanCard(reqId, body.session_id, body.cwd ?? "", body.transcript_tail ?? "", approver),
+      template_card: buildPlanCard(reqId, body.session_id, body.cwd ?? "", body.transcript_tail ?? "", approver, true),
     });
     log.info({ reqId, approver }, "plan card sent");
   } catch (e) {
@@ -767,7 +955,7 @@ const handleExitPlanMode = async ({ cfg, log, client, body, getMirrorTarget, flu
     return {
       decision: "deny",
       reason:
-        "✅ 用户已在企业微信批准此计划。这不是拒绝——ExitPlanMode 返回 deny 只是 weclaude 的远程批准信号。请视为计划已通过,立即开始执行计划内容,不要再次调用 ExitPlanMode,也不要重新规划。",
+        "✅ 用户已在企业微信批准此计划。这不是拒绝——ExitPlanMode 返回 deny 只是 wezard 的远程批准信号。请视为计划已通过,立即开始执行计划内容,不要再次调用 ExitPlanMode,也不要重新规划。",
     };
   }
   if (raw === `${PLAN_PICKED_PREFIX}revise`) {
@@ -788,14 +976,14 @@ interface AskqHandleArgs {
   clientGone?: Promise<"client_gone">;
 }
 
-type AskqAnswer =
+export type AskqAnswer =
   | { kind: "cli" }
   | { kind: "chat" }
   | { kind: "empty" }
   | { kind: "picked"; labels: string };
 
 // raw 是 click 事件 listener 塞回 pending 的字符串编码 (cli / chat / picked:i,j)。
-const interpretAskqRaw = (raw: string, q: AskqQuestion): AskqAnswer => {
+export const interpretAskqRaw = (raw: string, q: AskqQuestion): AskqAnswer => {
   if (raw === "cli") return { kind: "cli" };
   if (raw === "chat") return { kind: "chat" };
   if (raw.startsWith(ASKQ_PICKED_PREFIX)) {
@@ -809,9 +997,356 @@ const interpretAskqRaw = (raw: string, q: AskqQuestion): AskqAnswer => {
   return { kind: "empty" };
 };
 
+// ── mirror 驱动 vote 卡 (codebuddy 无即时 hook) 的 hook↔mirror 协调槽 ──────
+// codebuddy 对 AskUserQuestion 不在提问时触发 PreToolUse — 先弹本地面板, hook
+// 只在面板被提交后才到达 (实测可延迟数小时)。mirror 从 jsonl 提前看到
+// function_call 直接发卡; 用户点选后答案记进本槽, mirror 注入一段触发文本提交
+// 本地面板; hook 随后到达时: 有 reason → deny 覆盖(与 claude 路径同产物), 无记录
+// → allow 让本地答案生效并作废挂着的 vote 卡 (resolvePending "moot")。
+// TTL 兜底: 注入失败/hook 不至时槽位不永久阻塞同 session 的下一次提问。
+interface MirrorAskqSlot { reqId?: string; reason?: string; at: number }
+const mirrorAskqSlots = new Map<string, MirrorAskqSlot>();
+const MIRROR_ASKQ_SLOT_TTL_MS = 30 * 60_000;
+const freshSlot = (sessionId: string): MirrorAskqSlot | undefined => {
+  const s = mirrorAskqSlots.get(sessionId);
+  if (!s) return undefined;
+  if (Date.now() - s.at > MIRROR_ASKQ_SLOT_TTL_MS) {
+    mirrorAskqSlots.delete(sessionId);
+    return undefined;
+  }
+  return s;
+};
+export const hasMirrorAskq = (sessionId: string): boolean => freshSlot(sessionId) !== undefined;
+
+// ── 面板按键驱动 (codebuddy 本地面板的确定性提交协议) ──────────────────────
+// 逆向自 codebuddy TUI 的 AskUserQuestion 组件: 每题光标初始 0 (第一个选项),
+// ↑↓/j/k 移动; 单选选项上 Enter = 提交该选项 label 并自动前进下一题; 多选
+// Enter = 切换选中, 须把光标落到 N+1 行 (「下一题」行) 按 Enter 才前进; 自定义
+// 文本在第 N 行。全部题答完进提交页 (光标 0 = "1. Submit answers"), Enter 收工。
+// 序列开头 Up 连发把光标钳到 0, 吸收用户误触造成的漂移。
+export type AskqDriveAction = { kind: "keys"; keys: string[] } | { kind: "text"; text: string };
+
+export const buildAskqDriveActions = (questions: AskqQuestion[], picks: number[][]): AskqDriveAction[] => {
+  const maxOpts = questions.reduce((m, q) => Math.max(m, q.options.length), 0);
+  const acts: AskqDriveAction[] = [{ kind: "keys", keys: Array<string>(maxOpts + 3).fill("Up") }];
+  questions.forEach((q, i) => {
+    const N = q.options.length;
+    const picked = (picks[i] ?? []).filter((n) => Number.isInteger(n) && n >= 0 && n < N).sort((a, b) => a - b);
+    if (!q.multiSelect) {
+      const n = picked[0] ?? 0;
+      acts.push({ kind: "keys", keys: [...Array<string>(n).fill("Down"), "Enter"] });
+      return;
+    }
+    const keys: string[] = [];
+    let cur = 0;
+    for (const n of picked) {
+      keys.push(...Array<string>(n - cur).fill("Down"), "Enter");
+      cur = n;
+    }
+    // 多选的前进行在第 N+1 位 (0..N-1 选项, N 自定义行, N+1 下一题行)。
+    keys.push(...Array<string>(N + 1 - cur).fill("Down"), "Enter");
+    acts.push({ kind: "keys", keys });
+  });
+  // 提交页光标初始 0 = "1. Submit answers"。
+  acts.push({ kind: "keys", keys: ["Enter"] });
+  return acts;
+};
+
+// 「聊聊这个」: 光标钳 0 后落到第 N 行 (自定义文本行), 贴入引导语提交 — 自由文本
+// 答案本身即语义完整 (hook 若触发, deny+reason 会再覆盖成同款文案)。
+export const buildAskqChatDriveActions = (q: AskqQuestion): AskqDriveAction[] => [
+  { kind: "keys", keys: [...Array<string>(q.options.length + 3).fill("Up"), ...Array<string>(q.options.length).fill("Down")] },
+  { kind: "text", text: "先不回答，我想和你讨论一下这个问题" },
+  { kind: "keys", keys: ["Enter"] },
+];
+
+// 多问题: 逐题顺序发卡 → 收答 → 下一题。任一题选「CLI」整体转 CLI,选「聊聊」
+// 整体转讨论; 全部答完合并成单个 deny+reason 注入。卡不会一次性轰炸 N 张。
+interface MirrorAskqFlowArgs {
+  log: Logger;
+  client: WSClient;
+  sessionId: string;
+  /** mirror 附件的 target (可带 #tag) — 卡片/前奏都发到这一聊天。 */
+  chatKey: string;
+  toolInput: unknown;
+  voteTimeoutMs: number;
+  /** 按 buildAskqDriveActions 的序列驱动本地面板 (send-keys / 贴文本)。 */
+  drive: (acts: AskqDriveAction[]) => Promise<{ ok: boolean; reason?: string }>;
+}
+
+export const runMirrorAskqFlow = async ({ log, client, sessionId, chatKey, toolInput, voteTimeoutMs, drive }: MirrorAskqFlowArgs): Promise<void> => {
+  const questions = parseAskqInput(toolInput);
+  if (!questions || questions.length === 0) return;
+  if (questions.some((q) => q.options.length === 0)) return;
+  if (!client.isConnected) return;
+
+  const target = targetChatId(chatKey);
+  const total = questions.length;
+  const answers: string[] = [];
+  const picks: number[][] = [];
+  const flowStart = Date.now();
+  const note = async (content: string): Promise<void> => {
+    try {
+      await client.sendMessage(target, { msgtype: "markdown", markdown: { content: withTagHeader(chatKey, content) } });
+    } catch { /* best-effort */ }
+  };
+
+  for (let i = 0; i < total; i++) {
+    const q = questions[i]!;
+    // 剩余预算: N 题共享一份 voteTimeoutSec, 语义同 hook 流的 longPollSec 分摊。
+    const remainMs = voteTimeoutMs - (Date.now() - flowStart);
+    if (remainMs < 10_000) {
+      mirrorAskqSlots.delete(sessionId);
+      await note("⌛ 问题卡已超时，请在 CLI 中作答。");
+      return;
+    }
+    // meta 形状与 hook 流一致: click listener 用 toolInput(单题 wrapper)/chatKey
+    // 渲染 resolved 卡, 监听侧零改动。
+    const { reqId, promise } = createPending({
+      meta: {
+        kind: "generic",
+        createdAt: Date.now(),
+        toolName: "AskUserQuestion",
+        toolInput: { questions: [q] },
+        sessionId,
+        chatKey,
+        transcriptTail: "",
+      },
+      timeoutMs: remainMs,
+    });
+    mirrorAskqSlots.set(sessionId, { reqId, at: Date.now() });
+
+    const prefix = total > 1 ? `(${i + 1}/${total}) ` : "";
+    try {
+      try {
+        await client.sendMessage(target, {
+          msgtype: "markdown",
+          markdown: { content: withTagHeader(chatKey, buildAskqMarkdown(q, prefix)) },
+        });
+      } catch (e) {
+        log.warn({ err: (e as Error).message }, "mirror askq markdown prelude send failed");
+      }
+      await client.sendMessage(target, {
+        msgtype: "template_card",
+        template_card: buildAskqCard(reqId, q, "", chatKey),
+      });
+      log.info({ reqId, chatKey, idx: i, total }, "mirror askq card sent");
+    } catch (e) {
+      log.error({ err: (e as Error).message }, "mirror askq send failed");
+      resolvePending(reqId, "deny"); // 释放 pending 槽
+      mirrorAskqSlots.delete(sessionId);
+      return;
+    }
+
+    let raw: string;
+    try {
+      raw = (await promise) as unknown as string;
+    } catch {
+      mirrorAskqSlots.delete(sessionId);
+      await note("⌛ 问题卡已超时，请在 CLI 中作答。");
+      return;
+    }
+    // 本地先答, hook 侧作废了这张卡 — 中止整流, 不驱动不覆盖。
+    if (raw === "moot") {
+      log.info({ reqId, sessionId }, "mirror askq mooted by local answer");
+      mirrorAskqSlots.delete(sessionId);
+      return;
+    }
+
+    const ans = interpretAskqRaw(raw, q);
+    // 「去 CLI 处理」/ 空选 → 交还本地面板, 之后 hook 到达走 allow 分支。
+    if (ans.kind === "cli" || ans.kind === "empty") {
+      mirrorAskqSlots.delete(sessionId);
+      return;
+    }
+    if (ans.kind === "chat") {
+      mirrorAskqSlots.set(sessionId, {
+        reason: `Instead of answering "${q.header || q.question}", the user wants to chat about it first. Discuss the question with them before re-asking.`,
+        at: Date.now(),
+      });
+      const r = await drive(buildAskqChatDriveActions(q));
+      if (!r.ok) {
+        log.warn({ sessionId, reason: r.reason }, "mirror askq chat drive failed");
+        await note("⚠️ 已记录，但驱动 CLI 面板失败，请回到 CLI 手动处理。");
+      } else {
+        mirrorAskqSlots.delete(sessionId);
+      }
+      return;
+    }
+    answers.push(`"${q.header || q.question}": ${ans.labels}`);
+    // 按键驱动要的是选项下标, raw 编码 picked:i,j 里直接取 (与 interpret 同源)。
+    picks.push(
+      raw.slice(ASKQ_PICKED_PREFIX.length)
+        .split(",")
+        .map((s) => parseInt(s, 10))
+        .filter((n) => Number.isInteger(n) && n >= 0 && n < q.options.length),
+    );
+  }
+
+  const reason = total === 1
+    ? `User answered ${answers[0]} via WeCom`
+    : `User answered ${total} questions via WeCom — ${answers.join("; ")}`;
+  mirrorAskqSlots.set(sessionId, { reason, at: Date.now() });
+  // 驱动前再确认槽还是自己的: 用户若在收票期间本地答了 (hook 到达会清槽),
+  // 面板已经消失, 按键会落进主输入框 (Down 翻历史 / Enter 误提交) — 必须放弃。
+  if (freshSlot(sessionId)?.reason !== reason) {
+    log.info({ sessionId }, "mirror askq slot lost before drive — local answer won");
+    return;
+  }
+  const acts = buildAskqDriveActions(questions, picks);
+  log.info({ sessionId, acts: acts.length, picks }, "mirror askq drive start");
+  const r = await drive(acts);
+  if (!r.ok) {
+    // 驱动失败: 保留 reason 槽 — 用户手动提交面板时 hook 到达仍以记录答案覆盖。
+    log.warn({ sessionId, reason: r.reason }, "mirror askq drive failed");
+    await note("⚠️ 答案已记录，但驱动 CLI 面板失败，请回到 CLI 手动处理。");
+    return;
+  }
+  log.info({ sessionId }, "mirror askq drive done");
+  // 驱动成功 = 面板已按 WeCom 答案提交, 结果随工具自然落地。清槽放掉后续提问;
+  // hook 若迟到, 无槽 → allow → 本地 (即我们驱动的) 答案原样生效, 语义一致。
+  mirrorAskqSlots.delete(sessionId);
+  // 回执同 hook 流: 答完后 model 进入不可见长 thinking, 先确认答案已落地。
+  await note(total === 1 ? "✅ 已回传，Claude 处理中…" : `✅ ${total} 题已回传，Claude 处理中…`);
+};
+
+// ── mirror 驱动 plan 审批卡 (codebuddy 的 ExitPlanMode 完全不过 hook) ──────
+// 实测 (codebuddy 日志): ExitPlanMode 由 interruption-service 本地对话框直接
+// 裁决, HookExecutor 零调用 — hook 路径对它不存在。mirror 从 jsonl 提前看到
+// function_call → 发计划审批卡; 点选后往活 pane send-keys 直接裁决本地对话框:
+//   ✅ 同意   → Enter  (默认高亮 "1. Yes")
+//   ✏️ 继续改 → Escape (选项 2 标注的快捷键)
+// 本地若先答, function_call_result 落盘 → mirror 调 mootMirrorPlan 作废卡片。
+// 槽位防重: jsonl 重放/tail 重连不会对同一次退出重复发卡。
+interface MirrorPlanSlot { reqId?: string; at: number }
+const mirrorPlanSlots = new Map<string, MirrorPlanSlot>();
+const MIRROR_PLAN_SLOT_TTL_MS = 12 * 3600_000; // 与 approval.longPollSec 对齐
+const freshPlanSlot = (sessionId: string): MirrorPlanSlot | undefined => {
+  const s = mirrorPlanSlots.get(sessionId);
+  if (!s) return undefined;
+  if (Date.now() - s.at > MIRROR_PLAN_SLOT_TTL_MS) {
+    mirrorPlanSlots.delete(sessionId);
+    return undefined;
+  }
+  return s;
+};
+export const hasMirrorPlan = (sessionId: string): boolean => freshPlanSlot(sessionId) !== undefined;
+export const mootMirrorPlan = (sessionId: string): void => {
+  const s = freshPlanSlot(sessionId);
+  if (!s) return;
+  if (s.reqId) resolvePending(s.reqId, "moot" as never);
+  mirrorPlanSlots.delete(sessionId);
+};
+
+interface MirrorPlanFlowArgs {
+  log: Logger;
+  client: WSClient;
+  sessionId: string;
+  /** mirror 附件的 target (可带 #tag) — 卡片/前奏都发到这一聊天。 */
+  chatKey: string;
+  cwd: string;
+  /** 会话 jsonl — 从尾部倒查 ~/.codebuddy/plans/*.md 挖 plan 正文。 */
+  jsonlPath: string;
+  voteTimeoutMs: number;
+  /** 往活 pane 裁决本地对话框: 同意=Enter / 继续改=Escape。 */
+  sendKey: (key: "Enter" | "Escape") => Promise<{ ok: boolean; reason?: string }>;
+}
+
+export const runMirrorPlanFlow = async ({ log, client, sessionId, chatKey, cwd, jsonlPath, voteTimeoutMs, sendKey }: MirrorPlanFlowArgs): Promise<void> => {
+  if (!client.isConnected) return;
+  const target = targetChatId(chatKey);
+  const note = async (content: string): Promise<void> => {
+    try {
+      await client.sendMessage(target, { msgtype: "markdown", markdown: { content: withTagHeader(chatKey, content) } });
+    } catch { /* best-effort */ }
+  };
+
+  const plan = resolvePlanText(undefined, jsonlPath);
+  if (!plan) log.warn({ sessionId }, "mirror plan: plan text not found — card without prelude");
+  const { reqId, promise } = createPending({
+    meta: {
+      kind: "generic",
+      createdAt: Date.now(),
+      toolName: "ExitPlanMode",
+      toolInput: {},
+      cwd,
+      sessionId,
+      chatKey,
+      transcriptTail: "",
+    },
+    timeoutMs: voteTimeoutMs,
+  });
+  mirrorPlanSlots.set(sessionId, { reqId, at: Date.now() });
+
+  try {
+    if (plan) {
+      try {
+        await client.sendMessage(target, {
+          msgtype: "markdown",
+          markdown: { content: withTagHeader(chatKey, buildPlanMarkdown(plan)) },
+        });
+      } catch (e) {
+        log.warn({ err: (e as Error).message }, "mirror plan markdown prelude send failed");
+      }
+    }
+    await client.sendMessage(target, {
+      msgtype: "template_card",
+      template_card: buildPlanCard(reqId, sessionId, cwd, "", chatKey, Boolean(plan)),
+    });
+    log.info({ reqId, chatKey }, "mirror plan card sent");
+  } catch (e) {
+    log.error({ err: (e as Error).message }, "mirror plan send failed");
+    resolvePending(reqId, "deny");
+    mirrorPlanSlots.delete(sessionId);
+    return;
+  }
+
+  let raw: string;
+  try {
+    raw = (await promise) as unknown as string;
+  } catch {
+    mirrorPlanSlots.delete(sessionId);
+    await note("⌛ 计划卡已超时，请在 CLI 中处理。");
+    return;
+  }
+  // 本地先答 (function_call_result 落盘触发的 moot)。
+  if (raw === "moot") {
+    log.info({ reqId, sessionId }, "mirror plan mooted by local answer");
+    mirrorPlanSlots.delete(sessionId);
+    return;
+  }
+
+  const approve = raw === `${PLAN_PICKED_PREFIX}approve`;
+  const r = await sendKey(approve ? "Enter" : "Escape");
+  mirrorPlanSlots.delete(sessionId);
+  if (!r.ok) {
+    log.warn({ sessionId, reason: r.reason }, "mirror plan sendKey failed");
+    await note("⚠️ 已记录选择，但本地对话框按键注入失败，请回到 CLI 手动处理。");
+    return;
+  }
+  log.info({ reqId, sessionId, approve }, "mirror plan resolved via send-keys");
+  await note(approve ? "✅ 已同意，退出 plan mode 开始执行…" : "✏️ 已选择继续完善计划。");
+};
+
 // 多问题: 逐题顺序发卡 → 收答 → 下一题。任一题选「CLI」整体转 CLI,选「聊聊」
 // 整体转讨论; 全部答完合并成单个 deny+reason 注入。卡不会一次性轰炸 N 张。
 const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, flushBeforeCard, clientGone }: AskqHandleArgs): Promise<ApproveResp> => {
+  // ── codebuddy 镜像流去重 ────────────────────────────────────────────────
+  // codebuddy 的 hook 只在本地面板被提交后到达。mirror 早已发过 vote 卡:
+  //   - 槽里有 reason = 面板是被我们的注入提交的 → 用记录的 reason 覆盖, 不再发卡。
+  //   - 无记录 = 用户在本地答的 → allow 让本地答案生效, 并作废挂着的 vote 卡。
+  const slot = freshSlot(body.session_id);
+  if (slot?.reason) {
+    mirrorAskqSlots.delete(body.session_id);
+    log.info({ sessionId: body.session_id }, "askq hook: overriding with mirror-collected answer");
+    return { decision: "deny", reason: slot.reason };
+  }
+  if (body.cli_backend === "codebuddy") {
+    if (slot?.reqId) resolvePending(slot.reqId, "moot" as never);
+    mirrorAskqSlots.delete(body.session_id);
+    return { decision: "allow", reason: "codebuddy_local_panel" };
+  }
+
   const questions = parseAskqInput(body.tool_input);
   if (!questions || questions.length === 0) return { decision: "ask", reason: "askq_unparsable" };
   if (questions.some((q) => q.options.length === 0)) return { decision: "ask", reason: "askq_no_options" };
@@ -848,6 +1383,7 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
         toolInput: { questions: [q] },
         cwd: body.cwd,
         sessionId: body.session_id,
+        chatKey: approver, // 同 plan: 只为 resolved 卡复原 `#tag` emoji, 不参与 sweep
         transcriptTail: body.transcript_tail ?? "",
       },
       timeoutMs: remainMs,
@@ -865,14 +1401,14 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
       try {
         await client.sendMessage(target, {
           msgtype: "markdown",
-          markdown: { content: buildAskqMarkdown(q, prefix) },
+          markdown: { content: withTagHeader(approver, buildAskqMarkdown(q, prefix)) },
         });
       } catch (e) {
         log.warn({ err: (e as Error).message }, "askq markdown prelude send failed");
       }
       await client.sendMessage(target, {
         msgtype: "template_card",
-        template_card: buildAskqCard(reqId, q, body.transcript_tail ?? ""),
+        template_card: buildAskqCard(reqId, q, body.transcript_tail ?? "", approver),
       });
       log.info({ reqId, approver, idx: i, total }, "askq card sent");
     } catch (e) {
@@ -895,7 +1431,7 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
       try {
         await client.sendMessage(target, {
           msgtype: "markdown",
-          markdown: { content: "⚠️ CLI 侧连接已断开，本轮问题卡已失效，请回到 CLI 处理。" },
+          markdown: { content: withTagHeader(approver, "⚠️ CLI 侧连接已断开，本轮问题卡已失效，请回到 CLI 处理。") },
         });
       } catch { /* best-effort */ }
       return { decision: "ask", reason: "askq_client_gone" };
@@ -923,7 +1459,12 @@ const handleAskUserQuestion = async ({ cfg, log, client, body, getMirrorTarget, 
     try {
       await client.sendMessage(target, {
         msgtype: "markdown",
-        markdown: { content: total === 1 ? "✅ 已回传，Claude 处理中…" : `✅ ${total} 题已回传，Claude 处理中…` },
+        markdown: {
+          content: withTagHeader(
+            approver,
+            total === 1 ? "✅ 已回传，Claude 处理中…" : `✅ ${total} 题已回传，Claude 处理中…`,
+          ),
+        },
       });
     } catch (e) {
       log.warn({ err: (e as Error).message }, "askq ack send failed");
@@ -939,18 +1480,33 @@ interface ApproveReq {
   tool_input: unknown;
   cwd?: string;
   transcript_tail?: string;
+  /** hook 侧探测到的 CLI 后端 (pre-tool-use.sh 经 CODEBUDDY_* env 判定)。
+   *  codebuddy 的 AskUserQuestion hook 只在本地面板提交后到达 → 走去重分支。 */
+  cli_backend?: string;
+  /** Hook 侧原样透传。ExitPlanMode 在 codebuddy 下用它从 transcript 倒查
+   *  ~/.codebuddy/plans/*.md 挖 plan 正文 (tool_input 里没有)。 */
+  transcript_path?: string;
+  /** Reload 续接: 上一轮长轮询被 drain 时 daemon 回传的 req_id。带着它重来 =
+   *  「别再发一张卡, 把我重新挂到旧卡的那个 reqId 上」。 */
+  resume_req_id?: string;
 }
 
 interface ApproveResp {
-  decision: "allow" | "deny" | "ask";
+  // "retry" 只发给 hook, 不是 Claude Code 的合法 permissionDecision:
+  // 语义是「daemon 正在重启, 带上 req_id 稍后重来」, hook 自己消化掉。
+  decision: "allow" | "deny" | "ask" | "retry";
   reason?: string;
+  req_id?: string;
 }
 
 const decisionToHook = (d: Decision): "allow" | "deny" => (d === "deny" ? "deny" : "allow");
 
-const fallback = (cfg: Config, reason: string): ApproveResp => ({
-  decision: cfg.approval.fallbackOnError,
-  reason,
+// 必发卡的请求 (危险名单 / askRules / `.claude/**` 守卫) 永不走 fallbackOnError:
+// "allow" — 超时/断线时降级为 ask, 交回本地 CLI 由人来确认, 而不是静默放行一次
+// rm。只判 danger 的话, 用户自己配的 askRules 在 daemon 挂掉时反而失效。
+const fallback = (cfg: Config, reason: string, forceSingle?: unknown): ApproveResp => ({
+  decision: forceSingle && cfg.approval.fallbackOnError === "allow" ? "ask" : cfg.approval.fallbackOnError,
+  reason: forceSingle ? `${reason}:force_single` : reason,
 });
 
 interface ApprovalDeps {
@@ -996,33 +1552,35 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
   const detailUrlFor = (id: string): string =>
     buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
 
-  // 手机端卡片 quote 区实测只渲染前 2~3 行且无展开入口 — 命令超过这个字数时,
-  // 发卡前先推一条完整命令的 markdown 前置消息 (普通气泡可展开, 无渲染截断)。
+  // 手机端卡片 quote 区实测只渲染前 2~3 行 —— 长命令在卡上看不全。默认解法已经
+  // 挪到卡片自身 (引用区可点进详情页 + 右上角「📄 展开完整命令」按需发全文), 所以
+  // fullCommandPreludeChars 默认为 0 = 不自动前置。留着这条路是给两种情况兜底:
+  // 客户端不渲染 action_menu, 或者就是想让全文无条件出现在群里 (设成正数即可)。
   // 用 display(已脱敏)副本, token 类不外泄。仅单成员卡触发 (批量卡逐成员推会刷屏)。
   const PRELUDE_TRIGGER_CHARS = 200;
-  const PRELUDE_CHUNK_CHARS = 1800;
   const sendCommandPrelude = async (batch: ActiveBatch): Promise<void> => {
     const cap = cfg.approval.fullCommandPreludeChars;
     if (cap <= 0 || batch.members.length !== 1) return;
-    if (batch.toolName !== "Bash" && batch.toolName !== "Shell") return;
-    const ti = batch.members[0]!.toolInput as Record<string, unknown> | null;
-    const cmd = ti && typeof ti.command === "string" ? ti.command : "";
+    const cmd = commandOf(batch.toolName, batch.members[0]!.toolInput);
     if (cmd.length <= PRELUDE_TRIGGER_CHARS) return;
     const text = cmd.length > cap ? `${cmd.slice(0, cap)}\n…（已截断，完整命令共 ${cmd.length} 字）` : cmd;
-    const chunks: string[] = [];
-    for (let i = 0; i < text.length; i += PRELUDE_CHUNK_CHARS) chunks.push(text.slice(i, i + PRELUDE_CHUNK_CHARS));
+    const chunks = chunkText(text, FULLCMD_CHUNK_CHARS);
     const target = targetChatId(batch.approver);
     for (let i = 0; i < chunks.length; i++) {
       const head = i === 0
         ? `🔐 待审批完整命令（${cmd.length} 字${chunks.length > 1 ? `，${i + 1}/${chunks.length}` : ""}）：\n`
         : `（${i + 1}/${chunks.length}）\n`;
-      await client.sendMessage(target, { msgtype: "markdown", markdown: { content: head + chunks[i]! } });
+      await client.sendMessage(target, {
+        msgtype: "markdown",
+        markdown: { content: withTagHeader(batch.approver, head + chunks[i]!) },
+      });
     }
   };
 
   const notify = async (approver: string, content: string): Promise<void> => {
     try {
-      await client.sendMessage(targetChatId(approver), { msgtype: "markdown", markdown: { content } });
+      // withTagHeader: 同一 chat 可能并行跑着多个 `#tag` 会话, 裸消息看不出归属。
+      await client.sendMessage(targetChatId(approver), { msgtype: "markdown", markdown: { content: withTagHeader(approver, content) } });
     } catch (e) {
       log.warn({ err: (e as Error).message }, "notify send failed");
     }
@@ -1097,6 +1655,9 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
             chatKey: batch.approver,
             transcriptTail: m.transcriptTail,
             windowMinutes: batch.windowMinutes,
+            danger: batch.danger,
+            sessionName: batch.sessionName,
+            denyReason: batch.denyReason,
             detailUrl: detailUrlFor(m.reqId),
           });
         })();
@@ -1124,6 +1685,10 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         { batchId: batch.batchId, count: batch.members.length, multi: isMulti, approver: batch.approver, tool: batch.toolName },
         "batch flushed",
       );
+      // 只给单卡打「可续接」标: 批量卡的点击要靠内存里的 batchById 才能一次
+      // resolve N 个成员, 那张表撑不过重启 —— 续接了反而会让成员干等一张点了
+      // 没反应的卡。批量成员维持原行为 (drain → fallbackOnError)。
+      if (!isMulti) markCardSent(batch.members[0]!.reqId);
     } catch (e) {
       log.error({ batchId: batch.batchId, err: (e as Error).message }, "batch send failed");
       const err = new Error(`send_card_fail:${(e as Error).message}`);
@@ -1187,17 +1752,28 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         guardActive ? "claude-config guard force card" : "claude-config write detected (no live pane, passing through)",
       );
     }
-    // 必发卡 = askRules 命中 或 守卫生效。两者都要压过放行/窗口/缓存三条捷径。
-    const mustCard = Boolean(askHit) || guardActive;
+    // 危险名单 (daemon/danger.ts): 内置的 rm / 强推 / DROP / 敏感路径等。语义上
+    // 是「出厂自带的 askRules」—— 所以它必须和用户写的 askRules 站在同一层, 排在
+    // allowRules 之前。放在后面的话, 一条 `Bash(git *)` 这样的宽 allow 规则 (尤其
+    // 是从 Claude settings.json 批量导入来的) 就能让整份危险名单失效。
+    const danger: DangerHit | undefined = dangerOf(cfg, toolName, toolInput);
+    if (danger) log.info({ toolName, sessionId, rule: danger.rule }, "danger hit — forcing single approval");
+
+    // 必发卡 = 危险名单 或 askRules 命中 或 守卫生效。三者都要压过放行/窗口/缓存。
+    const mustCard = Boolean(danger) || Boolean(askHit) || guardActive;
 
     // allowRules: matcher 拦下的工具里再挖细粒度豁免 (Bash 可按命令前缀区分)。
-    // 交互卡工具 (AskUserQuestion 等) 在 ruleAllows 内部硬保护, 规则写了也不放行。
-    const ruleHit = mustCard ? undefined : ruleAllows(cfg.approval.allowRules, toolName, toolInput);
-    if (ruleHit) {
+    // 交互卡工具 (AskUserQuestion 等) 在引擎内部硬保护, 规则写了也不放行。
+    // 用 evaluateAllow 而非 ruleAllows: 未命中时要把"因为哪一段"带到卡上,
+    // 光知道"没放行"帮不了用户判断。判定本身零额外开销 (原本就要跑这一次)。
+    const verdict = evaluateAllow(cfg.approval.allowRules, toolName, toolInput);
+    if (!mustCard && verdict.allowed) {
+      const ruleHit = [...new Set(verdict.hits)].join(" + ");
       log.info({ toolName, sessionId, rule: ruleHit }, "allow-rule skip");
       json(res, 200, { decision: "allow", reason: `allow_rule:${ruleHit}` } satisfies ApproveResp);
       return;
     }
+    const denyReason = verdict.allowed ? undefined : verdict.reason;
 
     // EnterPlanMode: block model-initiated plan mode. deny + reason 回传 model,
     // 让它别进 plan mode、直接干活。用户仍可在本地 Shift+Tab 手动进 plan mode
@@ -1233,6 +1809,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
           tool_input: toolInput,
           cwd,
           transcript_tail: transcriptTail,
+          cli_backend: body.cli_backend,
         },
       });
       json(res, 200, resp satisfies ApproveResp);
@@ -1253,6 +1830,8 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
           tool_input: toolInput,
           cwd,
           transcript_tail: transcriptTail,
+          cli_backend: body.cli_backend,
+          transcript_path: body.transcript_path,
         },
       });
       json(res, 200, resp satisfies ApproveResp);
@@ -1264,8 +1843,18 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     // 检查跳过 (window 需要一个 chat 才存在), 走后面的 no_approver fallback。
     const approver = resolveApprover(cfg, sessionId, getMirrorTarget);
 
+    // danger.skip / danger 模式的早退。第三个参数是「除 danger 外还有没有别的必发卡
+    // 理由」—— askRules 与 `.claude/**` 守卫不能被 danger 的开关顺带关掉, 判定与
+    // 理由见 dangerEarlyExit 的注释 (守卫被绕过会让 pane 死锁)。
+    const earlyExit = dangerEarlyExit(cfg, danger, Boolean(askHit) || guardActive);
+    if (earlyExit) {
+      log.info({ toolName, sessionId, reason: earlyExit }, "danger switch early exit");
+      json(res, 200, { decision: "allow", reason: earlyExit } satisfies ApproveResp);
+      return;
+    }
+
     // Auto-approve window: while active for THIS chat, requests short-circuit to allow.
-    // askRules 命中 / 守卫生效的请求不吃窗口 — 危险前缀即使开着 ⏱ 也逐条确认。
+    // mustCard (危险名单 / askRules / `.claude/**` 守卫) 的请求不吃窗口 — 即使开着 ⏱ 也逐条确认。
     if (!mustCard && approver && isAutoWindowActive(approver)) {
       const remainSec = Math.ceil(autoWindowRemainingMs(approver) / 1000);
       log.info({ toolName, sessionId, chatKey: approver, remainSec }, "auto-window allow");
@@ -1276,7 +1865,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
       return;
     }
 
-    // Session cache (askRules 命中 / 守卫生效的请求同样不吃缓存)
+    // Session cache (mustCard 的请求同样不吃缓存)
     const ck = cacheKey(sessionId, toolName, toolInput);
     const cached = mustCard ? undefined : cacheGet(ck);
     if (cached) {
@@ -1290,12 +1879,12 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
 
     if (!approver) {
       log.warn("no approver configured");
-      json(res, 200, fallback(cfg, "no_approver") satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "no_approver", mustCard) satisfies ApproveResp);
       return;
     }
     if (!client.isConnected) {
       log.warn("ws not connected");
-      json(res, 200, fallback(cfg, "ws_disconnected") satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "ws_disconnected", mustCard) satisfies ApproveResp);
       return;
     }
 
@@ -1310,6 +1899,12 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     })();
 
     const longPollMs = cfg.approval.longPollSec * 1000;
+    // 卡片标题上的会话身份 — 发卡前算一次, 存进 meta 供 resolved 卡复用
+    // (#tag 直接取; 否则读 transcript 首条用户消息, 带缓存)。
+    const sessionName = sessionNameFor(approver, body.transcript_path, sessionId);
+    // Reload 续接: hook 带着上一轮的 req_id 回来, 复用同一个 id 重新挂起 ——
+    // WeCom 上那张卡的按钮编的就是它, 于是旧卡的点击照样能 resolve 这次长轮询。
+    const resumeId = (body.resume_req_id ?? "").trim();
     const { reqId, promise } = createPending({
       meta: {
         kind: "approval",
@@ -1320,8 +1915,14 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         sessionId,
         chatKey: approver,
         transcriptTail,
+        danger: danger?.rule,
+        sessionName,
+        denyReason,
+        cardSent: Boolean(resumeId), // 续接的前提就是卡已经在群里
+        forceSingle: mustCard,
       },
       timeoutMs: longPollMs,
+      reqId: resumeId || undefined,
     });
 
     recordApproval({
@@ -1336,10 +1937,15 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     // Batch coalesce: 同 session 同 tool 的并发请求合流为一张卡。窗口内首位
     // 创建 batch + 计时器, 后续到达者只追加成员, 不发卡。flush 时依据成员数
     // 选择普通 buildCard 或 buildBatchCard。0 = 关闭聚合, 立即 flush。
+    // 续接的请求不再进 batch: 卡已经在群里, 重发就是重复轰炸。
     const member: BatchMember = { reqId, toolInput: display, originalToolInput: toolInput, toolInputStr, cwd, transcriptTail };
     const bk = batchKeyOf(sessionId, toolName);
-    const existing = activeBatches.get(bk);
-    if (existing && !existing.flushed) {
+    // 必发卡请求既不 join 也不被 join — 一次这样的操作 = 一张卡 = 一次点击。
+    // 合流会把它塞进带「⏱全过 / ✅总是」的批量卡, 一次点击就连它一起放行了。
+    const existing = mustCard ? undefined : activeBatches.get(bk);
+    if (resumeId) {
+      // no-op: 直接进下面的长轮询, 等旧卡上的点击。
+    } else if (existing && !existing.flushed) {
       existing.members.push(member);
       log.info({ batchId: existing.batchId, count: existing.members.length, reqId }, "batch joined");
     } else {
@@ -1349,14 +1955,17 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         toolName,
         approver,
         windowMinutes: cfg.approval.windowMinutes,
+        danger: danger?.rule,
+        sessionName,
+        denyReason,
         members: [member],
         flushed: false,
         flushTimer: undefined as unknown as NodeJS.Timeout, // set below
       };
-      const coalesceMs = cfg.approval.batchCoalesceMs;
+      const coalesceMs = mustCard ? 0 : cfg.approval.batchCoalesceMs;
       const fire = (): void => void flushBatch(batch);
       batch.flushTimer = coalesceMs > 0 ? setTimeout(fire, coalesceMs) : setImmediate(fire) as unknown as NodeJS.Timeout;
-      activeBatches.set(bk, batch);
+      if (!mustCard) activeBatches.set(bk, batch);
       batchById.set(batch.batchId, batch);
       evictBatches();
       log.info({ batchId: batch.batchId, reqId, coalesceMs }, "batch opened");
@@ -1367,12 +1976,21 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     try {
       decision = await promise;
     } catch (e) {
+      // Reload drain: 卡还挂在 WeCom 上, 让 hook 带着同一个 reqId 等 daemon 回来
+      // 重新长轮询 —— 而不是 fallback 成 ask 把权限框弹回本地 CLI。
+      if (isReloadError(e)) {
+        log.info({ reqId, toolName, sessionId }, "approval parked for reload — telling hook to resume");
+        json(res, 200, { decision: "retry", reason: "daemon_reloading", req_id: reqId } satisfies ApproveResp);
+        return;
+      }
       log.warn({ err: (e as Error).message, reqId }, "approval timed out");
-      json(res, 200, fallback(cfg, "approver_timeout") satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "approver_timeout", mustCard) satisfies ApproveResp);
       return;
     }
 
-    if (decision === "allow_session" && cfg.approval.sessionCacheMinutes > 0) {
+    // 必发卡的决策一律不留痕: 不写 session cache、不开自动窗口 (卡上本就没这两个
+    // 按钮, 这里是防御性兜底 —— 决策也可能来自 sweep / 旧卡)。
+    if (!mustCard && decision === "allow_session" && cfg.approval.sessionCacheMinutes > 0) {
       cachePut(ck, decision, cfg.approval.sessionCacheMinutes * 60_000);
     }
     // 「✅ 总是」: 由本次调用生成规则, 热生效 + 写回 config.jsonc (对齐 Claude
@@ -1381,25 +1999,35 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     if (decision === "allow_always") {
       // 命中 askRules 的调用: allow 规则永远会被 ask 压过, 存了也是死规则 —
       // 提示用户真实的生效路径, 而不是静默写入一条不生效的配置。
-      const askBlocked = ruleMatchesAny(cfg.approval.askRules, toolName, toolInput);
+      // (askHit 在本次请求入口已算过, 同参数同结果, 不重复调用 ruleMatchesAny。)
+      const askBlocked = askHit;
       if (askBlocked) {
-        try {
-          await client.sendMessage(targetChatId(approver), {
-            msgtype: "markdown",
-            markdown: { content: `⚠️ 该命令命中强制审批规则 \`${askBlocked}\`（askRules 优先于放行规则），「总是」不会生效，本次已放行。如确要永久放行，需从 config.jsonc 的 askRules 移除该规则。` },
-          });
-        } catch { /* best-effort */ }
+        await notify(
+          approver,
+          `⚠️ 该命令命中强制审批规则 \`${askBlocked}\`（askRules 优先于放行规则），「总是」不会生效，本次已放行。如确要永久放行，需从 config.jsonc 的 askRules 移除该规则。`,
+        );
+      }
+      // 命中危险名单的调用同理: danger 与 askRules 同层, allow 规则压不过它。
+      // 危险卡上本就没有「总是」按钮, 这里是防御性兜底 (决策可能来自 sweep / 旧卡)。
+      if (!askBlocked && danger) {
+        await notify(
+          approver,
+          `⚠️ 该操作命中危险名单「${danger.rule}」，不支持「总是」：这类操作每次都要单独确认。`
+            + `本次已放行。如确要长期免审，请在 config.jsonc 的 \`approval.danger.allowPatterns\` 里加豁免正则。`,
+        );
       }
       // 守卫生效的调用同理: 规则存了也永远被守卫压过 (且放行它就等于放回死锁),
       // 只做一次性放行并说明为什么「总是」在这里不成立。
-      if (!askBlocked && guardActive) {
+      if (!askBlocked && !danger && guardActive) {
         await notify(
           approver,
           `⚠️ \`.claude/**\` 写操作不支持「总是」：这类改动会触发 CLI 原生确认框，`
             + `而那个框只有在你点过卡之后才能被代按 —— 免审就等于回到静默死锁。本次已放行。`,
         );
       }
-      const gen = askBlocked || guardActive ? [] : alwaysAllowRulesFor(toolName, toolInput, cfg.approval.allowRules);
+      const gen = askBlocked || danger || guardActive
+        ? []
+        : alwaysAllowRulesFor(toolName, toolInput, cfg.approval.allowRules);
       const added = gen.filter((r) => !cfg.approval.allowRules.includes(r));
       if (added.length > 0) {
         cfg.approval.allowRules.push(...added); // 同步热生效; 文件写入失败也不回滚
@@ -1411,15 +2039,8 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
           }
         }
         log.info({ toolName, added, persisted: Boolean(sourcePath) }, "allow_always rules saved");
-        try {
-          await client.sendMessage(targetChatId(approver), {
-            msgtype: "markdown",
-            markdown: { content: `📌 已保存永久放行规则：${added.map((r) => `\`${r}\``).join("、")}` },
-          });
-        } catch (e) {
-          log.warn({ err: (e as Error).message }, "allow_always notice send failed");
-        }
-      } else if (!askBlocked && !guardActive && gen.length === 0) {
+        await notify(approver, `📌 已保存永久放行规则：${added.map((r) => `\`${r}\``).join("、")}`);
+      } else if (!askBlocked && !danger && !guardActive && gen.length === 0) {
         // 生成不了可靠字面规则 — 本次一次性放行并告知。成因有四种, 文案必须指对
         // 排查方向: 曾把 `ls … 2>&1 | head` 的分段失败笼统报成"引号/结构"问题,
         // 用户照着查引号自然查不出东西 (真凶是 fd 重定向的 & 被当成后台执行符)。
@@ -1433,15 +2054,10 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
             : splitSegments(cmdStr) === undefined
               ? "该命令含未闭合引号或后台执行符 `&`，无法安全分段"
               : "该命令的结构提炼不出可靠前缀（异形段首、或解释器头部拿不到子命令）";
-        try {
-          await client.sendMessage(targetChatId(approver), {
-            msgtype: "markdown",
-            markdown: { content: `📌 ${why}，本次已一次性放行（未保存规则）。` },
-          });
-        } catch { /* best-effort */ }
+        await notify(approver, `📌 ${why}，本次已一次性放行（未保存规则）。`);
       }
     }
-    if (decision === "allow_window" && cfg.approval.windowMinutes > 0) {
+    if (!danger && decision === "allow_window" && cfg.approval.windowMinutes > 0) {
       setAutoWindow(approver, cfg.approval.windowMinutes * 60_000, {
         toolName,
         toolInput: display,
@@ -1462,7 +2078,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
           const summary = tools.length > 0 ? tools.join(" / ") : `${swept.length} 个`;
           await client.sendMessage(targetChatId(approver), {
             msgtype: "markdown",
-            markdown: { content: `⚡ 已批量自动放行其他 ${swept.length} 个并发请求：${summary}` },
+            markdown: { content: withTagHeader(approver, `⚡ 已批量自动放行其他 ${swept.length} 个并发请求：${summary}`) },
           });
         } catch (e) {
           log.warn({ err: (e as Error).message }, "sweep notice send failed");
@@ -1526,6 +2142,48 @@ export const installApprovalEventListener = (
       // Update 时 task_id 必须跟回调里的一致，否则微信会拒掉更新。
       const cbTaskId = ev?.template_card_event?.task_id ?? ev?.task_id ?? "";
 
+      // ── action_menu「📄 展开完整命令」: 纯展示, 不改判决、不 resolve pending。
+      // 取 detail store 而不是 pending —— 用户很可能是点完 ✅ 之后回头想看全文,
+      // 那时 pending 早被删了; detail 记录留存 24h, 且卡片解决后依然可点。
+      if (key.startsWith(FULLCMD_PREFIX)) {
+        const reqId = key.slice(FULLCMD_PREFIX.length);
+        const rec = getDetail(reqId);
+        // 回复目标: 待决时在 pending 里, 已决时 pending 已删 —— 回落到 resolved
+        // 暂存。两个都没有才用 defaultChat (`#tag` 会话会因此回到主会话, 不理想,
+        // 但那已经是记录过期的边缘情形)。
+        const target =
+          getPending(reqId)?.chatKey
+          ?? getResolvedSnapshot(reqId)?.meta.chatKey
+          ?? cfg.defaultChat;
+        const cmd = rec && rec.kind === "approval" ? commandOf(rec.toolName, rec.toolInput) : "";
+        // 只能走主动 markdown 分块 (≤1800 字单条)。曾试过对点击事件做 stream 被动
+        // 回复 (单条 20480 字节) —— 企微服务端拒绝: errcode=846605 invalid req_id,
+        // 卡片事件的 req_id 仅可用于 updateTemplateCard, 不进被动回复通道。
+        void (async () => {
+          try {
+            if (!cmd) {
+              await client.sendMessage(targetChatId(target), {
+                msgtype: "markdown",
+                markdown: { content: withTagHeader(target, "⌛ 该命令的详情已过期（记录只保留 24 小时），无法展开。") },
+              });
+              return;
+            }
+            for (const [i, chunk] of chunkText(cmd, FULLCMD_CHUNK_CHARS).entries()) {
+              const n = Math.ceil(cmd.length / FULLCMD_CHUNK_CHARS);
+              const head = n > 1 ? `📄 完整命令（${cmd.length} 字，${i + 1}/${n}）：\n` : `📄 完整命令（${cmd.length} 字）：\n`;
+              await client.sendMessage(targetChatId(target), {
+                msgtype: "markdown",
+                markdown: { content: withTagHeader(target, head + chunk) },
+              });
+            }
+            log.info({ reqId, len: cmd.length, target }, "full command expanded on demand");
+          } catch (e) {
+            log.warn({ err: (e as Error).message, reqId }, "full command expand failed");
+          }
+        })();
+        return;
+      }
+
       // ── AskUserQuestion 投票卡: 在普通 approval 解码前先匹配 ASKQ| 前缀。
       const askq = decodeAskqKey(key);
       if (askq) {
@@ -1562,6 +2220,8 @@ export const installApprovalEventListener = (
             ? "chat"
             : `${ASKQ_PICKED_PREFIX}${numericIdxs.join(",")}`;
         const ok = resolvePending(askq.reqId, resolved as never);
+        // 留 resolved 快照: 重复点击已决卡时据此跳过"已失效"重绘 (卡已是终态)。
+        if (ok && meta) stashResolved(askq.reqId, meta, resolved as never);
         log.info({ reqId: askq.reqId, outcome, ok }, "askq event resolved");
         if (q) {
           try {
@@ -1572,10 +2232,26 @@ export const installApprovalEventListener = (
                 q,
                 outcome,
                 meta?.transcriptTail ?? "",
+                meta?.chatKey,
               ),
             );
           } catch (e) {
             log.warn({ err: (e as Error).message, reqId: askq.reqId }, "askq updateTemplateCard failed");
+          }
+        } else if (!ok && !getResolvedSnapshot(askq.reqId)) {
+          // 死卡点击 (超时 / 本地先答已作废 / daemon 重启丢 pending): 给终态反馈,
+          // 别让用户对着无反应的卡干瞪眼。有 resolved 快照 = 已决卡的重复点击,
+          // 卡片已是终态, 不重绘。
+          try {
+            await client.updateTemplateCard(frame, {
+              card_type: "button_interaction",
+              main_title: { title: "🤔 问题卡已失效" },
+              sub_title_text: "该卡已超时或已在别处处理，请以最新上下文为准。",
+              task_id: cbTaskId || askq.reqId,
+              button_list: [{ text: "⌛ 已失效", style: 4, key: encodeAskqNoopKey(askq.reqId) }],
+            } as TemplateCard);
+          } catch (e) {
+            log.warn({ err: (e as Error).message, reqId: askq.reqId }, "askq stale-card update failed");
           }
         }
         return;
@@ -1595,6 +2271,7 @@ export const installApprovalEventListener = (
               planClick.action,
               meta?.cwd ?? "",
               meta?.transcriptTail ?? "",
+              meta?.chatKey,
             ),
           );
         } catch (e) {
@@ -1752,6 +2429,8 @@ export const installApprovalEventListener = (
               chatKey: meta?.chatKey ?? "",
               transcriptTail: meta?.transcriptTail ?? "",
               windowMinutes: cfg.approval.windowMinutes,
+              sessionName: meta?.sessionName,
+              denyReason: meta?.denyReason,
               detailUrl: detailUrlFor(reqId),
             })
           : buildResolvedCard({
@@ -1767,6 +2446,9 @@ export const installApprovalEventListener = (
               by,
               sessionId: meta?.sessionId ?? "",
               chatKey: meta?.chatKey ?? "",
+              danger: meta?.danger,
+              sessionName: meta?.sessionName,
+              denyReason: meta?.denyReason,
               detailUrl: detailUrlFor(reqId),
             });
         await client.updateTemplateCard(frame, card);

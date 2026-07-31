@@ -1,7 +1,7 @@
 // Session-scoped token/cost audit. Reads the session's main jsonl plus any
 // subagent transcripts under `<projectDir>/<sid>/subagents/agent-*.jsonl` and
 // produces a markdown table grouped by (bucket, model). Used by:
-//   - `weclaude audit` CLI (cli/audit.ts) — invoked by the /audit slash command
+//   - `wezard audit` CLI (cli/audit.ts) — invoked by the /audit slash command
 //   - inbound intercept (daemon/inbound.ts) — when a WeCom user sends `/audit`
 //     directly, we bypass the Claude REPL entirely (tmux paste of /audit was
 //     unreliable) and reply with the report immediately.

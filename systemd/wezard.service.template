@@ -1,5 +1,5 @@
 [Unit]
-Description=weclaude daemon (WeCom remote control for Claude Code)
+Description=wezard daemon (WeCom remote control for Claude Code)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,8 +9,8 @@ WorkingDirectory=__REPO__
 ExecStart=__NODE__ __REPO__/dist/daemon/index.js
 Restart=always
 RestartSec=5
-StandardOutput=append:__HOME__/.weclaude/daemon.stdout.log
-StandardError=append:__HOME__/.weclaude/daemon.stderr.log
+StandardOutput=append:__HOME__/.wezard/daemon.stdout.log
+StandardError=append:__HOME__/.wezard/daemon.stderr.log
 Environment=NODE_ENV=production
 
 [Install]

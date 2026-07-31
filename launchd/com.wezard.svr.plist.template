@@ -1,16 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Generated template — `scripts/install-launchd.sh` materializes the
-     real plist into ~/Library/LaunchAgents with absolute paths. -->
+<!-- Detail relay. `scripts/install.sh svr` materializes the real plist into
+     ~/Library/LaunchAgents with absolute paths. host/port come from
+     ~/.wezard/config.jsonc (svr.*) — no CLI args here. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.weclaude.daemon</string>
+    <string>com.wezard.svr</string>
 
     <key>ProgramArguments</key>
     <array>
         <string>__NODE__</string>
-        <string>__REPO__/dist/daemon/index.js</string>
+        <string>__REPO__/dist/svr/index.js</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -38,8 +39,8 @@
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>__HOME__/.weclaude/daemon.stdout.log</string>
+    <string>__HOME__/.wezard/svr.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>__HOME__/.weclaude/daemon.stderr.log</string>
+    <string>__HOME__/.wezard/svr.stderr.log</string>
 </dict>
 </plist>

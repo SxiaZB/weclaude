@@ -5,8 +5,9 @@ dist
 .env
 .env.*
 !.env.example
-~/.weclaude/
+~/.wezard/
 config.local.jsonc
 secrets.json
 .npmrc
 docs/
+.plugins-cache.json

@@ -7,7 +7,7 @@ import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import { expandHome } from "../shared/paths.js";
 import type { DaemonWs } from "./ws.js";
-import { listPending } from "./pending.js";
+import { drainForReload, listPending } from "./pending.js";
 
 interface Ctx {
   cfg: Config;
@@ -57,8 +57,12 @@ const routes: Record<string, Handler> = {
   "POST /shutdown": async (_req, res, _url, { ws, log }) => {
     json(res, 200, { ok: true });
     log.info("shutdown via HTTP");
+    // 先了结长轮询再退: 硬杀 socket 会让 hook 走 fallback (本地弹权限框),
+    // drain 则把「稍后带 req_id 重来」告诉 hook, 卡片不失效。
+    log.info(drainForReload(), "pending drained for reload");
     await ws.shutdown();
-    setTimeout(() => process.exit(0), 100);
+    // 200ms 给 drain 的 reject 回调把各自的 HTTP 响应刷出去。
+    setTimeout(() => process.exit(0), 200);
   },
   // /approve and /message are wired by callers later (approval, slash).
 };

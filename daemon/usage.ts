@@ -63,6 +63,7 @@ export interface BlockUsage {
 const PROJECT_ROOTS = [
   join(homedir(), ".claude-internal", "projects"),
   join(homedir(), ".claude", "projects"),
+  join(homedir(), ".codebuddy", "projects"),
 ];
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -70,7 +71,7 @@ const BLOCK_MS = 5 * HOUR_MS;
 const DAY_MS = 24 * HOUR_MS;
 
 // Rough per-model pricing (USD per 1M tokens). Kept intentionally small — only
-// covers the models likely to show up on weclaude users' machines. Unknown
+// covers the models likely to show up on wezard users' machines. Unknown
 // models fall back to 0 (token counts still shown, just no cost line).
 // Prices derived from ccusage's LiteLLM pricing at time of writing (Opus 4.7,
 // Sonnet 4.6, Haiku 4.5). Drift over time is expected — accuracy here matters
@@ -124,8 +125,37 @@ const walkJsonl = (root: string, sinceMs: number, out: string[]): void => {
   }
 };
 
+// CodeBuddy usage lives on `type:"function_call"` rows (each row = one real
+// API request), under `providerData.usage` with OpenAI-Responses-API camelCase
+// (inputTokens / outputTokens / inputTokensDetails[0].cached_tokens). No
+// separate cache_creation concept — the gateway reports total-cached only.
+// Returns null when the row lacks a usable usage blob.
+const extractCodebuddyTokens = (
+  u: Record<string, unknown>,
+  model: string,
+): ModelTotals | null => {
+  const rawIn = Number(u.inputTokens ?? 0);
+  const output = Number(u.outputTokens ?? 0);
+  const details = Array.isArray(u.inputTokensDetails) ? u.inputTokensDetails : [];
+  const cached = details.reduce((sum: number, d: unknown) => {
+    const c = (d as { cached_tokens?: unknown })?.cached_tokens;
+    return sum + Number(c ?? 0);
+  }, 0);
+  // rawIn is the full inbound (fresh + cached). Treat cached as cache_read
+  // and back-derive fresh input to keep the same accounting as extractTokens.
+  const cacheRead = cached;
+  const input = rawIn >= cacheRead ? rawIn - cacheRead : rawIn;
+  if (input + output + cacheRead === 0) return null;
+  void model;
+  return { input, output, cacheCreate: 0, cacheRead };
+};
+
 // Parse a jsonl file and yield assistant usage entries with ts >= sinceMs.
 // Skips synthetic error messages (model=<synthetic>) and rows without usage.
+// Sniffs the schema by top-level type: Claude Code writes `type:"assistant"`
+// with `message.usage`; CodeBuddy writes `type:"function_call"` with
+// `providerData.usage`. Both formats can appear in the same PROJECT_ROOTS
+// sweep, so per-line dispatch is safer than per-file.
 const readUsageEntries = (path: string, sinceMs: number): UsageEntry[] => {
   let raw: string;
   try {
@@ -144,27 +174,46 @@ const readUsageEntries = (path: string, sinceMs: number): UsageEntry[] => {
     } catch {
       continue;
     }
-    if (row.type !== "assistant") continue;
     const ts = Date.parse(String(row.timestamp ?? ""));
     if (!Number.isFinite(ts) || ts < sinceMs) continue;
-    const msg = (row.message ?? {}) as Record<string, unknown>;
-    const model = String(msg.model ?? "");
-    if (!model || model === "<synthetic>") continue;
-    const u = (msg.usage ?? {}) as Record<string, unknown>;
-    // CodeBuddy (claude-internal) 网关把 input_tokens 报成 cr+cw+fresh 的合计,
-    // 与 Anthropic 官方口径 (input_tokens 仅含 fresh, 与 cache_* 互不相交) 冲突。
-    // extractTokens 按模型名点号版本判定, 只对 CodeBuddy 反推, 不影响原生会话。
-    const tokens = extractTokens(u, model);
-    if (!tokens) continue;
-    // Dedup: `--resume` copies the parent transcript into the new session's
-    // jsonl, so every historical message would otherwise count many times.
-    // ccusage keys on `message.id + requestId`; we do the same. Fall back to
-    // `uuid` for older rows that lack message.id.
-    const msgId = String(msg.id ?? "");
-    const reqId = String(row.requestId ?? "");
-    const dedupKey = msgId ? `${msgId}|${reqId}` : String(row.uuid ?? "");
-    if (!dedupKey) continue;
-    out.push({ ts, model, tokens, dedupKey });
+
+    if (row.type === "assistant") {
+      const msg = (row.message ?? {}) as Record<string, unknown>;
+      const model = String(msg.model ?? "");
+      if (!model || model === "<synthetic>") continue;
+      const u = (msg.usage ?? {}) as Record<string, unknown>;
+      // CodeBuddy (claude-internal) 网关把 input_tokens 报成 cr+cw+fresh 的合计,
+      // 与 Anthropic 官方口径 (input_tokens 仅含 fresh, 与 cache_* 互不相交) 冲突。
+      // extractTokens 按模型名点号版本判定, 只对 CodeBuddy 反推, 不影响原生会话。
+      const tokens = extractTokens(u, model);
+      if (!tokens) continue;
+      // Dedup: `--resume` copies the parent transcript into the new session's
+      // jsonl, so every historical message would otherwise count many times.
+      // ccusage keys on `message.id + requestId`; we do the same. Fall back to
+      // `uuid` for older rows that lack message.id.
+      const msgId = String(msg.id ?? "");
+      const reqId = String(row.requestId ?? "");
+      const dedupKey = msgId ? `${msgId}|${reqId}` : String(row.uuid ?? "");
+      if (!dedupKey) continue;
+      out.push({ ts, model, tokens, dedupKey });
+      continue;
+    }
+
+    if (row.type === "function_call") {
+      const pd = (row.providerData ?? {}) as Record<string, unknown>;
+      const model = String(pd.model ?? "");
+      if (!model || model === "<synthetic>") continue;
+      const u = (pd.usage ?? {}) as Record<string, unknown>;
+      const tokens = extractCodebuddyTokens(u, model);
+      if (!tokens) continue;
+      // Dedup: CodeBuddy `callId` is unique per API request (a single
+      // conversation turn can spawn many with the same host `id`, so `id`
+      // alone would collapse them into one).
+      const dedupKey = String(row.callId ?? row.id ?? "");
+      if (!dedupKey) continue;
+      out.push({ ts, model, tokens, dedupKey });
+      continue;
+    }
   }
   return out;
 };
@@ -314,7 +363,7 @@ const fmtLocalDate = (ts: number): string => {
 };
 
 export const renderUsageReport = (r: UsageReport): string => {
-  const out: string[] = ["[weclaude] 📊 Usage 概览"];
+  const out: string[] = ["[wezard] 📊 Usage 概览"];
 
   if (r.active) {
     const b = r.active;
