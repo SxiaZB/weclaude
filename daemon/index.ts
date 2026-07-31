@@ -429,6 +429,54 @@ const main = async (): Promise<void> => {
       json(res, 200, { ok: true, target, idle: r.idle, reason: r.reason, lastText: m.lastText(target) });
     });
 
+    // POST /handoff — 交接一个 pane 的会话给一个全新会话,原地完成。先让目标
+    // 会话把当前工作压成一份"零上下文也能接手"的交接简报,等它写完并抓取,
+    // 再向同一 pane 注入 `/clear`(原地重开 session、重置上下文窗口、cwd 不变),
+    // settle 后把简报作为新会话的首条消息贴进去。全程只操控 tmux。拒绝对调用方
+    // 自身 pane 操作(会 deadlock,同 /peers/send)。
+    http.register("POST /handoff", async (req, res) => {
+      const { self, body } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
+      const pane = ((body as { pane?: string }).pane ?? "").trim();
+      const target = pane ? m.targetForPane(pane) : peerTarget(self, body.tag ?? "");
+      if (!target) { json(res, 404, { ok: false, reason: pane ? `no mirror session bound to pane ${pane}` : "cannot resolve target session" }); return; }
+      // 注入到自己的 pane = 往正在生成的输入框里打字,Claude Code 会把它排队,
+      // 调用方等自己等成死锁(同 /peers/send)。
+      if (target === self) { json(res, 400, { ok: false, reason: "refusing to hand off the calling session itself (would deadlock)" }); return; }
+      const focus = ((body as { focus?: string }).focus ?? "").toString().trim();
+      const timeoutMs = Math.min(Math.max(Number((body as { timeoutSec?: number }).timeoutSec ?? 600) || 600, 30), 7200) * 1000;
+
+      const briefPrompt = [
+        "把你当前会话的全部工作压缩成一份**交接简报**,目标是让一个零上下文的全新会话仅凭这份简报就能无缝接手。必须自洽、具体、可执行,涵盖:",
+        "1. 总目标 / 用户到底想要什么",
+        "2. 已完成的事、关键决策与其理由",
+        "3. 当前状态:改到哪了、什么能跑、什么还没跑通",
+        "4. 下一步该做什么(有序)",
+        "5. 涉及的关键文件/路径/符号,以及非显而易见的坑",
+        focus ? `特别强调:${focus}` : "",
+        "只输出这份简报本身,不要寒暄、不要反问。",
+      ].filter(Boolean).join("\n");
+
+      const inj1 = await m.injectText(target, briefPrompt);
+      if (!inj1.ok) { json(res, 502, { ok: false, target, reason: `summary inject failed: ${inj1.reason}` }); return; }
+      const idle = await waitForIdle(target, m.isBusy, timeoutMs, () => false);
+      const brief = m.lastText(target);
+      // 没等到 idle 就不能 /clear —— 那会丢掉这次还在生成的交接总结。
+      if (!idle.idle) { json(res, 504, { ok: false, target, brief, reason: `target still working: ${idle.reason}; not clearing to avoid losing the turn` }); return; }
+      if (!brief.trim()) { json(res, 502, { ok: false, target, reason: "target produced no summary text" }); return; }
+
+      const clr = await m.injectText(target, "/clear");
+      if (!clr.ok) { json(res, 502, { ok: false, target, brief, reason: `/clear inject failed: ${clr.reason}` }); return; }
+      // /clear 后 TUI 重绘出全新空会话 + 首条注入需要 warmup,给足 settle。
+      await new Promise((r) => setTimeout(r, 3000));
+
+      const carry = `以下是上一个会话交接过来的工作简报,请据此无缝接手并继续:\n\n${brief}`;
+      const inj2 = await m.injectText(target, carry);
+      json(res, inj2.ok ? 200 : 502, inj2.ok
+        ? { ok: true, target, brief }
+        : { ok: false, target, brief, reason: `handoff carry inject failed: ${inj2.reason}` });
+    });
+
     // POST /graph/run — declare a loop graph over this chat's tagged sessions
     // and start walking it. Fire-and-forget: returns a runId immediately, then
     // narrates progress into the chat while it advances.

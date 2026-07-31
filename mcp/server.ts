@@ -496,5 +496,30 @@ server.registerTool(
   async ({ runId }) => unwrap("stop_graph", await daemonPost("/graph/stop", { runId })),
 );
 
+server.registerTool(
+  "handoff",
+  {
+    title: "Hand off a session's work to a fresh session",
+    description:
+      "Hand off the work in a tmux pane / peer session to a BRAND-NEW session, in place: the daemon asks that session to compress everything into a self-contained handoff brief, waits for it, then sends `/clear` into the SAME pane (resets the context window, new sessionId, same cwd) and pastes the brief in as the new session's first message. Use this when a session's context window is bloated / near its limit, or the user says '交接一下' / 'handoff' / '开个新会话接着干' / '压缩上下文重开'. Address the session by tmux `pane` id (e.g. '%5', from list_peers / list_claude_sessions) OR by peer `tag`. Refuses to hand off your OWN session (would deadlock). Returns the brief that was carried across.",
+    inputSchema: {
+      pane: z.string().optional().describe("Target tmux pane id, e.g. '%5'. Takes precedence over tag. Get it from list_peers / list_claude_sessions."),
+      tag: z.string().optional().describe("Peer tag WITHOUT '#', e.g. 'fix'. Empty string = the chat's default session. Ignored when pane is given."),
+      focus: z.string().optional().describe("Optional emphasis for the handoff brief, e.g. '重点交代还没跑通的测试'."),
+      timeoutSec: z.number().optional().describe("Max seconds to wait for the summary before aborting (30-7200, default 600)."),
+    },
+  },
+  async ({ pane, tag, focus, timeoutSec }) =>
+    unwrap(
+      "handoff",
+      await daemonPost("/handoff", {
+        ...(pane ? { pane } : {}),
+        ...(tag !== undefined ? { tag } : {}),
+        ...(focus ? { focus } : {}),
+        ...(timeoutSec ? { timeoutSec } : {}),
+      }),
+    ),
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
