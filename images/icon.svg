@@ -6,37 +6,46 @@
       <stop offset="0.5" stop-color="#1B4BB5"/>
       <stop offset="1" stop-color="#0A2160"/>
     </linearGradient>
-    <!-- nebula glow -->
     <radialGradient id="nebula" cx="0.74" cy="0.22" r="0.7">
       <stop offset="0" stop-color="#7FC8FF" stop-opacity="0.35"/>
       <stop offset="0.6" stop-color="#7FC8FF" stop-opacity="0"/>
     </radialGradient>
     <radialGradient id="nebula2" cx="0.2" cy="0.82" r="0.6">
-      <stop offset="0" stop-color="#6E4BFF" stop-opacity="0.28"/>
-      <stop offset="0.7" stop-color="#6E4BFF" stop-opacity="0"/>
+      <stop offset="0" stop-color="#8A5BFF" stop-opacity="0.30"/>
+      <stop offset="0.7" stop-color="#8A5BFF" stop-opacity="0"/>
     </radialGradient>
-    <linearGradient id="hat" x1="180" y1="72" x2="320" y2="336" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#FFFFFF"/>
-      <stop offset="1" stop-color="#D7E3F7"/>
+
+    <!-- mysterious wizard-purple: deep indigo shadow → violet highlight -->
+    <linearGradient id="hat" x1="170" y1="70" x2="330" y2="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7C56D8"/>
+      <stop offset="0.5" stop-color="#5B37B3"/>
+      <stop offset="1" stop-color="#3A2080"/>
     </linearGradient>
-    <linearGradient id="hatShade" x1="256" y1="120" x2="256" y2="336" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#8FA9D6" stop-opacity="0"/>
-      <stop offset="1" stop-color="#7E97CC" stop-opacity="0.38"/>
+    <linearGradient id="hatLight" x1="210" y1="120" x2="300" y2="330" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#9B7BE8" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#9B7BE8" stop-opacity="0"/>
     </linearGradient>
-    <linearGradient id="brim" x1="120" y1="330" x2="392" y2="392" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#FFFFFF"/>
-      <stop offset="1" stop-color="#C6D5EE"/>
+    <linearGradient id="brim" x1="110" y1="330" x2="402" y2="398" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5A38AE"/>
+      <stop offset="0.5" stop-color="#452A8C"/>
+      <stop offset="1" stop-color="#301C66"/>
     </linearGradient>
-    <linearGradient id="band" x1="184" y1="292" x2="326" y2="336" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#F2A985"/>
-      <stop offset="1" stop-color="#E56A34"/>
+    <linearGradient id="gold" x1="186" y1="292" x2="326" y2="336" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFE08A"/>
+      <stop offset="0.5" stop-color="#F5C542"/>
+      <stop offset="1" stop-color="#D99A22"/>
     </linearGradient>
+
     <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
-      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#030F3A" flood-opacity="0.45"/>
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#050E36" flood-opacity="0.5"/>
     </filter>
     <radialGradient id="starGlow" cx="0.5" cy="0.5" r="0.5">
       <stop offset="0" stop-color="#FFFFFF"/>
       <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="goldGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFE79A"/>
+      <stop offset="1" stop-color="#FFE79A" stop-opacity="0"/>
     </radialGradient>
   </defs>
 
@@ -45,7 +54,7 @@
   <rect width="512" height="512" rx="114" fill="url(#nebula)"/>
   <rect width="512" height="512" rx="114" fill="url(#nebula2)"/>
 
-  <!-- starfield: scattered dots of varying size/opacity, kept clear of the hat -->
+  <!-- starfield -->
   <g fill="#FFFFFF">
     <circle cx="72"  cy="86"  r="2.4" opacity="0.9"/>
     <circle cx="140" cy="58"  r="1.6" opacity="0.7"/>
@@ -67,47 +76,61 @@
     <circle cx="330" cy="66"  r="2.0" opacity="0.8"/>
     <circle cx="270" cy="52"  r="1.4" opacity="0.6"/>
   </g>
-
-  <!-- twinkles: little 4-point sparkles glowing in the sky -->
   <g fill="#FFFFFF">
     <circle cx="86"  cy="104" r="9" fill="url(#starGlow)" opacity="0.6"/>
     <path d="M86 92 l3.5 8.5 8.5 3.5 -8.5 3.5 -3.5 8.5 -3.5 -8.5 -8.5 -3.5 8.5 -3.5 z"/>
-    <circle cx="432" cy="140" r="9" fill="url(#starGlow)" opacity="0.6"/>
-    <path d="M432 128 l3.5 8.5 8.5 3.5 -8.5 3.5 -3.5 8.5 -3.5 -8.5 -8.5 -3.5 8.5 -3.5 z"/>
-    <circle cx="150" cy="360" r="7" fill="url(#starGlow)" opacity="0.5"/>
-    <path d="M150 351 l2.8 6.5 6.5 2.8 -6.5 2.8 -2.8 6.5 -2.8 -6.5 -6.5 -2.8 6.5 -2.8 z"/>
+    <circle cx="440" cy="140" r="9" fill="url(#starGlow)" opacity="0.6"/>
+    <path d="M440 128 l3.5 8.5 8.5 3.5 -8.5 3.5 -3.5 8.5 -3.5 -8.5 -8.5 -3.5 8.5 -3.5 z"/>
   </g>
 
   <g filter="url(#soft)">
-    <!-- brim -->
-    <path d="M116 342 C116 320 168 306 256 306 C344 306 396 320 396 342
-             C396 366 344 384 256 384 C168 384 116 366 116 342 Z" fill="url(#brim)"/>
+    <!-- floppy brim: wide, gently wavy -->
+    <path d="M104 344
+             C104 322 150 310 200 306
+             C214 314 298 314 312 306
+             C362 310 408 322 408 344
+             C408 372 344 390 256 390
+             C168 390 104 372 104 344 Z"
+          fill="url(#brim)"/>
 
-    <!-- cone: smooth S-curve, floppy tip curling right -->
-    <path d="M338 92 C352 108 350 132 336 156 C318 188 300 214 302 246
-             C303 268 314 296 322 314 C326 324 320 334 309 334 L203 334
-             C192 334 186 324 190 314 L268 118 C278 92 316 70 338 92 Z" fill="url(#hat)"/>
-    <path d="M338 92 C352 108 350 132 336 156 C318 188 300 214 302 246
-             C303 268 314 296 322 314 C326 324 320 334 309 334 L203 334
-             C192 334 186 324 190 314 L268 118 C278 92 316 70 338 92 Z" fill="url(#hatShade)"/>
+    <!-- cone: tall, with a dramatic drooping tip curling forward (classic wizard) -->
+    <path d="M198 330
+             C206 262 220 200 240 150
+             C250 124 266 104 292 100
+             C324 95 350 112 350 140
+             C350 166 330 182 306 190
+             C292 194 288 202 292 214
+             C300 250 312 300 320 330 Z"
+          fill="url(#hat)"/>
+    <!-- inner highlight -->
+    <path d="M226 320
+             C232 250 244 190 260 150
+             C268 130 280 116 296 114
+             C280 122 272 140 266 164
+             C254 214 244 280 244 320 Z"
+          fill="url(#hatLight)" opacity="0.55"/>
 
-    <!-- band + buckle, Claude terracotta = the Claude↔WeCom bridge accent -->
-    <path d="M200 300 L312 300 L322 330 L190 330 Z" fill="url(#band)"/>
-    <rect x="240" y="303" width="30" height="26" rx="6" fill="#FCE7B8"/>
-    <rect x="247" y="309" width="16" height="14" rx="3.5" fill="#E56A34"/>
+    <!-- gold band + buckle -->
+    <path d="M206 300 C240 310 274 310 314 300 L322 330 C280 340 236 340 190 330 Z" fill="url(#gold)"/>
+    <rect x="242" y="306" width="30" height="24" rx="6" fill="#3A2080"/>
+    <rect x="249" y="311" width="16" height="14" rx="3.5" fill="url(#gold)"/>
 
-    <!-- brim front-edge highlight -->
-    <path d="M150 356 C200 372 312 372 362 356 C312 380 200 380 150 356 Z"
-          fill="#7E97CC" opacity="0.28"/>
+    <!-- gold stars sprinkled on the cone -->
+    <g fill="url(#gold)">
+      <path d="M270 178 l4.5 12 12 4.5 -12 4.5 -4.5 12 -4.5 -12 -12 -4.5 12 -4.5 z"/>
+      <path d="M244 244 l3.5 9.5 9.5 3.5 -9.5 3.5 -3.5 9.5 -3.5 -9.5 -9.5 -3.5 9.5 -3.5 z"/>
+    </g>
+    <!-- gold crescent moon on the cone -->
+    <path d="M290 250 a17 17 0 1 0 12 28 a13 13 0 1 1 -12 -28 z" fill="url(#gold)"/>
   </g>
 
-  <!-- star crowning the curling tip -->
-  <circle cx="344" cy="80" r="16" fill="url(#starGlow)" opacity="0.7"/>
-  <path d="M344 74 l6.5 18 18 6.5 -18 6.5 -6.5 18 -6.5 -18 -18 -6.5 18 -6.5 z" fill="#FFFFFF"/>
+  <!-- glowing star crowning the drooping tip -->
+  <circle cx="336" cy="130" r="18" fill="url(#goldGlow)" opacity="0.8"/>
+  <path d="M336 116 l6 16.5 16.5 6 -16.5 6 -6 16.5 -6 -16.5 -16.5 -6 16.5 -6 z" fill="#FFF3CE"/>
 
-  <!-- sparkles rising off the hat -->
-  <g fill="#FFFFFF">
-    <path d="M232 176 l6 17 17 6 -17 6 -6 17 -6 -17 -17 -6 17 -6 z" opacity="0.96"/>
-    <path d="M298 244 l4 12 12 4 -12 4 -4 12 -4 -12 -12 -4 12 -4 z" opacity="0.85"/>
+  <!-- magic sparkles drifting off the hat -->
+  <g fill="#FFE79A">
+    <path d="M170 210 l5 13.5 13.5 5 -13.5 5 -5 13.5 -5 -13.5 -13.5 -5 13.5 -5 z" opacity="0.95"/>
+    <path d="M356 262 l4 11 11 4 -11 4 -4 11 -4 -11 -11 -4 11 -4 z" opacity="0.85"/>
   </g>
 </svg>
