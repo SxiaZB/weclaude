@@ -114,15 +114,18 @@ const Mirror = z.object({
       // Fire this many seconds BEFORE ttl expiry — the ping needs slack to land
       // and settle. Effective idle trigger = ttlSec - marginSec.
       marginSec: z.number().int().nonnegative().default(45),
-      // Stop after this many consecutive pings on one idle stretch — a safety
-      // valve so a truly-abandoned pane isn't pinged forever. Reset on real
-      // activity (a genuine turn resumes the full budget).
-      maxPings: z.number().int().positive().default(6),
+      // Stop keeping alive once the LAST REAL (non-ping) activity is older than
+      // this. The cutoff is measured from genuine work, NOT from our own pings
+      // (which would otherwise self-perpetuate forever). Default = ttlSec, i.e.
+      // keepalive only bridges the first cache-expiry after real work and then
+      // lets it go cold. Raise it (e.g. 1800) to chain pings across a longer
+      // idle wait; pings still stop the moment real-idle crosses this bound.
+      maxIdleSec: z.number().int().positive().default(300),
       // The ping text. Tiny (small cache-write delta) and self-describing so a
       // human glancing at the pane sees why it's there. The reply is swallowed —
       // never mirrored to chat, the detail store, or usage accounting.
       ping: z.string().default('keepalive — reply with just "pong", take no other action'),
-      // Push a one-line "🫀 保活 · session ~Nk tokens" note to chat on each ping.
+      // Push a one-line "KeepAlive · ~Nk · n/max" note to chat on each ping.
       notify: z.boolean().default(true),
     })
     .default({}),

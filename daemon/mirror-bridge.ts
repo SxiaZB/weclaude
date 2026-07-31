@@ -36,7 +36,7 @@ import type { CtxCut, TurnUsage } from "./detail.js";
 import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
 import { splitMarkdown } from "../shared/md-chunk.js";
 import { randomTip } from "./tips.js";
-import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, lastContextTokens, type PeerInfo } from "./peers.js";
+import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, lastContextTokens, tailTurns, type PeerInfo } from "./peers.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -1623,12 +1623,13 @@ interface AttachState {
    *  standalone and drops per-tool bubbles (kept in the detail store). Set on the
    *  goal marker, cleared on the completing turn's turn_end. */
   goalActive?: boolean;
-  /** Prompt-cache keepalive state. `count` = pings fired since the last real
-   *  turn (capped at cfg…maxPings). `settledMtime` = transcript mtime once the
-   *  last ping fully landed — idle is measured from here; 0 = need to (re)settle.
-   *  `pinging` guards the inject→settle window; `pingMtime` is the mtime at
-   *  inject time, used to distinguish "ping written" from "ping not yet seen". */
-  keepalive?: { count: number; settledMtime: number; pinging: boolean; pingMtime: number };
+  /** `realMtime` = transcript mtime of the last REAL (non-ping) activity — the
+   *  anchor for the "real work too old" cutoff; keepalive pings deliberately do
+   *  NOT advance it, so they can't keep a dead session warm forever. `seenMtime`
+   *  = mtime observed on the previous tick, used to spot a real turn that grew
+   *  the transcript between ticks (vs. our own ping, which is gated by `pinging`).
+   *  `pinging`/`pingMtime` guard the inject→settle window. */
+  keepalive?: { realMtime: number; seenMtime: number; pinging: boolean; pingMtime: number };
   /** Keepalive paused by `/stop`. Stays off until a real turn resumes it — a
    *  WeCom inbound (dispatch) or the pane going busy on a genuine turn — so an
    *  explicitly-stopped session isn't poked until the human comes back. */
@@ -3480,14 +3481,31 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // goes idle (agent parked on a peer, background task running) lets the whole
   // context fall out of cache — the next real turn then re-writes it at 1.25x.
   // We inject a tiny ping just before expiry so the model makes one cheap
-  // request (cache-read 0.1x) that slides the TTL forward. Budget-capped so an
-  // abandoned pane isn't pinged forever; the counter refreshes on real activity.
+  // request (cache-read 0.1x) that slides the TTL forward. The whole schedule is
+  // anchored to the last REAL (non-ping) activity, NOT to our own pings — so a
+  // dead session is never kept warm forever, and once real work is older than
+  // `maxIdleSec` we stop and let the cache die.
   const fmtTokens = (n: number): string =>
     n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
   // After `/stop`, ignore pane-busy as a resume signal for this long — long
   // enough for an in-flight ping (interrupted by the same /stop's Esc) to settle,
   // so it can't self-resume the pause. A genuine new turn after this window does.
   const RESUME_GRACE_MS = 30_000;
+
+  // Seed the keepalive anchor. If the transcript's last user turn IS one of our
+  // pings, the session has been idling under keepalive — anchor realMtime in the
+  // past so a daemon restart doesn't resume pinging a stale session (it waits for
+  // genuine activity). Otherwise anchor to the current mtime (fresh real work).
+  const initKeepalive = (jsonlPath: string, mtime: number, pingText: string, ttlMs: number): AttachState["keepalive"] => {
+    let stale = false;
+    try {
+      const users = tailTurns(jsonlPath, 8).filter((t) => t.role === "user");
+      const last = users[users.length - 1]?.text ?? "";
+      const sig = normAssistant(pingText).slice(0, 40);
+      stale = sig.length > 0 && normAssistant(last).includes(sig);
+    } catch { /* unreadable tail — treat as fresh */ }
+    return { realMtime: stale ? mtime - ttlMs : mtime, seenMtime: mtime, pinging: false, pingMtime: 0 };
+  };
 
   const fireKeepalive = async (a: AttachState): Promise<void> => {
     const kc = cfg.wrc.mirror.keepalive;
@@ -3507,15 +3525,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     });
     if (!r.ok) {
       endKeepaliveQuiet(a);
-      // Roll the ping back so a failed attempt doesn't burn the budget.
-      if (a.keepalive) { a.keepalive.pinging = false; a.keepalive.count = Math.max(0, a.keepalive.count - 1); }
+      if (a.keepalive) a.keepalive.pinging = false; // roll back so the next tick can retry
       log.warn({ target: a.target, reason: r.reason }, "keepalive: inject failed");
       return;
     }
-    const n = a.keepalive?.count ?? 1;
     const tokens = lastContextTokens(a.jsonlPath);
     const size = tokens > 0 ? `~${fmtTokens(tokens)} tokens` : "未知";
-    log.info({ target: a.target, count: n, tokens }, "keepalive: ping injected");
+    log.info({ target: a.target, tokens }, "keepalive: ping injected");
     // Open a chat-detail turn for the real heartbeat exchange: userQuery is the
     // actual ping we injected; the assistant reply (expected: just "pong"), any
     // tool calls, and usage are grafted on from the swallowed items in onItem;
@@ -3523,7 +3539,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const turnId = newTurnId();
     a.keepaliveTurnId = turnId;
     recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: kc.ping });
-    if (kc.notify) sendStandalone(a, `❤️ 保活 · context ${size} · ${n}/${kc.maxPings}`);
+    if (kc.notify) sendStandalone(a, `❤️ 保活 · context ${size}`);
   };
 
   let keepaliveTicking = false;
@@ -3534,6 +3550,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     try {
       const idleTriggerMs = Math.max(30, kc.ttlSec - kc.marginSec) * 1000;
       const ttlMs = kc.ttlSec * 1000;
+      const maxIdleMs = Math.max(kc.ttlSec, kc.maxIdleSec) * 1000;
       const now = Date.now();
       for (const a of byTarget.values()) {
         if (!a.tmuxPane) continue;                            // spawn-mode: no live pane to warm
@@ -3543,40 +3560,37 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         let mtime = 0;
         try { mtime = statSync(a.jsonlPath).mtimeMs; } catch { continue; }
         if (!mtime) continue;
-        const k = (a.keepalive ??= { count: 0, settledMtime: 0, pinging: false, pingMtime: 0 });
+        const k = (a.keepalive ??= initKeepalive(a.jsonlPath, mtime, kc.ping, ttlMs))!;
+        // Growth since the previous tick — computed BEFORE updating seenMtime.
+        // A real turn writing between ticks trips this; our own ping's growth is
+        // absorbed by the pinging-branch ticks (which update seenMtime too), so it
+        // never looks like real activity here — that's the whole fix.
+        const grewSinceLast = mtime > k.seenMtime + 1000;
+        k.seenMtime = mtime;
         const busy = paneIsBusy(await capturePaneTail(a.tmuxPane, 12));
 
         if (k.pinging) {
           // Waiting for our own ping to land and settle. Not written yet, or the
-          // ping turn still running → keep waiting. Once written AND idle again,
-          // snapshot the settled mtime; the next idle window accrues from here.
+          // ping turn still running → keep waiting. realMtime is NEVER advanced by
+          // a ping — a ping is not real work.
           if (busy || mtime <= k.pingMtime) continue;
-          k.settledMtime = mtime;
           k.pinging = false;
           continue;
         }
-        // Real turn running → full budget again. If `/stop` paused us, resume ONLY
-        // after a grace window: the ping that may have been mid-flight when /stop
-        // landed makes the pane busy too, and must NOT be mistaken for the human
-        // coming back. After the grace, a busy pane is a genuine new turn → resume.
-        if (busy) {
-          k.count = 0; k.settledMtime = 0;
-          if (a.keepaliveOff && now - (a.keepaliveOffAt ?? 0) > RESUME_GRACE_MS) a.keepaliveOff = false;
-          continue;
+        // Real activity re-anchors the schedule and lifts a `/stop` pause: the pane
+        // is busy on a genuine turn, or the transcript grew since last tick (a turn
+        // that completed between ticks). Only a busy pane keeps looping.
+        if (busy || grewSinceLast) {
+          k.realMtime = mtime;
+          if (a.keepaliveOff && (busy ? now - (a.keepaliveOffAt ?? 0) > RESUME_GRACE_MS : true)) a.keepaliveOff = false;
+          if (busy) continue;
         }
-        // Transcript grew past the last settled ping while we weren't pinging =
-        // a real turn happened → reset the budget so idle after work re-earns it.
-        if (k.settledMtime && mtime > k.settledMtime + 1000) { k.count = 0; k.settledMtime = 0; }
-        if (a.keepaliveOff) continue;                          // paused by /stop until a real turn returns (busy branch / dispatch lift it)
-        const idle = now - mtime;
-        if (idle < idleTriggerMs) continue;                    // still warm — too early to bother
-        // Hard upper bound: past the TTL the cache is already gone, so a ping
-        // would pay a full 1.25x cold re-write of the whole context for a no-op
-        // turn — the exact waste we're avoiding. Only warm a cache that's still
-        // hittable; a genuinely stale session waits for a real turn to pay it.
-        if (idle >= ttlMs) continue;
-        if (k.count >= kc.maxPings) continue;                  // budget spent — let it go cold
-        k.count += 1;
+        if (a.keepaliveOff) continue;                          // paused by /stop until real activity returns
+        const idleSinceTouch = now - mtime;                    // cache warmth: last touch (real OR ping)
+        const realIdle = now - k.realMtime;                    // user cutoff: last REAL work only
+        if (idleSinceTouch < idleTriggerMs) continue;          // cache still comfortably warm
+        if (idleSinceTouch >= ttlMs) continue;                 // cache already cold — a ping would cold-rewrite for nothing
+        if (realIdle >= maxIdleMs) continue;                   // real work too old — stop, let it die (你的「超5分钟不保活」)
         k.pinging = true;
         k.pingMtime = mtime;
         await fireKeepalive(a);
@@ -3778,7 +3792,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // may be mid-flight right now can't immediately self-resume.
       a.keepaliveOff = true;
       a.keepaliveOffAt = Date.now();
-      a.keepalive = { count: 0, settledMtime: 0, pinging: false, pingMtime: 0 };
+      a.keepalive = undefined; // re-anchors cleanly on resume
       // Any in-flight ping's quiet window + detail turn are left to close on their
       // own turn_end (or the 60s fail-safe), so the interrupted pong stays out of chat.
       log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /stop — Esc sent to pane, keepalive paused");
@@ -3858,10 +3872,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         return;
       }
       // A real inbound is a new conversation → lift any `/stop` keepalive pause
-      // and re-earn the budget. (Pane-side new turns resume via the tick's busy
-      // branch; this covers the WeCom-driven path.)
+      // and re-anchor to now (this turn is real work). Pane-side new turns
+      // re-anchor via the tick's busy branch; this covers the WeCom-driven path.
       a.keepaliveOff = false;
-      if (a.keepalive) { a.keepalive.count = 0; a.keepalive.settledMtime = 0; }
+      if (a.keepalive) { a.keepalive.realMtime = Date.now(); a.keepalive.seenMtime = Date.now(); }
       // Finalize prior live stream (if any) so this new turn renders into its
       // own message bubble. Then open a fresh stream tied to the new frame and
       // ack immediately so WeCom doesn't time out while inject queues.
