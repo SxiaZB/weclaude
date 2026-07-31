@@ -20,6 +20,9 @@ export interface PendingMeta {
   /** 命中危险名单的规则名 (daemon/danger.ts)。仅用于卡片渲染 (⚠️ 标题 + 去掉
    *  「全过」按钮); 「必须单独点」这一属性由 forceSingle 表达。 */
   danger?: string;
+  /** 卡片标题上的会话名 (#tag / transcript 首条用户消息 / 短 id), 发卡时算好,
+   *  resolved 卡重渲染直接复用 — 事件回调里没有 transcript_path 可现算。 */
+  sessionName?: string;
   /** 卡片已经真的发到 WeCom 上了 (flushBatch 成功)。只有这种 pending 在 reload
    *  drain 时值得让 hook 续接 —— 卡还挂在聊天里, 重启后同 reqId 重新挂起即可复用。
    *  没发出去的卡续接就是让 hook 空等一个永远不会有人点的东西。 */
