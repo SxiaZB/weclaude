@@ -3580,12 +3580,17 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           k.pinging = false;
           continue;
         }
-        // Real activity re-anchors the schedule and lifts a `/stop` pause: the pane
-        // is busy on a genuine turn, or the transcript grew since last tick (a turn
-        // that completed between ticks). Only a busy pane keeps looping.
+        // Real activity re-anchors the schedule: the pane is busy on a genuine
+        // turn, or the transcript grew since last tick (a turn that completed
+        // between ticks). Only a busy pane keeps looping.
+        //   Lifting a `/stop` pause is stricter: transcript growth after /stop is
+        // almost always the Esc interrupt's own settling writes (the interrupted
+        // turn + trailing tool results), NOT new work — so `grewSinceLast` must
+        // never self-resume the pause. Only a busy pane past the resume grace does
+        // it here; a WeCom inbound lifts it in dispatch.
         if (busy || grewSinceLast) {
           k.realMtime = mtime;
-          if (a.keepaliveOff && (busy ? now - (a.keepaliveOffAt ?? 0) > RESUME_GRACE_MS : true)) a.keepaliveOff = false;
+          if (a.keepaliveOff && busy && now - (a.keepaliveOffAt ?? 0) > RESUME_GRACE_MS) a.keepaliveOff = false;
           if (busy) continue;
         }
         if (a.keepaliveOff) continue;                          // paused by /stop until real activity returns
