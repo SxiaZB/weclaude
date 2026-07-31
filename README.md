@@ -1,6 +1,21 @@
-# wezard
+<div align="center">
 
-**把 Claude Code 装进企业微信。** 在地铁上、被窝里、开会摸鱼时，照样能跟你电脑上的 Claude 干活。
+<img src="images/icon.png" alt="wezard" width="176" height="176" />
+
+<h1>wezard</h1>
+
+<p><b>把 Claude Code 装进企业微信。</b><br/>在地铁上、被窝里、开会摸鱼时，照样能跟你电脑上的 Claude 干活。</p>
+
+<p>
+  <a href="https://www.npmjs.com/package/wezard"><img src="https://img.shields.io/npm/v/wezard?style=flat-square&color=07C160&label=npm" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/wezard"><img src="https://img.shields.io/npm/dm/wezard?style=flat-square&color=07C160&label=downloads" alt="npm downloads" /></a>
+  <a href="https://github.com/guxi11/wezard/stargazers"><img src="https://img.shields.io/github/stars/guxi11/wezard?style=flat-square&color=E8825C" alt="GitHub stars" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/npm/l/wezard?style=flat-square&color=E8825C" alt="license" /></a>
+  <img src="https://img.shields.io/node/v/wezard?style=flat-square&color=339933" alt="node version" />
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555?style=flat-square" alt="platform" />
+</p>
+
+</div>
 
 ![demo](images/demo.png)
 
@@ -13,6 +28,26 @@
 - 📄 **文档读写** — Claude 通过 `wecom_doc_list_tools` / `wecom_doc_call` 直接调企业微信智能机器人的 doc / smartsheet / smartpage MCP，新建在线文档、写 Markdown、读链接、操作智能表格——全程在内网，不需要 corp access_token。
 - 🗂 **多会话发现/切换** — Claude 通过 `list_claude_sessions` / `switch_claude_session` / `new_claude_session` 列出本机 tmux 内所有在跑的 Claude 会话（带摘要 + 稳定动物 emoji 标签）、把 IM 镜像切到其中任一个、或在指定路径新开一个会话。审批卡标题也带同一枚 emoji，多个会话兜底到同一 IM 时一眼区分。
 - 🔄 **重启即续** — 电脑重启 / tmux 全没了 / daemon 崩了都不掉档：IM ↔ 会话绑定持久化在 `~/.wezard/mirror-attachments.json`，下一条 IM 消息自动 `claude --resume` 拉起新 tmux pane，历史完整继承；`tmux attach -t wezard` 接管即可。
+
+<details>
+<summary><b>目录</b></summary>
+
+- [快速开始](#快速开始)
+- [两种模式怎么选](#两种模式怎么选)
+- [体验是什么样](#体验是什么样)
+- [文档 / 智能表格 / 智能文档](#文档--智能表格--智能文档)
+- [事件订阅 / 定时广播](#事件订阅--定时广播)
+- [消息是怎么同步的](#消息是怎么同步的)
+- [一个聊天里跑多个会话（`#tag` 路由）](#一个聊天里跑多个会话tag-路由)
+- [多 CLI 后端](#多-cli-后端claude--claude-internal--codebuddy)
+- [Prompt-cache 保活（省钱心跳）](#prompt-cache-保活省钱心跳)
+- [常用命令](#常用命令)
+- [常见问题](#常见问题)
+- [架构一瞥](#架构一瞥)
+- [参与贡献](#参与贡献)
+- [License](#license)
+
+</details>
 
 ---
 
@@ -429,6 +464,24 @@ daemon 是**唯一**持有 WeCom WS 连接的进程，hook 和 MCP 都是它的�
 
 详情看 [CLAUDE.md](CLAUDE.md)。
 
+---
+
+## 参与贡献
+
+欢迎 issue / PR。本地开发：
+
+```bash
+git clone https://github.com/guxi11/wezard.git
+cd wezard && npm install
+npm run build          # tsc → dist/
+npm run typecheck      # tsc --noEmit
+npm run dev:daemon     # tsx 直跑 daemon，热迭代不用装
+./cli/wezard.sh reload # 重编译并重启常驻 daemon
+./cli/wezard.sh logs -f
+```
+
+架构与模块职责见 [CLAUDE.md](CLAUDE.md)。提交前跑一遍 `npm run typecheck`；无测试套件，别伪造测试命令。
+
 ## License
 
-MIT
+[MIT](LICENSE) © [guxi11](https://github.com/guxi11)
