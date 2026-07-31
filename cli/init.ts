@@ -113,7 +113,7 @@ const ensureBuild = (): void => {
 };
 
 const runSync = (): void => {
-  log(c.dim("  syncing hooks/MCP/env into agent settings.json..."));
+  log(c.dim("  syncing hooks/MCP/env into agent config files..."));
   const r = spawnSync(process.execPath, [`${REPO}/dist/cli/sync.js`], { stdio: "inherit" });
   if (r.status !== 0) throw new Error("sync failed");
 };

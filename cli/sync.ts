@@ -148,6 +148,11 @@ const targetKey = (path: string): string => expandHome(path);
 
 interface SyncOpts { remove?: boolean }
 
+// CodeBuddy reads MCP server config from `~/.codebuddy/mcp.json`, NOT from
+// settings.json. Derive the mcp.json path from the settings.json path.
+const mcpJsonPath = (settingsPath: string): string =>
+  pathResolve(dirname(expandHome(settingsPath)), "mcp.json");
+
 const syncOne = (
   settingsPath: string,
   kind: "claude" | "codebuddy",
@@ -163,17 +168,33 @@ const syncOne = (
   stripHooks(settings);
 
   if (opts.remove) {
-    stripMcp(settings);
     stripEnv(settings);
+    if (kind === "codebuddy") {
+      // MCP lives in mcp.json for CodeBuddy; strip from both locations.
+      stripMcp(settings);
+      const mcpAbs = mcpJsonPath(settingsPath);
+      const mcpJson = readJson(mcpAbs);
+      stripMcp(mcpJson);
+      writeJson(mcpAbs, mcpJson);
+    } else {
+      stripMcp(settings);
+    }
     delete lock.targets[targetKey(settingsPath)];
   } else {
-    upsertMcp(settings);
     const wroteEnv = upsertEnv(settings, env);
-    // CodeBuddy 无 plugin 路径, settings.json 注册 hook; Claude 家族由 plugin 提供。
     let wroteHooks = false;
     if (kind === "codebuddy") {
+      // CodeBuddy: hook → settings.json, MCP → mcp.json
       upsertHook(settings, env.hookTimeoutSec);
       wroteHooks = true;
+      // Strip any stale MCP from settings.json (migrated to mcp.json)
+      stripMcp(settings);
+      const mcpAbs = mcpJsonPath(settingsPath);
+      const mcpJson = readJson(mcpAbs);
+      upsertMcp(mcpJson);
+      writeJson(mcpAbs, mcpJson);
+    } else {
+      upsertMcp(settings);
     }
     lock.targets[targetKey(settingsPath)] = { wroteHooks, wroteMcp: true, wroteEnv };
   }
