@@ -280,13 +280,18 @@ const chunkText = (s: string, size: number): string[] => {
 let QUOTE_LINKABLE = false;
 export const setQuoteLinkable = (v: boolean): void => { QUOTE_LINKABLE = v; };
 
-/** 正文被截断时才给的两个入口, 待决卡与已决卡共用 (已决卡也要能回看批了什么)。 */
+// 「看不全」的判定阈值: 手机端引用区实测只渲染前 2~3 行 (~200 字), 与 API 层的
+// QUOTE_MAX (1200) 是两回事 —— 一条 700 字的命令没超 QUOTE_MAX、正文一字未截,
+// 手机上照样只能看到开头。所以入口挂载看的是手机可见极限, 不是截断与否。
+const FULLCMD_VISIBLE_CHARS = 200;
+
+/** 命令超过手机可见极限时给的两个入口, 待决卡与已决卡共用 (已决卡也要能回看批了什么)。 */
 const fullCmdAffordance = (
   a: CardArgs,
   bodyLen: number,
 ): { menu?: TemplateCard["action_menu"]; quoteUrl?: string; quoteTitle?: string } => {
   const fullCmd = commandOf(a.toolName, a.toolInput);
-  if (fullCmd.length <= bodyLen) return {};
+  if (fullCmd.length <= Math.min(FULLCMD_VISIBLE_CHARS, bodyLen)) return {};
   const linkable = QUOTE_LINKABLE && Boolean(a.detailUrl);
   return {
     menu: { desc: "更多", action_list: [{ text: "📄 展开完整命令", key: encodeFullCmdKey(a.reqId) }] },
