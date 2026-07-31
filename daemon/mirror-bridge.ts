@@ -36,7 +36,7 @@ import type { CtxCut, TurnUsage } from "./detail.js";
 import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
 import { splitMarkdown } from "../shared/md-chunk.js";
 import { randomTip } from "./tips.js";
-import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, type PeerInfo } from "./peers.js";
+import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, lastContextTokens, type PeerInfo } from "./peers.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -1623,6 +1623,16 @@ interface AttachState {
    *  standalone and drops per-tool bubbles (kept in the detail store). Set on the
    *  goal marker, cleared on the completing turn's turn_end. */
   goalActive?: boolean;
+  /** Prompt-cache keepalive state. `count` = pings fired since the last real
+   *  turn (capped at cfg…maxPings). `settledMtime` = transcript mtime once the
+   *  last ping fully landed — idle is measured from here; 0 = need to (re)settle.
+   *  `pinging` guards the inject→settle window; `pingMtime` is the mtime at
+   *  inject time, used to distinguish "ping written" from "ping not yet seen". */
+  keepalive?: { count: number; settledMtime: number; pinging: boolean; pingMtime: number };
+  /** While set, onItem swallows the entire keepalive ping turn (no bubble, no
+   *  detail, no usage), closing on the turn's terminal signal. The timer is a
+   *  fail-safe so a ping that never emits turn_end can't mute a later real turn. */
+  keepaliveQuiet?: NodeJS.Timeout;
 }
 
 // Mirror outbound state machine. See plan: defer stream open by N ms; flush
@@ -2331,7 +2341,22 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (a.liveStream && !a.liveStream.closed) void finalizeStream(a, a.liveStream);
   };
 
+  // Close the keepalive quiet window — the ping turn is over (or the fail-safe
+  // fired), so subsequent real items flow through onItem normally again.
+  const endKeepaliveQuiet = (a: AttachState): void => {
+    if (!a.keepaliveQuiet) return;
+    clearTimeout(a.keepaliveQuiet);
+    a.keepaliveQuiet = undefined;
+  };
+
   const onItem = (a: AttachState, item: RenderItem): void => {
+    // Keepalive ping turns are pure cache-warmers: swallow every item so the
+    // ping/pong never reaches chat, the detail store, or usage accounting. Close
+    // the window on the turn's terminal signal (hard or soft turn_end).
+    if (a.keepaliveQuiet) {
+      if (item.kind === "turn_end") endKeepaliveQuiet(a);
+      return;
+    }
     // 任何新 item 到达 = 上一条"消息写完了"并不代表这一轮结束 → 撤销待确认的软收口。
     // 硬信号 (end_turn / turn_duration) 的后端永远不会走到这里。
     if (a.softEnd) { clearTimeout(a.softEnd); a.softEnd = undefined; }
@@ -3418,6 +3443,97 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return { ok: true, pane: compactPane(raw, rows), busy: paneIsBusy(raw) };
   };
 
+  // ── Prompt-cache keepalive ──────────────────────────────────────────
+  // Anthropic's prompt cache expires ~5min after the last request. A pane that
+  // goes idle (agent parked on a peer, background task running) lets the whole
+  // context fall out of cache — the next real turn then re-writes it at 1.25x.
+  // We inject a tiny ping just before expiry so the model makes one cheap
+  // request (cache-read 0.1x) that slides the TTL forward. Budget-capped so an
+  // abandoned pane isn't pinged forever; the counter refreshes on real activity.
+  const fmtTokens = (n: number): string =>
+    n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
+
+  const fireKeepalive = async (a: AttachState): Promise<void> => {
+    const kc = cfg.wrc.mirror.keepalive;
+    // Suppress the pane→WeCom echo of the ping user line, then swallow the whole
+    // ping turn (reply included). The 60s fail-safe clears the quiet window if
+    // the turn somehow never emits turn_end, so a later real turn is never muted.
+    rememberInject(kc.ping);
+    a.keepaliveQuiet = setTimeout(() => { a.keepaliveQuiet = undefined; }, 60_000);
+    const r = await inject({
+      text: kc.ping, images: [], cfg,
+      log: log.child({ target: a.target, sessionId: a.sessionId, sub: "keepalive" }),
+      sessionId: a.sessionId, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane,
+    });
+    if (!r.ok) {
+      endKeepaliveQuiet(a);
+      // Roll the ping back so a failed attempt doesn't burn the budget.
+      if (a.keepalive) { a.keepalive.pinging = false; a.keepalive.count = Math.max(0, a.keepalive.count - 1); }
+      log.warn({ target: a.target, reason: r.reason }, "keepalive: inject failed");
+      return;
+    }
+    log.info({ target: a.target, count: a.keepalive?.count }, "keepalive: ping injected");
+    if (kc.notify) {
+      const tokens = lastContextTokens(a.jsonlPath);
+      const size = tokens > 0 ? `~${fmtTokens(tokens)} tokens` : "未知";
+      sendStandalone(a, `❤️ 保活 · context ${size} · ${a.keepalive?.count ?? 1}/${kc.maxPings}`);
+    }
+  };
+
+  let keepaliveTicking = false;
+  const keepaliveTick = async (): Promise<void> => {
+    const kc = cfg.wrc.mirror.keepalive;
+    if (!kc.enabled || keepaliveTicking) return;
+    keepaliveTicking = true;
+    try {
+      const idleTriggerMs = Math.max(30, kc.ttlSec - kc.marginSec) * 1000;
+      const ttlMs = kc.ttlSec * 1000;
+      const now = Date.now();
+      for (const a of byTarget.values()) {
+        if (!a.tmuxPane) continue;                            // spawn-mode: no live pane to warm
+        if (a.migrationWatcher) continue;                     // session rotating — skip
+        if (a.liveStream && !a.liveStream.closed) continue;   // mid typewriter — don't inject
+        if (!(await tmuxPaneAlive(a.tmuxPane))) continue;     // dead pane — nothing to keep alive
+        let mtime = 0;
+        try { mtime = statSync(a.jsonlPath).mtimeMs; } catch { continue; }
+        if (!mtime) continue;
+        const k = (a.keepalive ??= { count: 0, settledMtime: 0, pinging: false, pingMtime: 0 });
+        const busy = paneIsBusy(await capturePaneTail(a.tmuxPane, 12));
+
+        if (k.pinging) {
+          // Waiting for our own ping to land and settle. Not written yet, or the
+          // ping turn still running → keep waiting. Once written AND idle again,
+          // snapshot the settled mtime; the next idle window accrues from here.
+          if (busy || mtime <= k.pingMtime) continue;
+          k.settledMtime = mtime;
+          k.pinging = false;
+          continue;
+        }
+        if (busy) { k.count = 0; k.settledMtime = 0; continue; } // real turn running → full budget again
+        // Transcript grew past the last settled ping while we weren't pinging =
+        // a real turn happened → reset the budget so idle after work re-earns it.
+        if (k.settledMtime && mtime > k.settledMtime + 1000) { k.count = 0; k.settledMtime = 0; }
+        const idle = now - mtime;
+        if (idle < idleTriggerMs) continue;                    // still warm — too early to bother
+        // Hard upper bound: past the TTL the cache is already gone, so a ping
+        // would pay a full 1.25x cold re-write of the whole context for a no-op
+        // turn — the exact waste we're avoiding. Only warm a cache that's still
+        // hittable; a genuinely stale session waits for a real turn to pay it.
+        if (idle >= ttlMs) continue;
+        if (k.count >= kc.maxPings) continue;                  // budget spent — let it go cold
+        k.count += 1;
+        k.pinging = true;
+        k.pingMtime = mtime;
+        await fireKeepalive(a);
+      }
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "keepalive tick failed");
+    } finally {
+      keepaliveTicking = false;
+    }
+  };
+  const keepaliveTimer = setInterval(() => void keepaliveTick(), 15_000);
+
   return {
     attach,
     peers,
@@ -3645,6 +3761,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     newSession,
     shutdown: () => {
       clearInterval(paneDriftTimer);
+      clearInterval(keepaliveTimer);
       for (const a of bySessionId.values()) {
         if (a.outbound?.kind === "deferred") clearTimeout(a.outbound.timer);
         a.outbound = undefined;

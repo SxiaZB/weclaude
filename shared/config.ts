@@ -98,6 +98,34 @@ const Mirror = z.object({
   // 中间 tool_use / tool_result / thinking / 非 final text 全部只写进详情页,不发气泡。
   // 授权卡照常发群 (交互无法替代)。false = 现状 (逐条气泡)。
   brief: z.boolean().default(true),
+  // ── Prompt-cache keepalive ────────────────────────────────────────────
+  // Anthropic prompt caching: cache-write costs 1.25x, cache-read 0.1x, and the
+  // cache lives only ~5min. A pane that goes idle (agent parked waiting on a
+  // peer, or a long background task) lets that cache expire — so the next real
+  // turn pays a full 1.25x re-write of the entire context. keepalive injects a
+  // tiny ping just before expiry: it re-reads the cached prefix (0.1x) and
+  // slides the TTL forward, so the eventual real turn only writes the delta.
+  keepalive: z
+    .object({
+      // Master switch. Off → no pings, no timer overhead.
+      enabled: z.boolean().default(true),
+      // Prompt-cache TTL (s). Anthropic default is 300 (5min).
+      ttlSec: z.number().int().positive().default(300),
+      // Fire this many seconds BEFORE ttl expiry — the ping needs slack to land
+      // and settle. Effective idle trigger = ttlSec - marginSec.
+      marginSec: z.number().int().nonnegative().default(45),
+      // Stop after this many consecutive pings on one idle stretch — a safety
+      // valve so a truly-abandoned pane isn't pinged forever. Reset on real
+      // activity (a genuine turn resumes the full budget).
+      maxPings: z.number().int().positive().default(6),
+      // The ping text. Tiny (small cache-write delta) and self-describing so a
+      // human glancing at the pane sees why it's there. The reply is swallowed —
+      // never mirrored to chat, the detail store, or usage accounting.
+      ping: z.string().default('keepalive — reply with just "pong", take no other action'),
+      // Push a one-line "🫀 保活 · session ~Nk tokens" note to chat on each ping.
+      notify: z.boolean().default(true),
+    })
+    .default({}),
 });
 
 const Wrc = z.object({

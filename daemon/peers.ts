@@ -103,6 +103,34 @@ export const lastAssistantText = (jsonlPath: string, max = 4000): string => {
   return last.length > max ? `${last.slice(0, max)}…` : last;
 };
 
+/** Prompt-token size of the session's most recent turn: input + both cache
+ *  tiers = how full the context window is, i.e. exactly what a cold cache would
+ *  have to re-write at 1.25x. Read from the last assistant usage snapshot in
+ *  the tail; 0 when no usage is on record yet. Drives the keepalive decision
+ *  and the "session size" note. */
+export const lastContextTokens = (jsonlPath: string): number => {
+  const raw = readTail(jsonlPath);
+  if (!raw) return 0;
+  const normalize = backendForPath(jsonlPath).normalizeTranscriptLine;
+  const lines = raw.split("\n").filter((l) => l.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let row;
+    try { row = normalize(JSON.parse(lines[i]!)); } catch { continue; }
+    const u = row?.message?.usage;
+    if (!u) continue;
+    const rawIn = u.input_tokens ?? 0;
+    const cr = u.cache_read_input_tokens ?? 0;
+    const cw = u.cache_creation_input_tokens ?? 0;
+    // CodeBuddy's gateway totalizes input_tokens (= cr+cw+fresh); Anthropic-native
+    // keeps the three disjoint. Detect by the model's version style ("4.7-opus"
+    // vs "opus-4-7") — same reconciliation the mirror does for usage accounting.
+    const model = row?.message?.model;
+    const gatewayTotalized = typeof model === "string" && /\d\.\d/.test(model);
+    return gatewayTotalized && rawIn >= cr + cw ? rawIn : rawIn + cr + cw;
+  }
+  return 0;
+};
+
 // ── Pane liveness ─────────────────────────────────────────────────────
 // "Is this agent still working?" answered from outside the process. The pane is
 // the only honest source: transcript mtime goes quiet during long tool calls,
