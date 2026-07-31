@@ -3245,7 +3245,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   ): Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string; info?: string }> => {
     const prev = byTarget.get(target);
     // Resolution precedence (all chat-scoped except the running-cwd fallback):
-    //   base.pending > target.running > base.running > default
+    //   base.pending > caller.pending > target.running > base.running > default
     // A fresh tagged session inherits the chat's current cwd; re-`/new`ing a
     // live tagged session keeps its pane cwd unless the base session queued a
     // `cd`. This keeps siblings aligned by default without forcibly clobbering
@@ -3254,9 +3254,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const rec = !prev ? deps.store.get(target) : undefined;
     // An explicit per-node cwd (graph spec) outranks every chat-scoped fallback:
     // the point of declaring it is that this node lives in a different repo.
+    // When no base session exists (tagged-only chats), setPendingCwd writes to
+    // the caller's own record — include it here so the switch isn't lost.
     const eff =
       (opts?.cwd?.trim() ? expandHome(opts.cwd.trim()) : "") ||
       chat.pending ||
+      (prev?.pendingCwd?.trim()) ||
       (prev?.runningCwd?.trim()) ||
       (rec?.cwd?.trim()) ||
       chat.running ||
@@ -3890,10 +3893,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // Auto-upgrade /clear → /new when the user has queued a project switch:
       // a plain /clear would only rotate sessionId in the same pane, which sits
       // in the OLD cwd. Killing+respawning is the only way to honor the switch.
-      // pendingCwd is chat-scoped, so read it via the shared fallback rather
-      // than from this attachment's own record (which is now always empty for
-      // tagged sessions).
-      const pending = chatCwdFallback(a.target).pending;
+      // pendingCwd is chat-scoped on the base principal; fall back to the
+      // caller's own record when no base exists (tagged-only chats).
+      const pending = chatCwdFallback(a.target).pending || a.pendingCwd;
       if (armMigration && pending && pending !== a.runningCwd) {
         if (a.liveStream && !a.liveStream.closed) await finalizeStream(a, a.liveStream);
         log.info({ target: a.target, runningCwd: a.runningCwd, pendingCwd: pending }, "/clear upgraded to /new (cwd switch)");

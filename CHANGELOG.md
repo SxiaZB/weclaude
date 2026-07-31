@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-07-31
+
+### Fixed
+- `mirror`: tagged-only chat（无 untagged 默认会话）中 `enter` 设置 cwd 后 `/clear` 不触发目录切换 — `chatCwdFallback` 只读 base principal，base 不存在时返回空；dispatch 和 newSession 现在都 fallback 到 caller 自身的 `pendingCwd`。
+
 ## [1.2.1] - 2026-07-31
 
 ### Changed
@@ -72,7 +77,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/guxi11/wezard/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/guxi11/wezard/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/guxi11/wezard/compare/v1.1.4...v1.2.0
 [1.1.4]: https://github.com/guxi11/wezard/compare/v1.1.3...v1.1.4
