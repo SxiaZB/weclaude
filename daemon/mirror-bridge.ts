@@ -1633,6 +1633,9 @@ interface AttachState {
    *  WeCom inbound (dispatch) or the pane going busy on a genuine turn — so an
    *  explicitly-stopped session isn't poked until the human comes back. */
   keepaliveOff?: boolean;
+  /** When `/stop` paused keepalive (ms). The busy-based resume is gated on a
+   *  grace window after this so an in-flight ping at /stop time can't self-resume. */
+  keepaliveOffAt?: number;
   /** While set, onItem swallows the keepalive ping turn from every WeCom path
    *  (no bubble, no live stream), closing on the turn's terminal signal. The
    *  timer is a fail-safe so a ping that never emits turn_end can't mute a later
@@ -3481,6 +3484,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // abandoned pane isn't pinged forever; the counter refreshes on real activity.
   const fmtTokens = (n: number): string =>
     n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
+  // After `/stop`, ignore pane-busy as a resume signal for this long — long
+  // enough for an in-flight ping (interrupted by the same /stop's Esc) to settle,
+  // so it can't self-resume the pause. A genuine new turn after this window does.
+  const RESUME_GRACE_MS = 30_000;
 
   const fireKeepalive = async (a: AttachState): Promise<void> => {
     const kc = cfg.wrc.mirror.keepalive;
@@ -3548,14 +3555,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           k.pinging = false;
           continue;
         }
-        // Real turn running → full budget again, and resume if `/stop` paused us
-        // (the human/agent is back).
-        if (busy) { k.count = 0; k.settledMtime = 0; a.keepaliveOff = false; continue; }
+        // Real turn running → full budget again. If `/stop` paused us, resume ONLY
+        // after a grace window: the ping that may have been mid-flight when /stop
+        // landed makes the pane busy too, and must NOT be mistaken for the human
+        // coming back. After the grace, a busy pane is a genuine new turn → resume.
+        if (busy) {
+          k.count = 0; k.settledMtime = 0;
+          if (a.keepaliveOff && now - (a.keepaliveOffAt ?? 0) > RESUME_GRACE_MS) a.keepaliveOff = false;
+          continue;
+        }
         // Transcript grew past the last settled ping while we weren't pinging =
-        // a real turn happened → reset the budget so idle after work re-earns it,
-        // and lift the /stop pause.
-        if (k.settledMtime && mtime > k.settledMtime + 1000) { k.count = 0; k.settledMtime = 0; a.keepaliveOff = false; }
-        if (a.keepaliveOff) continue;                          // paused by /stop until a real turn returns
+        // a real turn happened → reset the budget so idle after work re-earns it.
+        if (k.settledMtime && mtime > k.settledMtime + 1000) { k.count = 0; k.settledMtime = 0; }
+        if (a.keepaliveOff) continue;                          // paused by /stop until a real turn returns (busy branch / dispatch lift it)
         const idle = now - mtime;
         if (idle < idleTriggerMs) continue;                    // still warm — too early to bother
         // Hard upper bound: past the TTL the cache is already gone, so a ping
@@ -3760,10 +3772,15 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const r = await tmuxRun(["send-keys", "-t", a.tmuxPane, "Escape"]);
       if (r.code !== 0) return { ok: false, reason: `send-keys Escape failed: ${r.stdout.slice(-200) || r.code}` };
       // /stop also pauses keepalive: the user is deliberately quieting this
-      // session, so stop poking it too. A real turn (WeCom inbound or the pane
-      // going busy) lifts the pause and re-earns the budget.
+      // session, so stop poking it too. A real turn (WeCom inbound, or the pane
+      // going busy AFTER the resume grace) lifts the pause and re-earns the
+      // budget. Stamping keepaliveOffAt gates the busy-resume so the ping that
+      // may be mid-flight right now can't immediately self-resume.
       a.keepaliveOff = true;
+      a.keepaliveOffAt = Date.now();
       a.keepalive = { count: 0, settledMtime: 0, pinging: false, pingMtime: 0 };
+      // Any in-flight ping's quiet window + detail turn are left to close on their
+      // own turn_end (or the 60s fail-safe), so the interrupted pong stays out of chat.
       log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /stop — Esc sent to pane, keepalive paused");
       return { ok: true };
     },

@@ -14,6 +14,7 @@
 - `mirror`: `/stop` 暂停保活 + 明确终止语义。
 
 ### Fixed
+- `mirror`: `/stop` 暂停保活失效 — 保活自身的 ping 会让 pane 变 busy，而 busy 被当成「真实活动」立刻解除暂停；改为对 busy-resume 加 30s grace 窗口，只有暂停后真正的新一轮才恢复（WeCom dispatch 仍即时恢复）。
 - `sync`: 为 CodeBuddy targets 把 MCP entry 写入 `mcp.json`。
 - 发布包补齐 svr plist/service 模板。
 
