@@ -4,14 +4,19 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-31
+
 ### Added
-- `mcp`: 新增 `subscribe_topic` / `broadcast_topic` tool — agent 自主订阅 topic 与广播,与 IM 命令「订阅」「广播」共用同一订阅表。
+- `mcp`: 事件订阅/广播全面 MCP 化 — 新增 `subscribe_topic` / `unsubscribe_topic` / `broadcast_topic` / `schedule_broadcast` / `cancel_broadcast` / `list_topics`,直接对 AI 说人话即可订阅/广播/定时。
 - `mcp`: 新增 `handoff` tool — 原地把一个 pane 的会话交接给全新会话。
 - `mirror`: prompt-cache 保活心跳 — 空闲 pane 在缓存过期前廉价续命；心跳记入 chat detail，留痕含真实 cache-read usage。
 - `approval`: 新增 `danger.skip` — 命中危险名单也免卡直接放行。
 
 ### Changed
 - `mirror`: `/stop` 暂停保活 + 明确终止语义。
+
+### Removed
+- **BREAKING** `topics`: 移除订阅/广播的 IM 文本命令(「订阅」「广播」「每天…广播」「取消广播」「订阅列表」「广播列表」)及 `/skill-b`,全部改由 MCP 工具驱动。`POST /publish` 外部触发接口保留。
 
 ### Fixed
 - `mirror`: `/stop` 暂停保活失效 — 保活自身的 ping 会让 pane 变 busy，而 busy 被当成「真实活动」立刻解除暂停；改为对 busy-resume 加 30s grace 窗口，只有暂停后真正的新一轮才恢复（WeCom dispatch 仍即时恢复）。
@@ -62,7 +67,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.1.4...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/guxi11/wezard/compare/v1.1.4...v1.2.0
 [1.1.4]: https://github.com/guxi11/wezard/compare/v1.1.3...v1.1.4
 [1.1.3]: https://github.com/guxi11/wezard/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/guxi11/wezard/compare/v1.1.1...v1.1.2
