@@ -1628,8 +1628,9 @@ interface AttachState {
    *  NOT advance it, so they can't keep a dead session warm forever. `seenMtime`
    *  = mtime observed on the previous tick, used to spot a real turn that grew
    *  the transcript between ticks (vs. our own ping, which is gated by `pinging`).
-   *  `pinging`/`pingMtime` guard the inject→settle window. */
-  keepalive?: { realMtime: number; seenMtime: number; pinging: boolean; pingMtime: number };
+   *  `pinging`/`pingMtime` guard the inject→settle window. `round` counts pings
+   *  since the last real activity re-anchor — surfaced as `n/N` in the notify. */
+  keepalive?: { realMtime: number; seenMtime: number; pinging: boolean; pingMtime: number; round: number };
   /** Keepalive paused by `/stop`. Stays off until a real turn resumes it — a
    *  WeCom inbound (dispatch) or the pane going busy on a genuine turn — so an
    *  explicitly-stopped session isn't poked until the human comes back. */
@@ -3507,7 +3508,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const sig = normAssistant(pingText).slice(0, 40);
       stale = sig.length > 0 && normAssistant(last).includes(sig);
     } catch { /* unreadable tail — treat as fresh */ }
-    return { realMtime: stale ? mtime - ttlMs : mtime, seenMtime: mtime, pinging: false, pingMtime: 0 };
+    return { realMtime: stale ? mtime - ttlMs : mtime, seenMtime: mtime, pinging: false, pingMtime: 0, round: 0 };
   };
 
   const fireKeepalive = async (a: AttachState): Promise<void> => {
@@ -3534,7 +3535,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
     const tokens = lastContextTokens(a.jsonlPath);
     const size = tokens > 0 ? `~${fmtTokens(tokens)} tokens` : "未知";
-    log.info({ target: a.target, tokens }, "keepalive: ping injected");
+    const totalRounds = Math.max(1, Math.round(kc.maxIdleSec / kc.ttlSec));
+    const round = a.keepalive ? (a.keepalive.round += 1) : 1;
+    log.info({ target: a.target, tokens, round, totalRounds }, "keepalive: ping injected");
     // Open a chat-detail turn for the real heartbeat exchange: userQuery is the
     // actual ping we injected; the assistant reply (expected: just "pong"), any
     // tool calls, and usage are grafted on from the swallowed items in onItem;
@@ -3542,7 +3545,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const turnId = newTurnId();
     a.keepaliveTurnId = turnId;
     recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: kc.ping });
-    if (kc.notify) sendStandalone(a, `KeepAlive · ${size}`);
+    if (kc.notify) sendStandalone(a, `KeepAlive ${round}/${totalRounds} · ${size}`);
   };
 
   let keepaliveTicking = false;
@@ -3590,6 +3593,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // it here; a WeCom inbound lifts it in dispatch.
         if (busy || grewSinceLast) {
           k.realMtime = mtime;
+          k.round = 0; // real work resets the round counter — pings start from 1/N again
           if (a.keepaliveOff && busy && now - (a.keepaliveOffAt ?? 0) > RESUME_GRACE_MS) a.keepaliveOff = false;
           if (busy) continue;
         }
