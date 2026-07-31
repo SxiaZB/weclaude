@@ -3539,7 +3539,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const turnId = newTurnId();
     a.keepaliveTurnId = turnId;
     recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: kc.ping });
-    if (kc.notify) sendStandalone(a, `❤️ 保活 · context ${size}`);
+    if (kc.notify) sendStandalone(a, `KeepAlive · ${size}`);
   };
 
   let keepaliveTicking = false;

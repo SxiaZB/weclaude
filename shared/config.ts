@@ -125,7 +125,7 @@ const Mirror = z.object({
       // human glancing at the pane sees why it's there. The reply is swallowed —
       // never mirrored to chat, the detail store, or usage accounting.
       ping: z.string().default('keepalive — reply with just "pong", take no other action'),
-      // Push a one-line "KeepAlive · ~Nk · n/max" note to chat on each ping.
+      // Push a one-line "KeepAlive · ~Nk" note to chat on each ping.
       notify: z.boolean().default(true),
     })
     .default({}),
