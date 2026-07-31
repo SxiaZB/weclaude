@@ -36,7 +36,7 @@ import type { CtxCut, TurnUsage } from "./detail.js";
 import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
 import { splitMarkdown } from "../shared/md-chunk.js";
 import { randomTip } from "./tips.js";
-import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, lastContextTokens, tailTurns, type PeerInfo } from "./peers.js";
+import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, lastContextTokens, keepaliveStamps, type PeerInfo } from "./peers.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -1623,14 +1623,15 @@ interface AttachState {
    *  standalone and drops per-tool bubbles (kept in the detail store). Set on the
    *  goal marker, cleared on the completing turn's turn_end. */
   goalActive?: boolean;
-  /** `realMtime` = transcript mtime of the last REAL (non-ping) activity — the
-   *  anchor for the "real work too old" cutoff; keepalive pings deliberately do
-   *  NOT advance it, so they can't keep a dead session warm forever. `seenMtime`
-   *  = mtime observed on the previous tick, used to spot a real turn that grew
-   *  the transcript between ticks (vs. our own ping, which is gated by `pinging`).
-   *  `pinging`/`pingMtime` guard the inject→settle window. `round` counts pings
-   *  since the last real activity re-anchor — surfaced as `n/N` in the notify. */
-  keepalive?: { realMtime: number; seenMtime: number; pinging: boolean; pingMtime: number; round: number };
+  /** Keepalive clocks, driven by MESSAGE-turn timestamps (see keepaliveStamps),
+   *  NOT file mtime — non-message lines bump mtime and must not read as activity.
+   *  `lastMs` = last user/assistant turn (real OR our ping) = cache-warmth clock;
+   *  `lastRealMs` = last genuine (non-ping/non-pong) turn = the real-idle cutoff.
+   *  `seenMtime` = file mtime observed last tick, the cheap "re-read the tail?"
+   *  gate. `pinging`/`pingMtime` guard the inject→settle window (pingMtime holds
+   *  `lastMs` at fire; the ping settles once a newer turn — its own — appears).
+   *  `round` counts pings since the last real turn — surfaced as `n/N`. */
+  keepalive?: { lastMs: number; lastRealMs: number; seenMtime: number; pinging: boolean; pingMtime: number; round: number };
   /** Keepalive paused by `/stop`. Stays off until a real turn resumes it — a
    *  WeCom inbound (dispatch) or the pane going busy on a genuine turn — so an
    *  explicitly-stopped session isn't poked until the human comes back. */
@@ -2686,6 +2687,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     });
     bySessionId.set(sessionId, a);
     byTarget.set(target, a);
+    // Preserve a persisted `/stop` pause across the re-attach: restore rebuilds the
+    // record here, and dropping keepaliveOff would resurrect a session the user
+    // explicitly quieted. restoreFromStore re-hydrates the in-memory flags below.
+    const prevRec = deps.store.get(target);
     deps.store.set(target, {
       sessionId,
       jsonlPath,
@@ -2693,6 +2698,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       tmuxPane: a.tmuxPane || undefined,
       cwd: a.runningCwd || undefined,
       pendingCwd: a.pendingCwd || undefined,
+      keepaliveOff: prevRec?.keepaliveOff,
+      keepaliveOffAt: prevRec?.keepaliveOffAt,
     });
     log.info({ sessionId, jsonlPath, target, tmuxSession: a.tmuxSession, runningCwd: a.runningCwd, pendingCwd: a.pendingCwd, mirrors: bySessionId.size }, "mirror attached");
     return { ok: true, sessionId, jsonlPath, target };
@@ -2815,8 +2822,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       log.warn({ principal, reason: r.reason }, "mirror restore: re-attach failed");
       return undefined;
     }
+    // Re-hydrate the `/stop` pause so a reload doesn't resume pinging a quieted
+    // session (attach preserved it on disk; this puts it back in memory).
+    const restored = byTarget.get(principal);
+    if (restored && rec.keepaliveOff) { restored.keepaliveOff = true; restored.keepaliveOffAt = rec.keepaliveOffAt; }
     log.info({ principal, sessionId: rec.sessionId, livePane: livePane || "(spawn-mode)" }, "mirror restored from store");
-    return byTarget.get(principal);
+    return restored;
+  };
+
+  // Write the live `/stop` pause state through to the store (merging, not
+  // clobbering, the rest of the record) so it survives a daemon reload.
+  const persistPause = (a: AttachState): void => {
+    const rec = deps.store.get(a.target);
+    if (rec) deps.store.set(a.target, { ...rec, keepaliveOff: a.keepaliveOff, keepaliveOffAt: a.keepaliveOffAt });
   };
 
 
@@ -3495,19 +3513,16 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // so it can't self-resume the pause. A genuine new turn after this window does.
   const RESUME_GRACE_MS = 30_000;
 
-  // Seed the keepalive anchor. If the transcript's last user turn IS one of our
-  // pings, the session has been idling under keepalive — anchor realMtime in the
-  // past so a daemon restart doesn't resume pinging a stale session (it waits for
-  // genuine activity). Otherwise anchor to the current mtime (fresh real work).
-  const initKeepalive = (jsonlPath: string, mtime: number, pingText: string, ttlMs: number): AttachState["keepalive"] => {
-    let stale = false;
-    try {
-      const users = tailTurns(jsonlPath, 8).filter((t) => t.role === "user");
-      const last = users[users.length - 1]?.text ?? "";
-      const sig = normAssistant(pingText).slice(0, 40);
-      stale = sig.length > 0 && normAssistant(last).includes(sig);
-    } catch { /* unreadable tail — treat as fresh */ }
-    return { realMtime: stale ? mtime - ttlMs : mtime, seenMtime: mtime, pinging: false, pingMtime: 0, round: 0 };
+  // Seed the keepalive clocks from message-turn timestamps (keepaliveStamps), never
+  // from file mtime — non-message lines (file-history-snapshot / ai-title / mode)
+  // bump mtime without being a model turn, which would fake a long-dead session
+  // back to "just active" and pin it in an endless ping loop. lastRealMs stays
+  // anchored on genuine work, so the tick's realIdle guard can finally let it die.
+  const initKeepalive = (jsonlPath: string, mtime: number, pingSig: string): AttachState["keepalive"] => {
+    let lastMs = 0;
+    let lastRealMs = 0;
+    try { const s = keepaliveStamps(jsonlPath, pingSig); lastMs = s.lastMs; lastRealMs = s.lastRealMs; } catch { /* unreadable tail */ }
+    return { lastMs, lastRealMs, seenMtime: mtime, pinging: false, pingMtime: 0, round: 0 };
   };
 
   const fireKeepalive = async (a: AttachState): Promise<void> => {
@@ -3560,6 +3575,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const idleTriggerMs = Math.max(30, kc.ttlSec - kc.marginSec) * 1000;
       const ttlMs = kc.ttlSec * 1000;
       const maxIdleMs = Math.max(kc.ttlSec, kc.maxIdleSec) * 1000;
+      const pingSig = normAssistant(kc.ping).slice(0, 40);
       const now = Date.now();
       for (const a of byTarget.values()) {
         if (!a.tmuxPane) continue;                            // spawn-mode: no live pane to warm
@@ -3569,45 +3585,46 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         let mtime = 0;
         try { mtime = statSync(a.jsonlPath).mtimeMs; } catch { continue; }
         if (!mtime) continue;
-        const k = (a.keepalive ??= initKeepalive(a.jsonlPath, mtime, kc.ping, ttlMs))!;
-        // Growth since the previous tick — computed BEFORE updating seenMtime.
-        // A real turn writing between ticks trips this; our own ping's growth is
-        // absorbed by the pinging-branch ticks (which update seenMtime too), so it
-        // never looks like real activity here — that's the whole fix.
-        const grewSinceLast = mtime > k.seenMtime + 1000;
+        const k = (a.keepalive ??= initKeepalive(a.jsonlPath, mtime, pingSig))!;
+        // File mtime is only a cheap "did anything change → re-read the tail" gate.
+        // The clocks themselves come from message turns, so metadata churn (which
+        // bumps mtime but is not a turn) can never move them. `grewSinceLast` now
+        // means a NEW message turn appeared — not that the file grew.
+        const prevLastMs = k.lastMs;
+        if (mtime > k.seenMtime + 1000) {
+          const s = keepaliveStamps(a.jsonlPath, pingSig);
+          if (s.stamped) { k.lastMs = s.lastMs; k.lastRealMs = s.lastRealMs; }
+          else { k.lastMs = mtime; k.lastRealMs = mtime; } // backend without timestamps → fall back to mtime
+        }
         k.seenMtime = mtime;
+        const grewSinceLast = k.lastMs > prevLastMs + 1000;
         const busy = paneIsBusy(await capturePaneTail(a.tmuxPane, 12));
 
         if (k.pinging) {
-          // Waiting for our own ping to land and settle. Not written yet, or the
-          // ping turn still running → keep waiting. realMtime is NEVER advanced by
-          // a ping — a ping is not real work.
-          if (busy || mtime <= k.pingMtime) continue;
+          // Waiting for our own ping to land and settle: until a NEWER message turn
+          // (the ping's own user line) appears and the pane goes idle, keep waiting.
+          if (busy || k.lastMs <= k.pingMtime) continue;
           k.pinging = false;
           continue;
         }
-        // Real activity re-anchors the schedule: the pane is busy on a genuine
-        // turn, or the transcript grew since last tick (a turn that completed
-        // between ticks). Only a busy pane keeps looping.
-        //   Lifting a `/stop` pause is stricter: transcript growth after /stop is
-        // almost always the Esc interrupt's own settling writes (the interrupted
-        // turn + trailing tool results), NOT new work — so `grewSinceLast` must
-        // never self-resume the pause. Only a busy pane past the resume grace does
-        // it here; a WeCom inbound lifts it in dispatch.
+        // A new real message turn (or a busy pane) re-anchors: reset the round
+        // counter, and past the /stop grace lift a busy-resume. grewSinceLast is
+        // message-based now, so `/stop`'s Esc settling writes (metadata, no new
+        // turn) can no longer self-resume the pause — only a busy pane past grace,
+        // or a WeCom inbound in dispatch, does.
         if (busy || grewSinceLast) {
-          k.realMtime = mtime;
           k.round = 0; // real work resets the round counter — pings start from 1/N again
-          if (a.keepaliveOff && busy && now - (a.keepaliveOffAt ?? 0) > RESUME_GRACE_MS) a.keepaliveOff = false;
+          if (a.keepaliveOff && busy && now - (a.keepaliveOffAt ?? 0) > RESUME_GRACE_MS) { a.keepaliveOff = false; persistPause(a); }
           if (busy) continue;
         }
         if (a.keepaliveOff) continue;                          // paused by /stop until real activity returns
-        const idleSinceTouch = now - mtime;                    // cache warmth: last touch (real OR ping)
-        const realIdle = now - k.realMtime;                    // user cutoff: last REAL work only
+        const idleSinceTouch = k.lastMs ? now - k.lastMs : now - mtime;   // last model turn = cache touch
+        const realIdle = k.lastRealMs ? now - k.lastRealMs : Infinity;    // no real turn in window ⇒ dead
         if (idleSinceTouch < idleTriggerMs) continue;          // cache still comfortably warm
         if (idleSinceTouch >= ttlMs) continue;                 // cache already cold — a ping would cold-rewrite for nothing
         if (realIdle >= maxIdleMs) continue;                   // real work too old — stop, let it die (你的「超5分钟不保活」)
         k.pinging = true;
-        k.pingMtime = mtime;
+        k.pingMtime = k.lastMs;                                // settles when a newer turn (the ping's own) appears
         await fireKeepalive(a);
       }
     } catch (e) {
@@ -3808,6 +3825,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       a.keepaliveOff = true;
       a.keepaliveOffAt = Date.now();
       a.keepalive = undefined; // re-anchors cleanly on resume
+      persistPause(a);          // survive a reload — don't resurrect a quieted session
       // Any in-flight ping's quiet window + detail turn are left to close on their
       // own turn_end (or the 60s fail-safe), so the interrupted pong stays out of chat.
       log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /stop — Esc sent to pane, keepalive paused");
@@ -3887,10 +3905,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         return;
       }
       // A real inbound is a new conversation → lift any `/stop` keepalive pause
-      // and re-anchor to now (this turn is real work). Pane-side new turns
-      // re-anchor via the tick's busy branch; this covers the WeCom-driven path.
+      // and re-anchor both clocks to now (this turn is real work). Pane-side new
+      // turns re-anchor via the tick's stamps; this covers the WeCom-driven path.
       a.keepaliveOff = false;
-      if (a.keepalive) { a.keepalive.realMtime = Date.now(); a.keepalive.seenMtime = Date.now(); }
+      if (a.keepalive) { a.keepalive.lastMs = Date.now(); a.keepalive.lastRealMs = Date.now(); }
+      persistPause(a); // clear the persisted pause too, else a reload would re-pause
       // Finalize prior live stream (if any) so this new turn renders into its
       // own message bubble. Then open a fresh stream tied to the new frame and
       // ack immediately so WeCom doesn't time out while inject queues.
