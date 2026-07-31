@@ -108,6 +108,31 @@ export const dangerModeSkips = (cfg: Config, hit: DangerHit | undefined): boolea
 export const dangerSkips = (cfg: Config, hit: DangerHit | undefined): boolean =>
   !!hit && cfg.approval.danger.skip;
 
+/**
+ * 上面两个开关合起来的早退判定。undefined = 不早退, 继续走审批链。
+ *
+ * `forcedByOthers` = 这次调用**除 danger 之外**还有别的必发卡理由 (askRules 命中,
+ * 或 `.claude/**` 写守卫生效)。danger 的两个开关只表达「我不在乎危险名单」, 不表达
+ * 「我不在乎另外那两条」—— 所以有其它理由时一律不早退:
+ *   • askRules: 用户显式配的强制审批, 被 danger 开关顺手关掉就成了假配置;
+ *   • `.claude/**` 守卫: 更硬 —— 早退意味着 settleClaudeConfigModal 不会执行,
+ *     CC 随后立起的原生确认框没人去按, pane 无限期卡死。守卫存在的全部意义
+ *     就是消灭这个死锁。
+ *
+ * 注意不能拿「mustCard」当这个参数: danger 命中本身就会置位 mustCard, 那样
+ * dangerSkips 永远不触发, 等于把上游这个特性废掉。
+ */
+export const dangerEarlyExit = (
+  cfg: Config,
+  hit: DangerHit | undefined,
+  forcedByOthers: boolean,
+): "danger_skip" | "danger_mode_skip" | undefined => {
+  if (forcedByOthers) return undefined;
+  if (dangerSkips(cfg, hit)) return "danger_skip";
+  if (dangerModeSkips(cfg, hit)) return "danger_mode_skip";
+  return undefined;
+};
+
 /** 判定一次工具调用是否落在危险名单里。undefined = 安全。 */
 export const dangerOf = (cfg: Config, toolName: string, toolInput: unknown): DangerHit | undefined => {
   const d = cfg.approval.danger;

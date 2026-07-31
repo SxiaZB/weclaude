@@ -26,7 +26,7 @@ import { claudeConfigWrite, type ClaudeConfigHit } from "../shared/claude-config
 import type { NativeModalAnswer } from "./mirror-bridge.js";
 import { appendUnique } from "../shared/config-writer.js";
 import { redact } from "./redact.js";
-import { dangerOf, dangerModeSkips, dangerSkips, type DangerHit } from "./danger.js";
+import { dangerOf, dangerEarlyExit, type DangerHit } from "./danger.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl, getDetail } from "./detail.js";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
@@ -1772,24 +1772,13 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     // 检查跳过 (window 需要一个 chat 才存在), 走后面的 no_approver fallback。
     const approver = resolveApprover(cfg, sessionId, getMirrorTarget);
 
-    // danger.skip / danger 模式这两条早退, 都只对「danger 这个理由」生效 ——
-    // askRules 与 `.claude/**` 守卫是另外两条独立的必发卡理由, 不能被 danger 的
-    // 开关顺带关掉。守卫尤其不能: 放行后 CC 会在 pane 里立起自己的原生确认框,
-    // 而早退意味着 settleClaudeConfigModal 不会执行 —— 没人去按那个框, pane 就
-    // 无限期卡死, 正是守卫要消灭的场景。
-    // (注意这里不能写 !mustCard: danger 命中本身就会置位 mustCard, 那样
-    //  dangerSkips 永远不触发, 等于把上游这个特性废掉。)
-    const forcedByOthers = Boolean(askHit) || guardActive;
-
-    // danger.skip: 命中危险名单也直接放行 (跳过 danger)。
-    if (!forcedByOthers && dangerSkips(cfg, danger)) {
-      json(res, 200, { decision: "allow", reason: "danger_skip" } satisfies ApproveResp);
-      return;
-    }
-
-    // danger 模式: 名单之外的调用不打扰人, 直接放行 (卡只留给真正危险的操作)。
-    if (!forcedByOthers && dangerModeSkips(cfg, danger)) {
-      json(res, 200, { decision: "allow", reason: "danger_mode_skip" } satisfies ApproveResp);
+    // danger.skip / danger 模式的早退。第三个参数是「除 danger 外还有没有别的必发卡
+    // 理由」—— askRules 与 `.claude/**` 守卫不能被 danger 的开关顺带关掉, 判定与
+    // 理由见 dangerEarlyExit 的注释 (守卫被绕过会让 pane 死锁)。
+    const earlyExit = dangerEarlyExit(cfg, danger, Boolean(askHit) || guardActive);
+    if (earlyExit) {
+      log.info({ toolName, sessionId, reason: earlyExit }, "danger switch early exit");
+      json(res, 200, { decision: "allow", reason: earlyExit } satisfies ApproveResp);
       return;
     }
 
