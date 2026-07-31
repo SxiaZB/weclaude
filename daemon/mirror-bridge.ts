@@ -37,7 +37,7 @@ import type { CtxCut, TurnUsage } from "./detail.js";
 import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
 import { splitMarkdown } from "../shared/md-chunk.js";
 import { randomTip } from "./tips.js";
-import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, type PeerInfo } from "./peers.js";
+import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, lastContextTokens, keepaliveStamps, type PeerInfo } from "./peers.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -1686,6 +1686,32 @@ interface AttachState {
    *  standalone and drops per-tool bubbles (kept in the detail store). Set on the
    *  goal marker, cleared on the completing turn's turn_end. */
   goalActive?: boolean;
+  /** Keepalive clocks, driven by MESSAGE-turn timestamps (see keepaliveStamps),
+   *  NOT file mtime — non-message lines bump mtime and must not read as activity.
+   *  `lastMs` = last user/assistant turn (real OR our ping) = cache-warmth clock;
+   *  `lastRealMs` = last genuine (non-ping/non-pong) turn = the real-idle cutoff.
+   *  `seenMtime` = file mtime observed last tick, the cheap "re-read the tail?"
+   *  gate. `pinging`/`pingMtime` guard the inject→settle window (pingMtime holds
+   *  `lastMs` at fire; the ping settles once a newer turn — its own — appears).
+   *  `round` counts pings since the last real turn — surfaced as `n/N`. */
+  keepalive?: { lastMs: number; lastRealMs: number; seenMtime: number; pinging: boolean; pingMtime: number; round: number };
+  /** Keepalive paused by `/stop`. Stays off until a real turn resumes it — a
+   *  WeCom inbound (dispatch) or the pane going busy on a genuine turn — so an
+   *  explicitly-stopped session isn't poked until the human comes back. */
+  keepaliveOff?: boolean;
+  /** When `/stop` paused keepalive (ms). The busy-based resume is gated on a
+   *  grace window after this so an in-flight ping at /stop time can't self-resume. */
+  keepaliveOffAt?: number;
+  /** While set, onItem swallows the keepalive ping turn from every WeCom path
+   *  (no bubble, no live stream), closing on the turn's terminal signal. The
+   *  timer is a fail-safe so a ping that never emits turn_end can't mute a later
+   *  real turn. */
+  keepaliveQuiet?: NodeJS.Timeout;
+  /** Detail-store turn id for the in-flight keepalive. The ping is kept OUT of
+   *  chat but recorded into chat-detail as a marked turn — its real usage
+   *  (cache-read snapshot) is routed here from the swallowed turn_usage items,
+   *  so the timeline shows the ping happened and proves it was a cheap read. */
+  keepaliveTurnId?: string;
 }
 
 // Mirror outbound state machine. See plan: defer stream open by N ms; flush
@@ -2394,7 +2420,41 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (a.liveStream && !a.liveStream.closed) void finalizeStream(a, a.liveStream);
   };
 
+  // Close the keepalive quiet window — the ping turn is over (or the fail-safe
+  // fired), so subsequent real items flow through onItem normally again.
+  const endKeepaliveQuiet = (a: AttachState): void => {
+    if (!a.keepaliveQuiet) return;
+    clearTimeout(a.keepaliveQuiet);
+    a.keepaliveQuiet = undefined;
+  };
+
   const onItem = (a: AttachState, item: RenderItem): void => {
+    // Keepalive ping turns are cache-warmers: swallow every item from the WeCom
+    // paths so the ping/pong never reaches chat. But record the REAL exchange
+    // into its chat-detail turn — the actual assistant reply (expected: just
+    // "pong"), the tool calls if any, and the usage (proof it was a cheap
+    // cache-read) — so the detail page shows the genuine heartbeat, not a
+    // synthetic summary. Closed on the terminal signal (hard or soft turn_end).
+    if (a.keepaliveQuiet) {
+      const id = a.keepaliveTurnId;
+      if (id) {
+        const now = Date.now();
+        if (item.kind === "text") {
+          recordTurnItem(id, { t: "text", body: item.body, ts: now, final: item.final === true });
+        } else if (item.kind === "tool_use") {
+          for (const c of item.calls) recordTurnItem(id, { t: "tool_use", toolUseId: c.toolUseId, toolName: c.name, toolInput: c.input, ts: now });
+        } else if (item.kind === "tool_result") {
+          recordTurnItem(id, { t: "tool_result", toolUseId: item.toolUseId, body: item.full, ts: now });
+        } else if (item.kind === "turn_usage") {
+          recordTurnUsage(id, { model: item.model, messageId: item.messageId, usage: item.usage });
+        } else if (item.kind === "turn_end") {
+          recordTurnClose(id);
+          a.keepaliveTurnId = undefined;
+        }
+      }
+      if (item.kind === "turn_end") endKeepaliveQuiet(a);
+      return;
+    }
     // 任何新 item 到达 = 上一条"消息写完了"并不代表这一轮结束 → 撤销待确认的软收口。
     // 硬信号 (end_turn / turn_duration) 的后端永远不会走到这里。
     if (a.softEnd) { clearTimeout(a.softEnd); a.softEnd = undefined; }
@@ -2690,6 +2750,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     });
     bySessionId.set(sessionId, a);
     byTarget.set(target, a);
+    // Preserve a persisted `/stop` pause across the re-attach: restore rebuilds the
+    // record here, and dropping keepaliveOff would resurrect a session the user
+    // explicitly quieted. restoreFromStore re-hydrates the in-memory flags below.
+    const prevRec = deps.store.get(target);
     deps.store.set(target, {
       sessionId,
       jsonlPath,
@@ -2697,6 +2761,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       tmuxPane: a.tmuxPane || undefined,
       cwd: a.runningCwd || undefined,
       pendingCwd: a.pendingCwd || undefined,
+      keepaliveOff: prevRec?.keepaliveOff,
+      keepaliveOffAt: prevRec?.keepaliveOffAt,
     });
     log.info({ sessionId, jsonlPath, target, tmuxSession: a.tmuxSession, runningCwd: a.runningCwd, pendingCwd: a.pendingCwd, mirrors: bySessionId.size }, "mirror attached");
     return { ok: true, sessionId, jsonlPath, target };
@@ -2819,8 +2885,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       log.warn({ principal, reason: r.reason }, "mirror restore: re-attach failed");
       return undefined;
     }
+    // Re-hydrate the `/stop` pause so a reload doesn't resume pinging a quieted
+    // session (attach preserved it on disk; this puts it back in memory).
+    const restored = byTarget.get(principal);
+    if (restored && rec.keepaliveOff) { restored.keepaliveOff = true; restored.keepaliveOffAt = rec.keepaliveOffAt; }
     log.info({ principal, sessionId: rec.sessionId, livePane: livePane || "(spawn-mode)" }, "mirror restored from store");
-    return byTarget.get(principal);
+    return restored;
+  };
+
+  // Write the live `/stop` pause state through to the store (merging, not
+  // clobbering, the rest of the record) so it survives a daemon reload.
+  const persistPause = (a: AttachState): void => {
+    const rec = deps.store.get(a.target);
+    if (rec) deps.store.set(a.target, { ...rec, keepaliveOff: a.keepaliveOff, keepaliveOffAt: a.keepaliveOffAt });
   };
 
 
@@ -3202,7 +3279,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (pending && pending !== running) {
       lines.push(`下次切换: \`${pending}\` (使用 /new 或 /clear 生效)`);
     }
-    lines.push("> 切换其他项目: 在对话中告诉 AI 调用 `enter` MCP 工具");
     // Session-boundary footer — `/new` and `/clear` are the only two callers,
     // so the tip lands exactly once per fresh context, never mid-conversation.
     lines.push(randomTip());
@@ -3250,7 +3326,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   ): Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string; info?: string }> => {
     const prev = byTarget.get(target);
     // Resolution precedence (all chat-scoped except the running-cwd fallback):
-    //   base.pending > target.running > base.running > default
+    //   base.pending > caller.pending > target.running > base.running > default
     // A fresh tagged session inherits the chat's current cwd; re-`/new`ing a
     // live tagged session keeps its pane cwd unless the base session queued a
     // `cd`. This keeps siblings aligned by default without forcibly clobbering
@@ -3259,9 +3335,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const rec = !prev ? deps.store.get(target) : undefined;
     // An explicit per-node cwd (graph spec) outranks every chat-scoped fallback:
     // the point of declaring it is that this node lives in a different repo.
+    // When no base session exists (tagged-only chats), setPendingCwd writes to
+    // the caller's own record — include it here so the switch isn't lost.
     const eff =
       (opts?.cwd?.trim() ? expandHome(opts.cwd.trim()) : "") ||
       chat.pending ||
+      (prev?.pendingCwd?.trim()) ||
       (prev?.runningCwd?.trim()) ||
       (rec?.cwd?.trim()) ||
       chat.running ||
@@ -3481,6 +3560,144 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return { ok: true, pane: compactPane(raw, rows), busy: paneIsBusy(raw) };
   };
 
+  // ── Prompt-cache keepalive ──────────────────────────────────────────
+  // Anthropic's prompt cache expires ~5min after the last request. A pane that
+  // goes idle (agent parked on a peer, background task running) lets the whole
+  // context fall out of cache — the next real turn then re-writes it at 1.25x.
+  // We inject a tiny ping just before expiry so the model makes one cheap
+  // request (cache-read 0.1x) that slides the TTL forward. The whole schedule is
+  // anchored to the last REAL (non-ping) activity, NOT to our own pings — so a
+  // dead session is never kept warm forever, and once real work is older than
+  // `maxIdleSec` we stop and let the cache die.
+  const fmtTokens = (n: number): string =>
+    n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
+  // After `/stop`, ignore pane-busy as a resume signal for this long — long
+  // enough for an in-flight ping (interrupted by the same /stop's Esc) to settle,
+  // so it can't self-resume the pause. A genuine new turn after this window does.
+  const RESUME_GRACE_MS = 30_000;
+
+  // Seed the keepalive clocks from message-turn timestamps (keepaliveStamps), never
+  // from file mtime — non-message lines (file-history-snapshot / ai-title / mode)
+  // bump mtime without being a model turn, which would fake a long-dead session
+  // back to "just active" and pin it in an endless ping loop. lastRealMs stays
+  // anchored on genuine work, so the tick's realIdle guard can finally let it die.
+  const initKeepalive = (jsonlPath: string, mtime: number, pingSig: string): AttachState["keepalive"] => {
+    let lastMs = 0;
+    let lastRealMs = 0;
+    try { const s = keepaliveStamps(jsonlPath, pingSig); lastMs = s.lastMs; lastRealMs = s.lastRealMs; } catch { /* unreadable tail */ }
+    return { lastMs, lastRealMs, seenMtime: mtime, pinging: false, pingMtime: 0, round: 0 };
+  };
+
+  const fireKeepalive = async (a: AttachState): Promise<void> => {
+    const kc = cfg.wrc.mirror.keepalive;
+    // Suppress the pane→WeCom echo of the ping user line, then swallow the whole
+    // ping turn (reply included). The 60s fail-safe clears the quiet window if
+    // the turn somehow never emits turn_end, so a later real turn is never muted;
+    // it also closes the detail turn so it can't hang open in the chat timeline.
+    rememberInject(kc.ping);
+    a.keepaliveQuiet = setTimeout(() => {
+      a.keepaliveQuiet = undefined;
+      if (a.keepaliveTurnId) { recordTurnClose(a.keepaliveTurnId); a.keepaliveTurnId = undefined; }
+    }, 60_000);
+    const r = await inject({
+      text: kc.ping, images: [], cfg,
+      log: log.child({ target: a.target, sessionId: a.sessionId, sub: "keepalive" }),
+      sessionId: a.sessionId, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane,
+    });
+    if (!r.ok) {
+      endKeepaliveQuiet(a);
+      if (a.keepalive) a.keepalive.pinging = false; // roll back so the next tick can retry
+      log.warn({ target: a.target, reason: r.reason }, "keepalive: inject failed");
+      return;
+    }
+    const tokens = lastContextTokens(a.jsonlPath);
+    const size = tokens > 0 ? `~${fmtTokens(tokens)} tokens` : "未知";
+    // Denominator tracks the ACTUAL ping cadence (idleTriggerMs = ttlSec - marginSec),
+    // not the nominal ttlSec — pings fire marginSec early, so ttlSec would undercount
+    // and let `n` exceed `N` (a 9/8). floor keeps the last shown round the last one that fires.
+    const cadenceSec = Math.max(30, kc.ttlSec - kc.marginSec);
+    const totalRounds = Math.max(1, Math.floor(kc.maxIdleSec / cadenceSec));
+    const round = a.keepalive ? (a.keepalive.round += 1) : 1;
+    log.info({ target: a.target, tokens, round, totalRounds }, "keepalive: ping injected");
+    // Open a chat-detail turn for the real heartbeat exchange: userQuery is the
+    // actual ping we injected; the assistant reply (expected: just "pong"), any
+    // tool calls, and usage are grafted on from the swallowed items in onItem;
+    // closed on the ping's turn_end (or the fail-safe). Kept out of chat.
+    const turnId = newTurnId();
+    a.keepaliveTurnId = turnId;
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: kc.ping });
+    if (kc.notify) sendStandalone(a, `KeepAlive ${round}/${totalRounds} · ${size}`);
+  };
+
+  let keepaliveTicking = false;
+  const keepaliveTick = async (): Promise<void> => {
+    const kc = cfg.wrc.mirror.keepalive;
+    if (!kc.enabled || keepaliveTicking) return;
+    keepaliveTicking = true;
+    try {
+      const idleTriggerMs = Math.max(30, kc.ttlSec - kc.marginSec) * 1000;
+      const ttlMs = kc.ttlSec * 1000;
+      const maxIdleMs = Math.max(kc.ttlSec, kc.maxIdleSec) * 1000;
+      const pingSig = normAssistant(kc.ping).slice(0, 40);
+      const now = Date.now();
+      for (const a of byTarget.values()) {
+        if (!a.tmuxPane) continue;                            // spawn-mode: no live pane to warm
+        if (a.migrationWatcher) continue;                     // session rotating — skip
+        if (a.liveStream && !a.liveStream.closed) continue;   // mid typewriter — don't inject
+        if (!(await tmuxPaneAlive(a.tmuxPane))) continue;     // dead pane — nothing to keep alive
+        let mtime = 0;
+        try { mtime = statSync(a.jsonlPath).mtimeMs; } catch { continue; }
+        if (!mtime) continue;
+        const k = (a.keepalive ??= initKeepalive(a.jsonlPath, mtime, pingSig))!;
+        // File mtime is only a cheap "did anything change → re-read the tail" gate.
+        // The clocks themselves come from message turns, so metadata churn (which
+        // bumps mtime but is not a turn) can never move them. `grewSinceLast` now
+        // means a NEW message turn appeared — not that the file grew.
+        const prevLastMs = k.lastMs;
+        if (mtime > k.seenMtime + 1000) {
+          const s = keepaliveStamps(a.jsonlPath, pingSig);
+          if (s.stamped) { k.lastMs = s.lastMs; k.lastRealMs = s.lastRealMs; }
+          else { k.lastMs = mtime; k.lastRealMs = mtime; } // backend without timestamps → fall back to mtime
+        }
+        k.seenMtime = mtime;
+        const grewSinceLast = k.lastMs > prevLastMs + 1000;
+        const busy = paneIsBusy(await capturePaneTail(a.tmuxPane, 12));
+
+        if (k.pinging) {
+          // Waiting for our own ping to land and settle: until a NEWER message turn
+          // (the ping's own user line) appears and the pane goes idle, keep waiting.
+          if (busy || k.lastMs <= k.pingMtime) continue;
+          k.pinging = false;
+          continue;
+        }
+        // A new real message turn (or a busy pane) re-anchors: reset the round
+        // counter, and past the /stop grace lift a busy-resume. grewSinceLast is
+        // message-based now, so `/stop`'s Esc settling writes (metadata, no new
+        // turn) can no longer self-resume the pause — only a busy pane past grace,
+        // or a WeCom inbound in dispatch, does.
+        if (busy || grewSinceLast) {
+          k.round = 0; // real work resets the round counter — pings start from 1/N again
+          if (a.keepaliveOff && busy && now - (a.keepaliveOffAt ?? 0) > RESUME_GRACE_MS) { a.keepaliveOff = false; persistPause(a); }
+          if (busy) continue;
+        }
+        if (a.keepaliveOff) continue;                          // paused by /stop until real activity returns
+        const idleSinceTouch = k.lastMs ? now - k.lastMs : now - mtime;   // last model turn = cache touch
+        const realIdle = k.lastRealMs ? now - k.lastRealMs : Infinity;    // no real turn in window ⇒ dead
+        if (idleSinceTouch < idleTriggerMs) continue;          // cache still comfortably warm
+        if (idleSinceTouch >= ttlMs) continue;                 // cache already cold — a ping would cold-rewrite for nothing
+        if (realIdle >= maxIdleMs) continue;                   // real work too old — stop, let it die (你的「超5分钟不保活」)
+        k.pinging = true;
+        k.pingMtime = k.lastMs;                                // settles when a newer turn (the ping's own) appears
+        await fireKeepalive(a);
+      }
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "keepalive tick failed");
+    } finally {
+      keepaliveTicking = false;
+    }
+  };
+  const keepaliveTimer = setInterval(() => void keepaliveTick(), 15_000);
+
   return {
     attach,
     peers,
@@ -3663,7 +3880,18 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       if (!alive) return { ok: false, reason: "tmux pane no longer alive" };
       const r = await tmuxRun(["send-keys", "-t", a.tmuxPane, "Escape"]);
       if (r.code !== 0) return { ok: false, reason: `send-keys Escape failed: ${r.stdout.slice(-200) || r.code}` };
-      log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /stop — Esc sent to pane");
+      // /stop also pauses keepalive: the user is deliberately quieting this
+      // session, so stop poking it too. A real turn (WeCom inbound, or the pane
+      // going busy AFTER the resume grace) lifts the pause and re-earns the
+      // budget. Stamping keepaliveOffAt gates the busy-resume so the ping that
+      // may be mid-flight right now can't immediately self-resume.
+      a.keepaliveOff = true;
+      a.keepaliveOffAt = Date.now();
+      a.keepalive = undefined; // re-anchors cleanly on resume
+      persistPause(a);          // survive a reload — don't resurrect a quieted session
+      // Any in-flight ping's quiet window + detail turn are left to close on their
+      // own turn_end (or the 60s fail-safe), so the interrupted pong stays out of chat.
+      log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /stop — Esc sent to pane, keepalive paused");
       return { ok: true };
     },
     submitPane: async (target) => {
@@ -3752,6 +3980,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     newSession,
     shutdown: () => {
       clearInterval(paneDriftTimer);
+      clearInterval(keepaliveTimer);
       for (const a of bySessionId.values()) {
         if (a.outbound?.kind === "deferred") clearTimeout(a.outbound.timer);
         a.outbound = undefined;
@@ -3782,6 +4011,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         }
         return;
       }
+      // A real inbound is a new conversation → lift any `/stop` keepalive pause
+      // and re-anchor both clocks to now (this turn is real work). Pane-side new
+      // turns re-anchor via the tick's stamps; this covers the WeCom-driven path.
+      a.keepaliveOff = false;
+      if (a.keepalive) { a.keepalive.lastMs = Date.now(); a.keepalive.lastRealMs = Date.now(); }
+      persistPause(a); // clear the persisted pause too, else a reload would re-pause
       // Finalize prior live stream (if any) so this new turn renders into its
       // own message bubble. Then open a fresh stream tied to the new frame and
       // ack immediately so WeCom doesn't time out while inject queues.
@@ -3796,10 +4031,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // Auto-upgrade /clear → /new when the user has queued a project switch:
       // a plain /clear would only rotate sessionId in the same pane, which sits
       // in the OLD cwd. Killing+respawning is the only way to honor the switch.
-      // pendingCwd is chat-scoped, so read it via the shared fallback rather
-      // than from this attachment's own record (which is now always empty for
-      // tagged sessions).
-      const pending = chatCwdFallback(a.target).pending;
+      // pendingCwd is chat-scoped on the base principal; fall back to the
+      // caller's own record when no base exists (tagged-only chats).
+      const pending = chatCwdFallback(a.target).pending || a.pendingCwd;
       if (armMigration && pending && pending !== a.runningCwd) {
         if (a.liveStream && !a.liveStream.closed) await finalizeStream(a, a.liveStream);
         log.info({ target: a.target, runningCwd: a.runningCwd, pendingCwd: pending }, "/clear upgraded to /new (cwd switch)");

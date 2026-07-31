@@ -42,6 +42,9 @@ const readTail = (jsonlPath: string): string => {
 export interface Turn {
   role: "user" | "assistant";
   text: string;
+  /** Wall-clock epoch ms from the line's own `timestamp`; 0 if absent/unparsable.
+   *  Lets keepalive anchor realIdle to a message's actual time, not file mtime. */
+  ms?: number;
 }
 
 // Meta wrappers Claude Code injects around slash commands / hook output. They
@@ -77,7 +80,8 @@ export const tailTurns = (jsonlPath: string, n = 3): Turn[] => {
       const role = row.message?.role;
       if (role !== "user" && role !== "assistant") return [];
       const text = blockText(row.message?.content).replace(META_RE, "").replace(/\s+/g, " ").trim();
-      return text ? [{ role, text } as Turn] : [];
+      const ms = Date.parse((parsed as { timestamp?: string }).timestamp ?? "");
+      return text ? [{ role, text, ms: Number.isNaN(ms) ? 0 : ms } as Turn] : [];
     });
   return turns.slice(-n);
 };
@@ -101,6 +105,66 @@ export const lastAssistantText = (jsonlPath: string, max = 4000): string => {
   const turns = tailTurns(jsonlPath, 40).filter((t) => t.role === "assistant");
   const last = turns[turns.length - 1]?.text ?? "";
   return last.length > max ? `${last.slice(0, max)}…` : last;
+};
+
+/** Prompt-token size of the session's most recent turn: input + both cache
+ *  tiers = how full the context window is, i.e. exactly what a cold cache would
+ *  have to re-write at 1.25x. Read from the last assistant usage snapshot in
+ *  the tail; 0 when no usage is on record yet. Drives the keepalive decision
+ *  and the "session size" note. */
+export const lastContextTokens = (jsonlPath: string): number => {
+  const raw = readTail(jsonlPath);
+  if (!raw) return 0;
+  const normalize = backendForPath(jsonlPath).normalizeTranscriptLine;
+  const lines = raw.split("\n").filter((l) => l.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let row;
+    try { row = normalize(JSON.parse(lines[i]!)); } catch { continue; }
+    const u = row?.message?.usage;
+    if (!u) continue;
+    const rawIn = u.input_tokens ?? 0;
+    const cr = u.cache_read_input_tokens ?? 0;
+    const cw = u.cache_creation_input_tokens ?? 0;
+    // CodeBuddy's gateway totalizes input_tokens (= cr+cw+fresh); Anthropic-native
+    // keeps the three disjoint. Detect by the model's version style ("4.7-opus"
+    // vs "opus-4-7") — same reconciliation the mirror does for usage accounting.
+    const model = row?.message?.model;
+    const gatewayTotalized = typeof model === "string" && /\d\.\d/.test(model);
+    return gatewayTotalized && rawIn >= cr + cw ? rawIn : rawIn + cr + cw;
+  }
+  return 0;
+};
+
+/** The two clocks keepalive actually needs, read from MESSAGE-turn timestamps —
+ *  never from file mtime. Claude Code appends `file-history-snapshot` / `ai-title`
+ *  / `mode` / `permission-mode` lines that carry no `timestamp` yet bump the file
+ *  mtime; keying the schedule off mtime lets that non-conversational churn fake
+ *  "activity", resetting the idle clocks and pinning a long-dead session in an
+ *  endless keepalive loop. Deriving from turns kills that at the source.
+ *   `lastMs`     newest user/assistant turn (real OR our own ping) — the prompt-cache
+ *                warmth clock; only a real model request actually re-warms the cache.
+ *   `lastRealMs` newest GENUINE turn (non-ping/non-pong) — the real-idle cutoff; 0
+ *                when none sits in the read window ⇒ real work predates the tail.
+ *   `stamped`    false when no turn carried a timestamp (backend without them), so
+ *                the caller can fall back to mtime instead of judging all idle. */
+export const keepaliveStamps = (
+  jsonlPath: string,
+  pingSig: string,
+): { lastMs: number; lastRealMs: number; stamped: boolean } => {
+  const turns = tailTurns(jsonlPath, 24);
+  const norm = (s: string): string => s.replace(/\s+/gu, "");
+  const isPing = (t: Turn): boolean => t.role === "user" && pingSig.length > 0 && norm(t.text).includes(pingSig);
+  const isPong = (t: Turn): boolean => t.role === "assistant" && norm(t.text).replace(/[^a-zA-Z]/g, "").toLowerCase() === "pong";
+  let lastMs = 0;
+  let lastRealMs = 0;
+  let stamped = false;
+  for (const t of turns) {
+    const ms = t.ms ?? 0;
+    if (ms > 0) stamped = true;
+    if (ms > lastMs) lastMs = ms;
+    if (ms > lastRealMs && !isPing(t) && !isPong(t)) lastRealMs = ms;
+  }
+  return { lastMs, lastRealMs, stamped };
 };
 
 // ── Pane liveness ─────────────────────────────────────────────────────

@@ -23,6 +23,12 @@ export interface MirrorAttachment {
    *  once the spawn lands. Decoupling from `cwd` means a /pwd before /new
    *  can show "current X, will switch to Y on /new". */
   pendingCwd?: string;
+  /** `/stop` keepalive pause, persisted so a daemon reload doesn't resurrect a
+   *  session the user explicitly quieted. Lifted (→ false) by a real inbound or a
+   *  busy-resume, both of which re-persist. `keepaliveOffAt` = when paused (ms),
+   *  gating the busy-resume grace across restarts. */
+  keepaliveOff?: boolean;
+  keepaliveOffAt?: number;
 }
 
 export interface MirrorStore {

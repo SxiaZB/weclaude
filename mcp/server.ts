@@ -496,5 +496,155 @@ server.registerTool(
   async ({ runId }) => unwrap("stop_graph", await daemonPost("/graph/stop", { runId })),
 );
 
+server.registerTool(
+  "handoff",
+  {
+    title: "Hand off a session's work to a fresh session",
+    description:
+      "Hand off the work in a tmux pane / peer session to a BRAND-NEW session, in place: the daemon asks that session to compress everything into a self-contained handoff brief, waits for it, then sends `/clear` into the SAME pane (resets the context window, new sessionId, same cwd) and pastes the brief in as the new session's first message. Use this when a session's context window is bloated / near its limit, or the user says '交接一下' / 'handoff' / '开个新会话接着干' / '压缩上下文重开'. Address the session by tmux `pane` id (e.g. '%5', from list_peers / list_claude_sessions) OR by peer `tag`. Refuses to hand off your OWN session (would deadlock). Returns the brief that was carried across.",
+    inputSchema: {
+      pane: z.string().optional().describe("Target tmux pane id, e.g. '%5'. Takes precedence over tag. Get it from list_peers / list_claude_sessions."),
+      tag: z.string().optional().describe("Peer tag WITHOUT '#', e.g. 'fix'. Empty string = the chat's default session. Ignored when pane is given."),
+      focus: z.string().optional().describe("Optional emphasis for the handoff brief, e.g. '重点交代还没跑通的测试'."),
+      timeoutSec: z.number().optional().describe("Max seconds to wait for the summary before aborting (30-7200, default 600)."),
+    },
+  },
+  async ({ pane, tag, focus, timeoutSec }) =>
+    unwrap(
+      "handoff",
+      await daemonPost("/handoff", {
+        ...(pane ? { pane } : {}),
+        ...(tag !== undefined ? { tag } : {}),
+        ...(focus ? { focus } : {}),
+        ...(timeoutSec ? { timeoutSec } : {}),
+      }),
+    ),
+);
+
+// ── Topic pub/sub (注册订阅 + 广播) ────────────────────────────────────────
+// A lightweight event bus layered on WeCom chats: a session registers its chat
+// as a subscriber of a named topic, anyone broadcasts to every subscriber at
+// once. Same store the IM commands「订阅」/「广播」use — persisted to config.jsonc
+// (`topics.subs`), surviving daemon reloads. subscribe resolves the caller's
+// chat via selfRef; broadcast is subscriber-agnostic, so it hits the shared
+// /publish route directly.
+server.registerTool(
+  "subscribe_topic",
+  {
+    title: "Subscribe this chat to a topic",
+    description:
+      "Register the CURRENT WeCom chat (the one mirroring this session) as a subscriber of a named topic, so it receives every future broadcast_topic push and scheduled daily broadcast on that topic. Equivalent to the user typing 「订阅 <topic>」 in the chat, but driven by the agent. Topics are free-form event names (e.g. 'ci-fail', 'daily-report'); subscriptions persist across daemon reloads. Use when the user says 「订阅 xxx」/「注册到 xxx 事件」/「以后 xxx 的消息也发这个群」. Returns `added` (false if already subscribed) and the topic's current subscriber count.",
+    inputSchema: {
+      topic: z.string().describe("Topic name to subscribe to, e.g. 'ci-fail'. Free-form: letters / digits / CJK / - / _ / . , no whitespace."),
+    },
+  },
+  async ({ topic }) => unwrap("subscribe_topic", await daemonPost("/topics/subscribe", { topic })),
+);
+
+server.registerTool(
+  "broadcast_topic",
+  {
+    title: "Broadcast a message to a topic's subscribers",
+    description:
+      "Fan a markdown message out to EVERY chat/session subscribed to the given topic. Equivalent to 「广播 <topic> <内容>」. Each subscriber receives it as a normal WeCom bubble in its own channel (tagged sessions get their `#tag` header). Returns `sent` / `failed` / `subs` so you know the reach. Use when the user says 「广播 xxx」/「给订阅 xxx 的都发一下」, or an agent needs to notify a fleet of sessions at once. For a private nudge into ONE peer session, use send_peer instead.",
+    inputSchema: {
+      topic: z.string().describe("Topic to publish to. Subscribers are whoever ran subscribe_topic / 「订阅」 on this topic."),
+      markdown: z.string().describe("Message body in WeCom markdown."),
+    },
+  },
+  async ({ topic, markdown }) => {
+    const resp = await fetch(`${DAEMON_BASE}/publish`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ topic, markdown }),
+    });
+    const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+    return j.ok ? ok(j) : fail(`broadcast_topic failed: ${j.error ?? `http ${resp.status}`}`);
+  },
+);
+
+server.registerTool(
+  "unsubscribe_topic",
+  {
+    title: "Unsubscribe this chat from a topic",
+    description:
+      "Remove the CURRENT WeCom chat from a topic's subscriber list, so it stops receiving that topic's broadcasts and scheduled pushes. The inverse of subscribe_topic. Returns `removed` (false if it wasn't subscribed). Use when the user says 「退订 xxx」/「别再往这个群发 xxx 了」.",
+    inputSchema: {
+      topic: z.string().describe("Topic name to unsubscribe from."),
+    },
+  },
+  async ({ topic }) => unwrap("unsubscribe_topic", await daemonPost("/topics/unsubscribe", { topic })),
+);
+
+server.registerTool(
+  "list_topics",
+  {
+    title: "List this chat's subscriptions and all scheduled broadcasts",
+    description:
+      "Show what THIS chat is subscribed to (`subs`: topic + subscriber count) plus every daily scheduled broadcast on the host (`schedules`: topic, HH:MM, creator). Use when the user asks 「订阅列表」/「有哪些定时广播」/「我订了什么」. Read-only.",
+    inputSchema: {},
+  },
+  async () => unwrap("list_topics", await daemonPost("/topics/list", {})),
+);
+
+server.registerTool(
+  "schedule_broadcast",
+  {
+    title: "Schedule a daily broadcast to a topic",
+    description:
+      "Register a recurring daily broadcast: every day at hour:minute (host local time) the daemon publishes `content` to all subscribers of `topic`. Equivalent to 「每天 HH:MM 广播 <topic> <内容>」. Persists across daemon reloads. Use when the user says 「每天 8 点广播 xxx」/「定时给订阅者发 xxx」. To fire once immediately instead, use broadcast_topic.",
+    inputSchema: {
+      topic: z.string().describe("Topic whose subscribers receive the daily push."),
+      hour: z.number().int().min(0).max(23).describe("Hour of day, 0-23 (host local time)."),
+      minute: z.number().int().min(0).max(59).optional().describe("Minute, 0-59. Default 0."),
+      content: z.string().describe("Message body in WeCom markdown, sent every day at the given time."),
+    },
+  },
+  async ({ topic, hour, minute, content }) =>
+    unwrap("schedule_broadcast", await daemonPost("/topics/schedule", { topic, hour, minute: minute ?? 0, content })),
+);
+
+server.registerTool(
+  "cancel_broadcast",
+  {
+    title: "Cancel a topic's daily scheduled broadcasts",
+    description:
+      "Delete ALL daily scheduled broadcasts for a topic (does NOT touch subscriptions or fire anything). Equivalent to 「取消广播 <topic>」. Returns how many schedules were removed. Use when the user says 「取消 xxx 的定时」/「别再每天发 xxx 了」.",
+    inputSchema: {
+      topic: z.string().describe("Topic whose scheduled broadcasts should be removed."),
+    },
+  },
+  async ({ topic }) => unwrap("cancel_broadcast", await daemonPost("/topics/cancel-schedule", { topic })),
+);
+
+// ── Config ──────────────────────────────────────────────────────────
+server.registerTool(
+  "config_set",
+  {
+    title: "Wezard config",
+    description:
+      "Read or modify wezard daemon configuration. Supported keys: allow_from (add/remove authorized chats/users), approval_window (auto-approve window minutes), approval_cache (session decision cache minutes), danger_skip (skip dangerous-op gating), danger_enabled (toggle danger detection), approval_mode (all|danger), cwd (default workspace), default_chat (outbound target), log_level (trace|debug|info|warn|error). Use action='add'/'remove' for array keys (allow_from), 'set' for scalars. Keywords: 设置、配置、cfg、wezard、allowFrom、授权、自动通过、时间窗口、danger skip、workspace.",
+    inputSchema: {
+      key: z
+        .enum(["allow_from", "approval_window", "approval_cache", "danger_skip", "danger_enabled", "approval_mode", "cwd", "default_chat", "log_level"])
+        .describe("Config key to read or modify."),
+      value: z
+        .string()
+        .optional()
+        .describe("New value. Omit to read current value. For booleans: 'true'/'false'. For arrays with action=set: JSON array string."),
+      action: z
+        .enum(["set", "add", "remove"])
+        .optional()
+        .describe("For array keys (allow_from): 'add' appends, 'remove' deletes an item. Scalars always use 'set'. Default: 'set'."),
+    },
+  },
+  async ({ key, value, action }) => {
+    if (value === undefined) {
+      return unwrap("config_set", await daemonPost("/config/get", { key }));
+    }
+    return unwrap("config_set", await daemonPost("/config/set", { key, value, action: action ?? "set" }));
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

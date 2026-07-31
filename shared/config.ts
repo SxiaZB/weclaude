@@ -98,6 +98,37 @@ const Mirror = z.object({
   // 中间 tool_use / tool_result / thinking / 非 final text 全部只写进详情页,不发气泡。
   // 授权卡照常发群 (交互无法替代)。false = 现状 (逐条气泡)。
   brief: z.boolean().default(true),
+  // ── Prompt-cache keepalive ────────────────────────────────────────────
+  // Anthropic prompt caching: cache-write costs 1.25x, cache-read 0.1x, and the
+  // cache lives only ~5min. A pane that goes idle (agent parked waiting on a
+  // peer, or a long background task) lets that cache expire — so the next real
+  // turn pays a full 1.25x re-write of the entire context. keepalive injects a
+  // tiny ping just before expiry: it re-reads the cached prefix (0.1x) and
+  // slides the TTL forward, so the eventual real turn only writes the delta.
+  keepalive: z
+    .object({
+      // Master switch. Off → no pings, no timer overhead.
+      enabled: z.boolean().default(true),
+      // Prompt-cache TTL (s). Anthropic default is 300 (5min).
+      ttlSec: z.number().int().positive().default(300),
+      // Fire this many seconds BEFORE ttl expiry — the ping needs slack to land
+      // and settle. Effective idle trigger = ttlSec - marginSec.
+      marginSec: z.number().int().nonnegative().default(45),
+      // Stop keeping alive once the LAST REAL (non-ping) activity is older than
+      // this. The cutoff is measured from genuine work, NOT from our own pings
+      // (which would otherwise self-perpetuate forever). Default = ttlSec, i.e.
+      // keepalive only bridges the first cache-expiry after real work and then
+      // lets it go cold. Raise it (e.g. 1800) to chain pings across a longer
+      // idle wait; pings still stop the moment real-idle crosses this bound.
+      maxIdleSec: z.number().int().positive().default(300),
+      // The ping text. Tiny (small cache-write delta) and self-describing so a
+      // human glancing at the pane sees why it's there. The reply is swallowed —
+      // never mirrored to chat, the detail store, or usage accounting.
+      ping: z.string().default('keepalive — reply with just "pong", take no other action'),
+      // Push a one-line "KeepAlive · ~Nk" note to chat on each ping.
+      notify: z.boolean().default(true),
+    })
+    .default({}),
 });
 
 const Wrc = z.object({
@@ -269,7 +300,7 @@ const Svr = z.object({
 
 // 事件订阅 / 广播。subs 是 topic → 目标id数组 (`user:xxx` / `chat:xxx`),
 // 一个 topic 可以有多个订阅者; schedules 是「每天 HH:MM 触发某 topic」的定时任务。
-// 订阅关系与定时通过 IM 命令 (订阅 / 每天HH:MM广播 …) 增删,写回 config.jsonc。
+// 订阅关系与定时通过 MCP 工具 (subscribe_topic / schedule_broadcast …) 增删,写回 config.jsonc。
 const Schedule = z.object({
   topic: z.string(),
   hour: z.number().int().min(0).max(23),
