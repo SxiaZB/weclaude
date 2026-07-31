@@ -257,8 +257,9 @@ const emojiFor = tagBadge;
 // 会话名: #tag (企微发起) > CC 会话名 (本地发起, sessions 注册表) > 首条消息。
 const HMETA_VAL_MAX = 26;
 
-const cardTitle = (a: CardArgs): string =>
-  `${a.sessionName || a.sessionShort} · ${shortTool(a.toolName)}`;
+// 标题只放会话名 —— 工具名在下面的命令正文里一眼可见, 标题重复它是浪费
+// main_title 那 13×2 字的宝贵空间。
+const cardTitle = (a: CardArgs): string => a.sessionName || a.sessionShort;
 
 // mcp__server__tool → server:tool — 标题里的长工具名压短。
 const shortTool = (toolName: string): string =>
