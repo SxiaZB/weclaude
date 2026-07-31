@@ -27,7 +27,7 @@ import type { NativeModalAnswer } from "./mirror-bridge.js";
 import { appendUnique } from "../shared/config-writer.js";
 import { redact } from "./redact.js";
 import { dangerOf, dangerModeSkips, dangerSkips, type DangerHit } from "./danger.js";
-import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";
+import { recordApproval, recordApprovalDecision, buildDetailUrl, getDetail } from "./detail.js";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
 import { tagBadge, withTagHeader } from "../shared/session-label.js";
@@ -204,8 +204,21 @@ const renderInput = (
   return { body: summarizeUnknown(i, cwd) };
 };
 
-const quoteArea = (text: string): TemplateCard["quote_area"] =>
-  ({ type: 0, quote_text: text } as TemplateCard["quote_area"]);
+// 引用区: quote_text 本身无长度限制且支持换行 (企微模板卡片文档), 但手机端实测
+// 只渲染前 2~3 行且没有展开入口。给它挂上 type:1 + url 让整块可点 —— 点一下直接
+// 进详情页看全文, 比"先在群里发一条完整命令的文本消息再发卡"干净得多。
+// title 用来明说"还有多少没显示 + 可以点", 否则用户不知道引用区是可点的。
+const quoteArea = (text: string, url?: string, title?: string): TemplateCard["quote_area"] =>
+  (url
+    ? { type: 1, url, ...(title ? { title } : {}), quote_text: text }
+    : { type: 0, ...(title ? { title } : {}), quote_text: text }) as TemplateCard["quote_area"];
+
+// Bash/Shell 的原始命令 — 判断卡片正文是否被截断、以及「展开完整命令」取哪一段。
+const commandOf = (toolName: string, toolInput: unknown): string => {
+  if (toolName !== "Bash" && toolName !== "Shell") return "";
+  const i = toolInput as Record<string, unknown> | null;
+  return i && typeof i.command === "string" ? i.command : "";
+};
 
 const MAIN_DESC_MAX = 30;
 const mainTitle = (title: string, desc?: string): TemplateCard["main_title"] =>
@@ -245,11 +258,39 @@ const approveButtons = (a: CardArgs): TemplateCard["button_list"] =>
         { text: "✅", style: 4, key: encodeKey(a.reqId, "allow") },
       ];
 
+// 正文放不下时的两条出路, 都挂在卡片自己身上 (不再额外发一条完整命令的文本消息):
+//   • 引用区可点 → 详情页 (HTML, 有高亮, 但要跳浏览器)
+//   • 右上角「⋯」菜单「📄 展开完整命令」→ 按需在群里发全文 (不跳出企微)
+// action_menu 只在正文确实被截断时才挂, 免得短命令的卡也多一个没用的入口。
+const FULLCMD_PREFIX = "FULLCMD|";
+const encodeFullCmdKey = (reqId: string): string => `${FULLCMD_PREFIX}${reqId}`;
+// WeCom markdown 单条上限约 2048 字节, 留出标题与 tag 头的余量。
+const FULLCMD_CHUNK_CHARS = 1800;
+const chunkText = (s: string, size: number): string[] => {
+  const out: string[] = [];
+  for (let i = 0; i < s.length; i += size) out.push(s.slice(i, i + size));
+  return out.length > 0 ? out : [""];
+};
+
+/** 正文被截断时才给的两个入口, 待决卡与已决卡共用 (已决卡也要能回看批了什么)。 */
+const fullCmdAffordance = (
+  a: CardArgs,
+  bodyLen: number,
+): { menu?: TemplateCard["action_menu"]; quoteTitle?: string } => {
+  const fullCmd = commandOf(a.toolName, a.toolInput);
+  if (fullCmd.length <= bodyLen) return {};
+  return {
+    menu: { desc: "更多", action_list: [{ text: "📄 展开完整命令", key: encodeFullCmdKey(a.reqId) }] },
+    quoteTitle: `完整命令共 ${fullCmd.length} 字 · 点此查看`,
+  };
+};
+
 const buildCard = (a: CardArgs): TemplateCard => {
   const r = renderInput(a.toolName, a.toolInput, a.toolInputStr, a.cwd);
   const dir = dirName(a.cwd);
   const tail = oneLine(a.transcriptTail).trim();
   const jl = detailJumpList(a.detailUrl);
+  const fc = fullCmdAffordance(a, r.body.length);
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
@@ -258,7 +299,8 @@ const buildCard = (a: CardArgs): TemplateCard => {
       r.desc,
     ),
     ...(a.danger ? { sub_title_text: `命中危险名单「${a.danger}」· 需单独确认,不进入自动放行` } : {}),
-    ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
+    ...(fc.menu ? { action_menu: fc.menu } : {}),
+    ...(r.body ? { quote_area: quoteArea(r.body, a.detailUrl, fc.quoteTitle) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
     button_list: approveButtons(a),
@@ -308,11 +350,15 @@ const buildResolvedCard = (
   const dir = dirName(a.cwd);
   const tail = oneLine(a.transcriptTail).trim();
   const jl = detailJumpList(a.detailUrl);
+  // 已决卡同样保留「看全文」的两个入口 —— 回头想确认"我刚才批的到底是什么"是
+  // 常态, 而 detail 记录留存 24h, 点了照样能展开。
+  const fc = fullCmdAffordance(a, r.body.length);
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
     main_title: mainTitle(`${a.danger ? "⚠️ " : ""}${tagOf(a)}${a.toolName} · ${dir}/`, r.desc),
-    ...(r.body ? { quote_area: quoteArea(r.body) } : {}),
+    ...(fc.menu ? { action_menu: fc.menu } : {}),
+    ...(r.body ? { quote_area: quoteArea(r.body, a.detailUrl, fc.quoteTitle) } : {}),
     ...(jl ? { jump_list: jl } : {}),
     task_id: a.reqId,
     button_list: [resolvedButton(a.decision, a.windowMinutes, a.reqId, a.chatKey ?? "")],
@@ -1441,27 +1487,28 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
   const detailUrlFor = (id: string): string =>
     buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
 
-  // 手机端卡片 quote 区实测只渲染前 2~3 行且无展开入口 — 命令超过这个字数时,
-  // 发卡前先推一条完整命令的 markdown 前置消息 (普通气泡可展开, 无渲染截断)。
+  // 手机端卡片 quote 区实测只渲染前 2~3 行 —— 长命令在卡上看不全。默认解法已经
+  // 挪到卡片自身 (引用区可点进详情页 + 右上角「📄 展开完整命令」按需发全文), 所以
+  // fullCommandPreludeChars 默认为 0 = 不自动前置。留着这条路是给两种情况兜底:
+  // 客户端不渲染 action_menu, 或者就是想让全文无条件出现在群里 (设成正数即可)。
   // 用 display(已脱敏)副本, token 类不外泄。仅单成员卡触发 (批量卡逐成员推会刷屏)。
   const PRELUDE_TRIGGER_CHARS = 200;
-  const PRELUDE_CHUNK_CHARS = 1800;
   const sendCommandPrelude = async (batch: ActiveBatch): Promise<void> => {
     const cap = cfg.approval.fullCommandPreludeChars;
     if (cap <= 0 || batch.members.length !== 1) return;
-    if (batch.toolName !== "Bash" && batch.toolName !== "Shell") return;
-    const ti = batch.members[0]!.toolInput as Record<string, unknown> | null;
-    const cmd = ti && typeof ti.command === "string" ? ti.command : "";
+    const cmd = commandOf(batch.toolName, batch.members[0]!.toolInput);
     if (cmd.length <= PRELUDE_TRIGGER_CHARS) return;
     const text = cmd.length > cap ? `${cmd.slice(0, cap)}\n…（已截断，完整命令共 ${cmd.length} 字）` : cmd;
-    const chunks: string[] = [];
-    for (let i = 0; i < text.length; i += PRELUDE_CHUNK_CHARS) chunks.push(text.slice(i, i + PRELUDE_CHUNK_CHARS));
+    const chunks = chunkText(text, FULLCMD_CHUNK_CHARS);
     const target = targetChatId(batch.approver);
     for (let i = 0; i < chunks.length; i++) {
       const head = i === 0
         ? `🔐 待审批完整命令（${cmd.length} 字${chunks.length > 1 ? `，${i + 1}/${chunks.length}` : ""}）：\n`
         : `（${i + 1}/${chunks.length}）\n`;
-      await client.sendMessage(target, { msgtype: "markdown", markdown: { content: head + chunks[i]! } });
+      await client.sendMessage(target, {
+        msgtype: "markdown",
+        markdown: { content: withTagHeader(batch.approver, head + chunks[i]!) },
+      });
     }
   };
 
@@ -2027,6 +2074,45 @@ export const installApprovalEventListener = (
       const key = ev?.template_card_event?.event_key ?? ev?.event_key ?? "";
       // Update 时 task_id 必须跟回调里的一致，否则微信会拒掉更新。
       const cbTaskId = ev?.template_card_event?.task_id ?? ev?.task_id ?? "";
+
+      // ── action_menu「📄 展开完整命令」: 纯展示, 不改判决、不 resolve pending。
+      // 取 detail store 而不是 pending —— 用户很可能是点完 ✅ 之后回头想看全文,
+      // 那时 pending 早被删了; detail 记录留存 24h, 且卡片解决后依然可点。
+      if (key.startsWith(FULLCMD_PREFIX)) {
+        const reqId = key.slice(FULLCMD_PREFIX.length);
+        const rec = getDetail(reqId);
+        // 回复目标: 待决时在 pending 里, 已决时 pending 已删 —— 回落到 resolved
+        // 暂存。两个都没有才用 defaultChat (`#tag` 会话会因此回到主会话, 不理想,
+        // 但那已经是记录过期的边缘情形)。
+        const target =
+          getPending(reqId)?.chatKey
+          ?? getResolvedSnapshot(reqId)?.meta.chatKey
+          ?? cfg.defaultChat;
+        const cmd = rec && rec.kind === "approval" ? commandOf(rec.toolName, rec.toolInput) : "";
+        void (async () => {
+          try {
+            if (!cmd) {
+              await client.sendMessage(targetChatId(target), {
+                msgtype: "markdown",
+                markdown: { content: withTagHeader(target, "⌛ 该命令的详情已过期（记录只保留 24 小时），无法展开。") },
+              });
+              return;
+            }
+            for (const [i, chunk] of chunkText(cmd, FULLCMD_CHUNK_CHARS).entries()) {
+              const n = Math.ceil(cmd.length / FULLCMD_CHUNK_CHARS);
+              const head = n > 1 ? `📄 完整命令（${cmd.length} 字，${i + 1}/${n}）：\n` : `📄 完整命令（${cmd.length} 字）：\n`;
+              await client.sendMessage(targetChatId(target), {
+                msgtype: "markdown",
+                markdown: { content: withTagHeader(target, head + chunk) },
+              });
+            }
+            log.info({ reqId, len: cmd.length, target }, "full command expanded on demand");
+          } catch (e) {
+            log.warn({ err: (e as Error).message, reqId }, "full command expand failed");
+          }
+        })();
+        return;
+      }
 
       // ── AskUserQuestion 投票卡: 在普通 approval 解码前先匹配 ASKQ| 前缀。
       const askq = decodeAskqKey(key);

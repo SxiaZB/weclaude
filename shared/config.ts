@@ -230,10 +230,12 @@ const Approval = z.object({
   // 批准后等原生确认框出现的最长时间 (ms)。CC 在 hook 返回后才渲染它, 轮询步进 200ms。
   // 太短会误判成 no_modal (框随后才出现, 于是没人按, 退回死锁), 4s 覆盖实测抖动。
   claudeConfigModalWaitMs: z.number().int().nonnegative().default(4000),
-  // Bash 命令超过 ~200 字 (卡片手机端可见极限) 时, 发卡前先推一条含完整命令的
-  // markdown 消息 (普通气泡可展开, 无卡片渲染截断)。此值为前置消息的总字数上限
-  // (超出截断并注明; 按 1800 字/条分块发送)。0 = 关闭前置消息。
-  fullCommandPreludeChars: z.number().int().nonnegative().default(3600),
+  // Bash 命令超过 ~200 字 (卡片手机端可见极限) 时, 发卡前**无条件**先推一条含完整
+  // 命令的 markdown 消息。默认 0 = 关闭 —— 长命令现在由卡片自己承载: 引用区可点
+  // 进详情页, 右上角「⋯」菜单有「📄 展开完整命令」按需在群里发全文。设成正数可
+  // 恢复旧行为 (客户端不渲染 action_menu、或就是要全文无条件落在群里时用)。
+  // 此值为前置消息的总字数上限 (超出截断并注明; 按 1800 字/条分块发送)。
+  fullCommandPreludeChars: z.number().int().nonnegative().default(0),
 });
 
 // sync.targets[].kind 的合法值。claude-internal / custom 等旧值自动 collapse
