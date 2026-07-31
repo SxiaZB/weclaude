@@ -9,7 +9,7 @@ import { loadSessionStore } from "./sessions.js";
 import { loadMirrorStore } from "./mirror-store.js";
 import { makeBridge } from "./cc-bridge.js";
 import { startMirror, installMirrorEventListener, type MirrorBridge } from "./mirror-bridge.js";
-import { spawnTmuxClaude } from "./spawn-tmux.js";
+import { setTmuxTimeoutReporter, spawnTmuxClaude } from "./spawn-tmux.js";
 import { installApprovalEventListener, makeApproveHandler } from "./approval.js";
 import { initDetailPersistence, makeDetailHandler, chatHandlers, configureRemoteForward } from "./detail.js";
 import { initAutoWindowPersistence } from "./session-cache.js";
@@ -71,6 +71,13 @@ const main = async (): Promise<void> => {
   // attach / tmux spawn.
   const { primary, backends } = bindCliBackends({ ...cfg.wrc, projectsDirOverride: cfg.wrc.mirror.projectsDir });
   log.info({ primary: primary.name, bin: primary.bin, backends: backends.map((b) => b.name) }, "cli backends bound");
+
+  // A killed-on-timeout tmux call is the ONLY externally visible symptom of a
+  // wedged tmux server, and the exec helper has no logger of its own. Wire it
+  // up before anything can spawn a pane.
+  setTmuxTimeoutReporter(({ args, timeoutMs }) =>
+    log.warn({ args: args.slice(0, 4), timeoutMs }, "tmux command timed out — killed"),
+  );
 
   // Restore auto-approve windows persisted across daemon restarts —
   // otherwise a `wezard reload` silently drops the user's "10min" choice.

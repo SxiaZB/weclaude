@@ -66,18 +66,65 @@ interface ExecResult {
   code: number | null;
 }
 
-export const runTmux = (args: string[]): Promise<ExecResult> =>
+/** Hard ceiling for ANY tmux subcommand. A wedged tmux server used to hang the
+ *  caller forever with zero log output: one inbound spawned a pane, then
+ *  dispatch's `tmuxPaneAlive` never returned, so the per-session inject queue
+ *  stayed locked behind a zombie job and that chat went permanently silent.
+ *  Normal tmux commands finish in <100ms — 10s is a generous ceiling, not a
+ *  latency budget. Override via WEZARD_TMUX_TIMEOUT_MS (0 disables, for debugging). */
+export const TMUX_TIMEOUT_MS = ((): number => {
+  const raw = Number(process.env.WEZARD_TMUX_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 10_000;
+})();
+
+/** Timeouts are the only signal that the tmux server wedged, so they must leave
+ *  a trace. runTmux has no logger of its own (it predates the daemon's pino
+ *  child loggers and is called from two modules) — the daemon installs a
+ *  reporter at boot. */
+let timeoutReporter: ((info: { args: string[]; timeoutMs: number }) => void) | undefined;
+export const setTmuxTimeoutReporter = (fn: (info: { args: string[]; timeoutMs: number }) => void): void => {
+  timeoutReporter = fn;
+};
+
+export interface RunTmuxOpts {
+  /** Written to the child's stdin, which is then closed. For `tmux load-buffer -`. */
+  stdin?: string;
+  /** Per-call override of TMUX_TIMEOUT_MS. */
+  timeoutMs?: number;
+}
+
+export const runTmux = (args: string[], opts: RunTmuxOpts = {}): Promise<ExecResult> =>
   new Promise((resolve) => {
     const proc = spawn("tmux", args, {
       env: { ...process.env, PATH: augmentedPath(process.env.PATH) },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [opts.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
     let out = "";
     let err = "";
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const timeoutMs = opts.timeoutMs ?? TMUX_TIMEOUT_MS;
+    const finish = (r: ExecResult): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(r);
+    };
+    // SIGKILL, not SIGTERM: a tmux client blocked on a wedged server ignores
+    // TERM. Resolving as a normal failure lets every existing `if (!r.ok)`
+    // branch handle it — no call site needs to know about timeouts.
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        proc.kill("SIGKILL");
+        timeoutReporter?.({ args, timeoutMs });
+        finish({ ok: false, stdout: out, stderr: `tmux timeout after ${timeoutMs}ms: ${args.slice(0, 3).join(" ")}`, code: null });
+      }, timeoutMs);
+    }
     proc.stdout?.on("data", (c: Buffer) => (out += c.toString("utf8")));
     proc.stderr?.on("data", (c: Buffer) => (err += c.toString("utf8")));
-    proc.on("error", (e) => resolve({ ok: false, stdout: "", stderr: e.message, code: null }));
-    proc.on("close", (code) => resolve({ ok: code === 0, stdout: out, stderr: err, code }));
+    proc.on("error", (e) => finish({ ok: false, stdout: "", stderr: e.message, code: null }));
+    proc.on("close", (code) => finish({ ok: code === 0, stdout: out, stderr: err, code }));
+    if (opts.stdin !== undefined) proc.stdin?.end(opts.stdin);
   });
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));

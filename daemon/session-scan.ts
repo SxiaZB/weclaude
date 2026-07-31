@@ -66,6 +66,11 @@ const augmentedPath = (orig: string | undefined): string => {
     .join(":");
 };
 
+// A wedged tmux server (or an lsof blocked on a stuck mount) must not hang the
+// scan forever — /sessions would never answer and, worse, the caller's await
+// would never return. Degrade to "no output" like any other failure.
+const SCAN_CMD_TIMEOUT_MS = 15_000;
+
 const runCmd = (cmd: string, args: string[]): Promise<{ ok: boolean; stdout: string }> =>
   new Promise((resolve) => {
     const p = spawn(cmd, args, {
@@ -73,9 +78,20 @@ const runCmd = (cmd: string, args: string[]): Promise<{ ok: boolean; stdout: str
       stdio: ["ignore", "pipe", "ignore"],
     });
     let out = "";
+    let settled = false;
+    const finish = (r: { ok: boolean; stdout: string }): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
+    const timer = setTimeout(() => {
+      p.kill("SIGKILL");
+      finish({ ok: false, stdout: "" });
+    }, SCAN_CMD_TIMEOUT_MS);
     p.stdout?.on("data", (c) => (out += c.toString("utf8")));
-    p.on("error", () => resolve({ ok: false, stdout: "" }));
-    p.on("close", (code) => resolve({ ok: code === 0, stdout: out }));
+    p.on("error", () => finish({ ok: false, stdout: "" }));
+    p.on("close", (code) => finish({ ok: code === 0, stdout: out }));
   });
 
 const runTmux = (args: string[]): Promise<{ ok: boolean; stdout: string }> => runCmd("tmux", args);

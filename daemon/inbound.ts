@@ -641,8 +641,21 @@ export const installInboundRouter = (
       if (!("interruptPane" in bridge)) {
         await replyText(frame, msg, who, "[wezard] /stop only available in mirror mode");
       } else {
-        const r = await bridge.interruptPane(who);
-        await replyText(frame, msg, who, r.ok ? "✅ Esc sent · 保活已暂停（下次对话自动恢复）" : `[wezard] /stop failed: ${r.reason ?? "unknown"}`);
+        // teardown: /stop is the user's "shut this up" button, so it must also
+        // close hanging bubbles and free the inject queue — not just press Esc.
+        // Report both halves separately: a live pane that refuses Esc is a very
+        // different situation from a chat that was merely stuck on a dead bubble.
+        const r = await bridge.interruptPane(who, { teardown: true });
+        if (!r.ok) {
+          await replyText(frame, msg, who, `[wezard] /stop failed: ${r.reason ?? "unknown"}`);
+        } else {
+          const parts = [
+            r.escOk ? "✅ Esc sent" : `⚠️ Esc 未送达（${r.escReason ?? "unknown"}）`,
+            r.torndown ? `已收口 ${r.torndown} 个挂起气泡` : "无挂起气泡",
+            "保活已暂停（下次对话自动恢复）",
+          ];
+          await replyText(frame, msg, who, parts.join(" · "));
+        }
       }
       return { stop: true };
     }

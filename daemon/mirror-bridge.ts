@@ -31,7 +31,7 @@ import {
 import { isModalPane, parseModalOptions, pickModalAnswer, type ModalPaneVerdict } from "../shared/modal-pane.js";
 import type { MirrorStore } from "./mirror-store.js";
 import { hasMirrorAskq, runMirrorAskqFlow, hasMirrorPlan, mootMirrorPlan, runMirrorPlanFlow } from "./approval.js";
-import { spawnTmuxClaude } from "./spawn-tmux.js";
+import { runTmux as runTmuxCmd, spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl, buildChatUrl } from "./detail.js";
 import type { CtxCut, TurnUsage } from "./detail.js";
 import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
@@ -933,17 +933,13 @@ interface InjectArgs {
   freshSpawn?: boolean;
 }
 
-// Run a tmux subcommand, capturing stdout/stderr. Local helper to avoid
-// pulling spawn-tmux's runTmux into the bridge module graph.
-const tmuxRun = (args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> =>
-  new Promise((resolve) => {
-    const p = spawn("tmux", args, { stdio: ["ignore", "pipe", "pipe"] });
-    let out = "", err = "";
-    p.stdout?.on("data", (c: Buffer) => (out += c.toString("utf8")));
-    p.stderr?.on("data", (c: Buffer) => (err += c.toString("utf8")));
-    p.on("error", (e) => resolve({ ok: false, stdout: "", stderr: e.message }));
-    p.on("close", (code) => resolve({ ok: code === 0, stdout: out, stderr: err }));
-  });
+// Run a tmux subcommand, capturing stdout/stderr. Delegates to spawn-tmux's
+// runTmux so there is exactly ONE tmux exec path in the daemon — and therefore
+// exactly one place where the hard timeout lives. (Two hand-rolled copies used
+// to exist here; both could hang forever, which is how a wedged tmux server
+// silently killed a whole chat. See TMUX_TIMEOUT_MS.)
+const tmuxRun = (args: string[], opts?: { stdin?: string }): Promise<{ ok: boolean; stdout: string; stderr: string; code: number | null }> =>
+  runTmuxCmd(args, opts);
 
 const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -993,13 +989,30 @@ const PB_CLASS_BY_EXT: Record<string, string> = {
   tiff: "«class TIFF»",
 };
 
+// Same no-unbounded-await rule as runTmux: this sits on the inject path (image
+// pump), and `osascript` in particular can block indefinitely if macOS decides
+// to raise an automation-permission prompt nobody is there to answer. 30s is
+// generous for a sips transcode of a large screenshot.
+const PROC_TIMEOUT_MS = 30_000;
+
 const runProc = (cmd: string, args: string[]): Promise<{ ok: boolean; stderr: string }> =>
   new Promise((resolve) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });
     let err = "";
+    let settled = false;
+    const finish = (r: { ok: boolean; stderr: string }): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
+    const timer = setTimeout(() => {
+      p.kill("SIGKILL");
+      finish({ ok: false, stderr: `${cmd} timeout after ${PROC_TIMEOUT_MS}ms` });
+    }, PROC_TIMEOUT_MS);
     p.stderr?.on("data", (c: Buffer) => (err += c.toString("utf8")));
-    p.on("error", (e) => resolve({ ok: false, stderr: e.message }));
-    p.on("close", (code) => resolve({ ok: code === 0, stderr: err }));
+    p.on("error", (e) => finish({ ok: false, stderr: e.message }));
+    p.on("close", (code) => finish({ ok: code === 0, stderr: err }));
   });
 
 const setMacClipboardImage = async (imgPath: string): Promise<{ ok: boolean; reason?: string }> => {
@@ -1242,18 +1255,10 @@ const injectViaTmuxText = async (target: string, text: string, log: Logger, fres
   const RETRY_SETTLE_MS = freshSpawn ? 1500 : 800;
 
   const loadAndPaste = async (): Promise<{ ok: boolean; reason?: string }> => {
-    const loaded = await new Promise<{ ok: boolean; reason?: string }>((resolve) => {
-      const loader = spawn("tmux", ["load-buffer", "-"], { stdio: ["pipe", "ignore", "pipe"] });
-      let lerr = "";
-      loader.stderr?.on("data", (c: Buffer) => (lerr += c.toString("utf8")));
-      loader.on("error", (e) => resolve({ ok: false, reason: `tmux not found: ${e.message}` }));
-      loader.on("close", (code) => {
-        if (code !== 0) resolve({ ok: false, reason: `tmux load-buffer exit ${code}: ${lerr.slice(-200)}` });
-        else resolve({ ok: true });
-      });
-      loader.stdin?.end(text);
-    });
-    if (!loaded.ok) return loaded;
+    // stdin variant of the shared exec path — it carries the same hard timeout,
+    // which a hand-rolled spawn here did not.
+    const loaded = await tmuxRun(["load-buffer", "-"], { stdin: text });
+    if (!loaded.ok) return { ok: false, reason: `tmux load-buffer failed: ${loaded.stderr.slice(-200) || loaded.code}` };
     const pasted = await tmuxRun(["paste-buffer", "-p", "-d", "-t", target]);
     if (!pasted.ok) return { ok: false, reason: `tmux paste-buffer failed: ${pasted.stderr.slice(-200)}` };
     return { ok: true };
@@ -1407,6 +1412,21 @@ const inject = (args: InjectArgs): Promise<{ ok: boolean; reason?: string; uncer
 // ── Per-session injection queue ───────────────────────────────────────
 type Job = () => Promise<void>;
 const queues = new Map<string, Promise<void>>();
+/** Ceiling for one whole inject job (respawn + paste + submit verification).
+ *  Worst legitimate case is a cold `--resume` respawn (~8s) plus a fresh-spawn
+ *  inject with both paste re-try and both cleared-polls (~30s), so 90s is ~2.5x
+ *  headroom. Past that the job is wedged, and holding the queue is strictly
+ *  worse than dropping the turn: every later message in that chat would queue
+ *  behind it forever. Well under brief's 350s bubble ceiling so the user still
+ *  gets an error bubble rather than a silent stream timeout. */
+const INJECT_JOB_TIMEOUT_MS = 90_000;
+/** Drop a session's queue chain. A hung job can't be cancelled (it's parked in a
+ *  tmux read), but detaching the chain means the NEXT message doesn't inherit
+ *  its deadlock. Pair with an injectGen bump so the zombie can't act when it
+ *  eventually returns. */
+const abortInjectQueue = (key: string): void => {
+  queues.delete(key);
+};
 const enqueue = (key: string, job: Job): Promise<void> => {
   const prev = queues.get(key) ?? Promise.resolve();
   const next = prev.then(job, job).catch(() => undefined);
@@ -1517,8 +1537,16 @@ export interface MirrorBridge {
   injectText: (target: string, text: string) => Promise<{ ok: boolean; reason?: string }>;
   /** Send Esc to the live tmux pane bound to `target` — interrupts whatever
    *  Claude is currently doing (active generation / open prompt). No-op for
-   *  spawn-mode attachments (no live TTY to interrupt). */
-  interruptPane: (target: string) => Promise<{ ok: boolean; reason?: string }>;
+   *  spawn-mode attachments (no live TTY to interrupt).
+   *
+   *  `teardown: true` (what `/stop` passes) additionally does the tmux-free part
+   *  FIRST: bump injectGen, drop the inject queue, and force-close every hanging
+   *  bubble/stream. That path stays useful when tmux is the thing that's wedged,
+   *  and reports `torndown` (bubbles closed) plus whether the Esc landed. */
+  interruptPane: (
+    target: string,
+    opts?: { teardown?: boolean },
+  ) => Promise<{ ok: boolean; reason?: string; torndown?: number; escOk?: boolean; escReason?: string }>;
   /** Send a bare Enter to the live tmux pane bound to `target` — confirms a
    *  prompt / press-enter-to-continue, or submits the input box as-is. No-op
    *  for spawn-mode attachments (no live TTY). */
@@ -1636,6 +1664,11 @@ interface AttachState {
    *  必须用冷启动时序,否则 paste 校验会在 TUI 抓到 pty 之前超时并重贴一次,
    *  两次 paste 最终都落进输入框 = 提示词重复。一次性,由第一次 dispatch 消费。 */
   justSpawned?: boolean;
+  /** Inject generation. Bumped by `/stop` and by the inject watchdog. A job that
+   *  hung inside tmux and wakes up minutes later compares its snapshot against
+   *  this and bails — otherwise a recovering tmux server would suddenly paste a
+   *  long-abandoned message into the pane. */
+  injectGen?: number;
   /** 待记账的上下文断点 (`/clear` 注入 / `/new` 铸盘 / 观测到 /clear 轮换)。由下一次
    *  recordTurnStart 消费一次 —— 断点属于"断点之后的第一轮", 那才是读不到上文的一轮。 */
   ctxCut?: CtxCut;
@@ -2306,6 +2339,78 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (next) openBriefTurn(a, next);
   };
 
+  // 强制收口一个 attachment 的全部出站通道, 并返回收掉的气泡/流条数。
+  //
+  // 关键约束: **一个 tmux 调用都不许有**。它的两个调用方 (`/stop` 和 inject
+  // watchdog) 恰恰是在 tmux 已经卡死时才最需要生效 —— 历史故障里 tmux 无响应
+  // 导致 dispatch 静默挂死, 用户在手机上看到一条永不结束的 "…" 气泡, 发 /stop
+  // 也没用 (旧 /stop 第一件事就是 tmuxPaneAlive, 一起卡死)。所以这里只做纯内存
+  // 状态的清算, Esc 之类要碰 pane 的动作留给调用方在这之后自己尽力去做。
+  const teardownOutbound = (a: AttachState, note?: string): number => {
+    let closed = 0;
+    // 排队中的 turn 先清空再动当前 turn —— 反序会让 closeBriefTurn 顺手 shift
+    // 一个僵尸 turn 上来当活跃 turn, 白收一遍。
+    for (const q of a.briefQueue ?? []) {
+      closed++;
+      void finishBubble(a, q.bubble, briefDetailLink(q.turnId));
+      recordTurnClose(q.turnId);
+    }
+    a.briefQueue = [];
+    if (a.briefTurnId) {
+      closed++;
+      closeBriefTurn(a);
+    }
+    if (a.softEnd) { clearTimeout(a.softEnd); a.softEnd = undefined; }
+    if (a.outbound) {
+      if (a.outbound.kind === "deferred") clearTimeout(a.outbound.timer);
+      a.outbound = undefined;
+    }
+    if (a.standaloneBuf) { clearTimeout(a.standaloneBuf.timer); flushStandalone(a); }
+    if (a.liveStream && !a.liveStream.closed) {
+      closed++;
+      void finalizeStream(a, a.liveStream);
+    }
+    if (note) sendStandalone(a, note);
+    return closed;
+  };
+
+  // Watchdog around one inject job. The failure this exists for: every await in
+  // the job chain used to be unbounded, so a wedged tmux server parked the job
+  // forever — no log line, no error bubble, and the per-session queue stayed
+  // locked behind it, muting that chat until the daemon restarted. Now the queue
+  // is released on a deadline and the user gets told.
+  const withInjectWatchdog = async (a: AttachState, gen: number, job: () => Promise<void>): Promise<void> => {
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), INJECT_JOB_TIMEOUT_MS);
+    });
+    const outcome = await Promise.race([
+      job().then(
+        () => "done" as const,
+        (e: unknown) => {
+          log.error({ target: a.target, sessionId: a.sessionId, err: (e as Error)?.message }, "inject job threw");
+          return "done" as const;
+        },
+      ),
+      timedOut,
+    ]);
+    if (timer) clearTimeout(timer);
+    if (outcome !== "timeout") return;
+    // Racing already released the queue for the next message. The zombie is
+    // still parked in tmux, so bump the generation to disarm its paste, and
+    // detach the queue chain it thinks it owns.
+    if ((a.injectGen ?? 0) === gen) a.injectGen = gen + 1;
+    abortInjectQueue(a.sessionId);
+    log.error(
+      { target: a.target, sessionId: a.sessionId, gen: a.injectGen, timeoutMs: INJECT_JOB_TIMEOUT_MS },
+      "inject job watchdog fired — queue released, turn abandoned",
+    );
+    teardownOutbound(
+      a,
+      `[mirror] ✗ 注入超时 ${Math.round(INJECT_JOB_TIMEOUT_MS / 1000)}s — tmux 无响应, 本轮已放弃。再发一条消息即可重试, 或 \`/new\` 换个 pane。`,
+    );
+  };
+
   // Route one RenderItem into the turn store. final text 会额外作为 standalone 发群。
   const handleBriefItem = (a: AttachState, item: RenderItem): void => {
     const turnId = a.briefTurnId;
@@ -2769,17 +2874,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   };
 
   // ── Persistence: restore-from-store (lazy + boot) ────────────────────
-  const tmuxRun = (args: string[]): Promise<{ code: number | null; stdout: string }> =>
-    new Promise((resolve) => {
-      const p = spawn("tmux", args, {
-        env: { ...process.env, PATH: augmentedPath(process.env.PATH) },
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-      let out = "";
-      p.stdout?.on("data", (c: Buffer) => (out += c.toString("utf8")));
-      p.on("error", () => resolve({ code: null, stdout: "" }));
-      p.on("close", (code) => resolve({ code, stdout: out }));
-    });
+  // NOTE: this used to be a second hand-rolled `spawn("tmux", …)` that shadowed
+  // the module-level helper — and had no timeout, so `/stop` itself could hang
+  // on a wedged server. It now resolves to the same single exec path.
 
   // Verify a paneId still exists. `display-message -t <paneId>` succeeds iff
   // the pane is alive — and tmux pane ids monotonically increment within a
@@ -3872,14 +3969,24 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         sessionId: sid, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane, freshSpawn: true,
       });
     },
-    interruptPane: async (target) => {
+    interruptPane: async (target, opts) => {
       const a = byTarget.get(target);
       if (!a) return { ok: false, reason: "no mirror attached for target" };
-      if (!a.tmuxPane) return { ok: false, reason: "no live tmux pane (spawn-mode attachment)" };
-      const alive = await tmuxPaneAlive(a.tmuxPane);
-      if (!alive) return { ok: false, reason: "tmux pane no longer alive" };
-      const r = await tmuxRun(["send-keys", "-t", a.tmuxPane, "Escape"]);
-      if (r.code !== 0) return { ok: false, reason: `send-keys Escape failed: ${r.stdout.slice(-200) || r.code}` };
+      // `/stop` (teardown: true) must work when tmux itself is the problem, so
+      // the order is: local state first, pane second. The old implementation
+      // probed the pane FIRST and returned early on failure — meaning a wedged
+      // tmux server left the user with a "…" bubble that /stop could not close
+      // and an inject queue no message could get past. Callers that only want
+      // an Esc (the `.claude/**` guard's cancel) pass no opts and keep the old
+      // pane-only behavior, bubbles untouched.
+      let torndown = 0;
+      if (opts?.teardown) {
+        a.injectGen = (a.injectGen ?? 0) + 1; // disarm a zombie inject's paste
+        abortInjectQueue(a.sessionId);        // unblock the next message
+        torndown = teardownOutbound(a);       // close every hanging bubble/stream
+      } else if (!a.tmuxPane) {
+        return { ok: false, reason: "no live tmux pane (spawn-mode attachment)" };
+      }
       // /stop also pauses keepalive: the user is deliberately quieting this
       // session, so stop poking it too. A real turn (WeCom inbound, or the pane
       // going busy AFTER the resume grace) lifts the pause and re-earns the
@@ -3889,10 +3996,27 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       a.keepaliveOffAt = Date.now();
       a.keepalive = undefined; // re-anchors cleanly on resume
       persistPause(a);          // survive a reload — don't resurrect a quieted session
+      // Best-effort Esc. Every failure mode here is reported, never fatal: the
+      // teardown above already gave the user their chat back.
+      let escOk = false;
+      let escReason = "";
+      if (!a.tmuxPane) {
+        escReason = "spawn-mode attachment (no live tmux pane)";
+      } else if (!(await tmuxPaneAlive(a.tmuxPane))) {
+        escReason = "tmux pane no longer alive";
+      } else {
+        const r = await tmuxRun(["send-keys", "-t", a.tmuxPane, "Escape"]);
+        escOk = r.ok;
+        if (!r.ok) escReason = `send-keys Escape failed: ${(r.stderr || r.stdout).slice(-200) || r.code}`;
+      }
       // Any in-flight ping's quiet window + detail turn are left to close on their
       // own turn_end (or the 60s fail-safe), so the interrupted pong stays out of chat.
-      log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /stop — Esc sent to pane, keepalive paused");
-      return { ok: true };
+      log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane, torndown, escOk, escReason, gen: a.injectGen }, "mirror /stop — teardown + Esc");
+      // Esc failure is not an overall failure when we tore down: the user asked
+      // for quiet and got it. Without teardown there's nothing else to report,
+      // so keep the old strict contract.
+      if (!opts?.teardown && !escOk) return { ok: false, reason: escReason };
+      return { ok: true, torndown, escOk, escReason: escReason || undefined };
     },
     submitPane: async (target) => {
       const a = byTarget.get(target);
@@ -4096,7 +4220,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         enterDeferred(a, frame, streamId);
       }
       const sid = a.sessionId;
-      await enqueue(sid, async () => {
+      const myGen = a.injectGen ?? 0;
+      await enqueue(sid, () => withInjectWatchdog(a, myGen, async () => {
         if (s && s.closed) return; // (eager path) superseded by a newer dispatch
         // Always reincarnate when no live pane: covers (a) pane closed between
         // turns, (b) daemon reload restored a binding without a live pane, AND
@@ -4105,6 +4230,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // If respawn fails, fall through to spawn-mode inject for THIS turn
         // but DON'T erase tmuxSession from store — next inbound will retry,
         // making the system self-healing instead of one-failure-permanent.
+        // First step of the job and the historical hang point — log BEFORE the
+        // probe so a stall is attributable to it next time, not invisible.
+        log.info({ target: a.target, sessionId: sid, pane: a.tmuxPane, gen: myGen }, "inject job start");
         const paneAlive = a.tmuxPane ? await tmuxPaneAlive(a.tmuxPane) : false;
         let freshSpawn = a.justSpawned === true;
         a.justSpawned = false;
@@ -4153,6 +4281,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // surfaces the user's text, and without a pre-recorded entry the
         // dedupe filter wouldn't suppress it — user's chat msg gets echoed
         // back as a quoted bubble. Recording up front fixes that.
+        // Last checkpoint before we touch the pane: a `/stop` (or a watchdog
+        // fire) during the respawn above means this text is no longer wanted.
+        // Without this, a tmux server that unwedges after the user gave up would
+        // paste a minutes-old message into a session that has moved on.
+        if ((a.injectGen ?? 0) !== myGen) {
+          log.warn({ target: a.target, sessionId: sid, myGen, gen: a.injectGen }, "inject aborted — superseded by /stop or watchdog");
+          return;
+        }
         rememberInject(text);
         const r = await inject({
           text, images, cfg, log: log.child({ principal, sessionId: sid }),
@@ -4219,7 +4355,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // or hard timeout. Releasing the inject queue here lets the next
         // dispatch start its inject promptly while tail content keeps flowing
         // into the (still-open) stream until superseded.
-      });
+      }));
     },
   };
 };
