@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-07-31
+
+### Fixed
+- `mirror`: `/stop` 暂停保活的第二个自我唤醒漏洞 —— 1.2.0 给 busy-resume 加了 grace，但 `grewSinceLast`（transcript 增长）分支没有守卫。`/stop` 的 Esc 打断会产生尾部写入（被中断的 turn + 残留 tool result），下一个 tick 把它当成真实活动立刻解除刚请求的暂停，KeepAlive 照常触发。现在纯 transcript 增长不再解除 `/stop` 暂停，只有 busy pane（过 grace）或 WeCom inbound 能恢复。
+
 ## [1.2.2] - 2026-07-31
 
 ### Fixed
@@ -77,7 +82,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.2...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.3...HEAD
+[1.2.3]: https://github.com/guxi11/wezard/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/guxi11/wezard/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/guxi11/wezard/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/guxi11/wezard/compare/v1.1.4...v1.2.0
