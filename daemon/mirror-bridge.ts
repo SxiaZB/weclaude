@@ -3198,7 +3198,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (pending && pending !== running) {
       lines.push(`下次切换: \`${pending}\` (使用 /new 或 /clear 生效)`);
     }
-    lines.push("> 切换其他项目: 在对话中告诉 AI 调用 `enter` MCP 工具");
     // Session-boundary footer — `/new` and `/clear` are the only two callers,
     // so the tip lands exactly once per fresh context, never mid-conversation.
     lines.push(randomTip());
@@ -3535,7 +3534,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
     const tokens = lastContextTokens(a.jsonlPath);
     const size = tokens > 0 ? `~${fmtTokens(tokens)} tokens` : "未知";
-    const totalRounds = Math.max(1, Math.round(kc.maxIdleSec / kc.ttlSec));
+    // Denominator tracks the ACTUAL ping cadence (idleTriggerMs = ttlSec - marginSec),
+    // not the nominal ttlSec — pings fire marginSec early, so ttlSec would undercount
+    // and let `n` exceed `N` (a 9/8). floor keeps the last shown round the last one that fires.
+    const cadenceSec = Math.max(30, kc.ttlSec - kc.marginSec);
+    const totalRounds = Math.max(1, Math.floor(kc.maxIdleSec / cadenceSec));
     const round = a.keepalive ? (a.keepalive.round += 1) : 1;
     log.info({ target: a.target, tokens, round, totalRounds }, "keepalive: ping injected");
     // Open a chat-detail turn for the real heartbeat exchange: userQuery is the
