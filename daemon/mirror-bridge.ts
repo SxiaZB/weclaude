@@ -1629,6 +1629,10 @@ interface AttachState {
    *  `pinging` guards the inject→settle window; `pingMtime` is the mtime at
    *  inject time, used to distinguish "ping written" from "ping not yet seen". */
   keepalive?: { count: number; settledMtime: number; pinging: boolean; pingMtime: number };
+  /** Keepalive paused by `/stop`. Stays off until a real turn resumes it — a
+   *  WeCom inbound (dispatch) or the pane going busy on a genuine turn — so an
+   *  explicitly-stopped session isn't poked until the human comes back. */
+  keepaliveOff?: boolean;
   /** While set, onItem swallows the keepalive ping turn from every WeCom path
    *  (no bubble, no live stream), closing on the turn's terminal signal. The
    *  timer is a fail-safe so a ping that never emits turn_end can't mute a later
@@ -3534,10 +3538,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           k.pinging = false;
           continue;
         }
-        if (busy) { k.count = 0; k.settledMtime = 0; continue; } // real turn running → full budget again
+        // Real turn running → full budget again, and resume if `/stop` paused us
+        // (the human/agent is back).
+        if (busy) { k.count = 0; k.settledMtime = 0; a.keepaliveOff = false; continue; }
         // Transcript grew past the last settled ping while we weren't pinging =
-        // a real turn happened → reset the budget so idle after work re-earns it.
-        if (k.settledMtime && mtime > k.settledMtime + 1000) { k.count = 0; k.settledMtime = 0; }
+        // a real turn happened → reset the budget so idle after work re-earns it,
+        // and lift the /stop pause.
+        if (k.settledMtime && mtime > k.settledMtime + 1000) { k.count = 0; k.settledMtime = 0; a.keepaliveOff = false; }
+        if (a.keepaliveOff) continue;                          // paused by /stop until a real turn returns
         const idle = now - mtime;
         if (idle < idleTriggerMs) continue;                    // still warm — too early to bother
         // Hard upper bound: past the TTL the cache is already gone, so a ping
@@ -3741,7 +3749,12 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       if (!alive) return { ok: false, reason: "tmux pane no longer alive" };
       const r = await tmuxRun(["send-keys", "-t", a.tmuxPane, "Escape"]);
       if (r.code !== 0) return { ok: false, reason: `send-keys Escape failed: ${r.stdout.slice(-200) || r.code}` };
-      log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /stop — Esc sent to pane");
+      // /stop also pauses keepalive: the user is deliberately quieting this
+      // session, so stop poking it too. A real turn (WeCom inbound or the pane
+      // going busy) lifts the pause and re-earns the budget.
+      a.keepaliveOff = true;
+      a.keepalive = { count: 0, settledMtime: 0, pinging: false, pingMtime: 0 };
+      log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /stop — Esc sent to pane, keepalive paused");
       return { ok: true };
     },
     submitPane: async (target) => {
@@ -3817,6 +3830,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         }
         return;
       }
+      // A real inbound is a new conversation → lift any `/stop` keepalive pause
+      // and re-earn the budget. (Pane-side new turns resume via the tick's busy
+      // branch; this covers the WeCom-driven path.)
+      a.keepaliveOff = false;
+      if (a.keepalive) { a.keepalive.count = 0; a.keepalive.settledMtime = 0; }
       // Finalize prior live stream (if any) so this new turn renders into its
       // own message bubble. Then open a fresh stream tied to the new frame and
       // ack immediately so WeCom doesn't time out while inject queues.

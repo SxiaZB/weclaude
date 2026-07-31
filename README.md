@@ -387,7 +387,8 @@ Anthropic 的 prompt cache 只活 ~5 分钟，且**写缓存 1.25x、读缓存 0
 
 - **只在「缓存还命中得到」的窗口内保活**：空闲落在 `[ttlSec - marginSec, ttlSec)`（默认 `[255s, 300s)`）才 ping。**过了 TTL 就绝不出手**——那时缓存已经没了，ping 反而要付整份上下文的冷写，为一轮 no-op 白烧钱。daemon reload 后挂着的老会话、长时间无人理的 pane，都直接放过，等下一次真实操作自然承担。
 - **零污染**：ping 文案默认 `keepalive — reply with just "pong", take no other action`，逼出一个约 1 token 的极短回复且禁止任何工具动作。这轮 ping/pong **不进聊天**（群里只有一条 `❤️ 保活 · context ~85k tokens · 3/6`），但会作为一条标记 turn **记入 chat detail 时间线**，并把那次真实的 cache-read usage 挂上去——留痕、可审计，证明它确实只是一次廉价读缓存。
-- **预算封顶**：每个 pane 连续保活 `maxPings`（默认 6）次后就停手让它冷掉；一旦观察到真实活动，预算自动重置、重新计数。
+- **预算封顶 + 会终止**：每个 pane 连续保活 `maxPings`（默认 6）次后就停手让它冷掉；一旦观察到真实活动（新一轮对话），预算自动重置、重新计数。两道终止保险叠加——超过 TTL 的会话本就不 ping，加上 6 次封顶，不会无限保活下去。
+- **`/stop` 手动暂停**：在 IM 里发 `/stop`（Esc 打断当前生成）同时会暂停该会话的保活；等下次有新对话（IM 消息或 CLI 里新起一轮）自动恢复。
 - **只针对 mirror 模式的活 pane**：spawn 模式无 TTY、pane 已死、正在流式输出或会话轮换中的，一律跳过。
 
 全部可配（`wrc.mirror.keepalive`）：
