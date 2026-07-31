@@ -266,39 +266,26 @@ const FULLCMD_PREFIX = "FULLCMD|";
 const encodeFullCmdKey = (reqId: string): string => `${FULLCMD_PREFIX}${reqId}`;
 // WeCom markdown 单条上限约 2048 字节, 留出标题与 tag 头的余量。
 const FULLCMD_CHUNK_CHARS = 1800;
-// stream 被动回复的 content 上限 20480 字节 (UTF8) — 留出余量防边界拒收。
-const STREAM_MAX_BYTES = 20000;
 const chunkText = (s: string, size: number): string[] => {
   const out: string[] = [];
   for (let i = 0; i < s.length; i += size) out.push(s.slice(i, i + size));
   return out.length > 0 ? out : [""];
 };
 
-// 引用区要不要挂点击跳转: detailPublicBase 没配时链接根是回环, 手机上点了就是
-// 死链 —— 比没有更糟 (用户以为坏了)。只有显式配了外部可达根才挂 url。
-// 模块级注入, 与 setCardQuoteMax 同款 (boot 时设一次)。
-let QUOTE_LINKABLE = false;
-export const setQuoteLinkable = (v: boolean): void => { QUOTE_LINKABLE = v; };
-
-// 「看不全」的判定阈值: 手机端引用区实测只渲染前 2~3 行 (~200 字), 与 API 层的
-// QUOTE_MAX (1200) 是两回事 —— 一条 700 字的命令没超 QUOTE_MAX、正文一字未截,
-// 手机上照样只能看到开头。所以入口挂载看的是手机可见极限, 不是截断与否。
-const FULLCMD_VISIBLE_CHARS = 200;
-
-/** 命令超过手机可见极限时给的两个入口, 待决卡与已决卡共用 (已决卡也要能回看批了什么)。 */
+/** 带命令的卡一律给两个「看全文」入口, 待决卡与已决卡共用 (已决卡也要能回看
+ *  批了什么)。不按长度区分: 卡片引用区在各端都有可见缩减 (手机 2~3 行, PC 也
+ *  非全量), 与其猜"够不够长", 不如入口常驻 —— 短命令多一个菜单项无害。
+ *  quote 点击 → 详情页 (PC 端好用, 回环链接手机打不开是已知取舍);
+ *  右上「⋯」→ 群里发全文 (哪端都能用的兜底)。 */
 const fullCmdAffordance = (
   a: CardArgs,
-  bodyLen: number,
 ): { menu?: TemplateCard["action_menu"]; quoteUrl?: string; quoteTitle?: string } => {
   const fullCmd = commandOf(a.toolName, a.toolInput);
-  if (fullCmd.length <= Math.min(FULLCMD_VISIBLE_CHARS, bodyLen)) return {};
-  const linkable = QUOTE_LINKABLE && Boolean(a.detailUrl);
+  if (!fullCmd) return {};
   return {
     menu: { desc: "更多", action_list: [{ text: "📄 展开完整命令", key: encodeFullCmdKey(a.reqId) }] },
-    quoteUrl: linkable ? a.detailUrl : undefined,
-    quoteTitle: linkable
-      ? `完整命令共 ${fullCmd.length} 字 · 点此查看`
-      : `完整命令共 ${fullCmd.length} 字 · 右上⋯可展开`,
+    quoteUrl: a.detailUrl,
+    quoteTitle: `完整命令 ${fullCmd.length} 字 · 点此(PC)或右上⋯查看`,
   };
 };
 
@@ -307,7 +294,7 @@ const buildCard = (a: CardArgs): TemplateCard => {
   const dir = dirName(a.cwd);
   const tail = oneLine(a.transcriptTail).trim();
   const jl = detailJumpList(a.detailUrl);
-  const fc = fullCmdAffordance(a, r.body.length);
+  const fc = fullCmdAffordance(a);
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
@@ -369,7 +356,7 @@ const buildResolvedCard = (
   const jl = detailJumpList(a.detailUrl);
   // 已决卡同样保留「看全文」的两个入口 —— 回头想确认"我刚才批的到底是什么"是
   // 常态, 而 detail 记录留存 24h, 点了照样能展开。
-  const fc = fullCmdAffordance(a, r.body.length);
+  const fc = fullCmdAffordance(a);
   return {
     card_type: "button_interaction",
     source: buildSource(tail),
@@ -1501,7 +1488,6 @@ const resolveApprover = (
 
 export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarget, flushBeforeCard, nativeModal }: ApprovalDeps): Handler => {
   setCardQuoteMax(cfg.approval.cardQuoteMaxChars);
-  setQuoteLinkable(cfg.daemon.detailPublicBase.trim() !== "");
   const detailUrlFor = (id: string): string =>
     buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
 
@@ -2096,18 +2082,10 @@ export const installApprovalEventListener = (
           ?? getResolvedSnapshot(reqId)?.meta.chatKey
           ?? cfg.defaultChat;
         const cmd = rec && rec.kind === "approval" ? commandOf(rec.toolName, rec.toolInput) : "";
+        // 只能走主动 markdown 分块 (≤1800 字单条)。曾试过对点击事件做 stream 被动
+        // 回复 (单条 20480 字节) —— 企微服务端拒绝: errcode=846605 invalid req_id,
+        // 卡片事件的 req_id 仅可用于 updateTemplateCard, 不进被动回复通道。
         void (async () => {
-          // 分块 markdown: 主动通道, 永远可用 —— stream 路径的兜底。
-          const sendChunked = async (): Promise<void> => {
-            for (const [i, chunk] of chunkText(cmd, FULLCMD_CHUNK_CHARS).entries()) {
-              const n = Math.ceil(cmd.length / FULLCMD_CHUNK_CHARS);
-              const head = n > 1 ? `📄 完整命令（${cmd.length} 字，${i + 1}/${n}）：\n` : `📄 完整命令（${cmd.length} 字）：\n`;
-              await client.sendMessage(targetChatId(target), {
-                msgtype: "markdown",
-                markdown: { content: withTagHeader(target, head + chunk) },
-              });
-            }
-          };
           try {
             if (!cmd) {
               await client.sendMessage(targetChatId(target), {
@@ -2116,25 +2094,15 @@ export const installApprovalEventListener = (
               });
               return;
             }
-            // 首选被动 stream 回复: 卡片点击事件自带 req_id, 走 aibot_respond_msg
-            // 通道可以发单条 20480 字节的大气泡 (主动 markdown 只有 ~2048), 绝大多数
-            // 命令一条装完、不刷屏。命令用代码块包裹保住空白与缩进; 正文含 ``` 时
-            // 裸发, 免得围栏被内容截断。
-            const fenced = cmd.includes("```") ? cmd : `\`\`\`\n${cmd}\n\`\`\``;
-            const streamBody = withTagHeader(target, `📄 完整命令（${cmd.length} 字）：\n${fenced}`);
-            if (Buffer.byteLength(streamBody, "utf8") <= STREAM_MAX_BYTES) {
-              try {
-                await client.replyStream(frame, `fullcmd-${reqId}`, streamBody, true);
-                log.info({ reqId, len: cmd.length, target, via: "stream" }, "full command expanded on demand");
-                return;
-              } catch (e) {
-                // 企微对卡片事件的被动回复窗口/类型支持未有文档保证 —— 被拒就退
-                // 分块, 用户无感知差异 (只是多几条消息)。
-                log.warn({ err: (e as Error).message, reqId }, "stream reply rejected — falling back to chunked markdown");
-              }
+            for (const [i, chunk] of chunkText(cmd, FULLCMD_CHUNK_CHARS).entries()) {
+              const n = Math.ceil(cmd.length / FULLCMD_CHUNK_CHARS);
+              const head = n > 1 ? `📄 完整命令（${cmd.length} 字，${i + 1}/${n}）：\n` : `📄 完整命令（${cmd.length} 字）：\n`;
+              await client.sendMessage(targetChatId(target), {
+                msgtype: "markdown",
+                markdown: { content: withTagHeader(target, head + chunk) },
+              });
             }
-            await sendChunked();
-            log.info({ reqId, len: cmd.length, target, via: "chunked" }, "full command expanded on demand");
+            log.info({ reqId, len: cmd.length, target }, "full command expanded on demand");
           } catch (e) {
             log.warn({ err: (e as Error).message, reqId }, "full command expand failed");
           }
