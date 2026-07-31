@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.2.4] - 2026-07-31
+
+### Changed
+- `mirror`: KeepAlive 心跳通知带回轮次计数 —— 从 `KeepAlive · ~Nk tokens` 恢复为 `KeepAlive n/N · ~Nk tokens`。`n` = 上次真实（非 ping）活动以来的 ping 轮数（真实活动重新锚定时归零），`N` = `round(maxIdleSec / ttlSec)`，即当前配置下缓存冷掉前的最大保活轮数。1.2.1 随 `maxPings`→`maxIdleSec` 一并去掉的 `n/max`，现按需求改以派生分母回归。
+
 ## [1.2.3] - 2026-07-31
 
 ### Fixed
@@ -82,7 +87,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.3...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.4...HEAD
+[1.2.4]: https://github.com/guxi11/wezard/compare/v1.2.3...v1.2.4
 [1.2.3]: https://github.com/guxi11/wezard/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/guxi11/wezard/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/guxi11/wezard/compare/v1.2.0...v1.2.1
