@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.2.7] - 2026-08-01
+
+### Fixed
+- `mirror`: KeepAlive 轮次计数卡在 `1/N` —— 1.2.6 把调度改用消息时钟后,`grewSinceLast`(轮次重置 + 真实活动重锚的判据)错用了 `lastMs`(**含保活自己的 ping/pong**)。心跳的 ping+pong 也是消息 turn,会推高 `lastMs`,在交互式会话里 pong 隔几秒才生成、时序有缝,导致下一个非 pinging tick 把自己的心跳误判为「新活动」而把 `round` 归零,`n` 永远爬不过 1。改为只看 `lastRealMs`(已滤除 ping/pong):纯保活期间轮次正常累加 `1/N→2/N→…`,只有真实对话才重置。
+
 ## [1.2.6] - 2026-07-31
 
 ### Fixed
@@ -98,7 +103,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.6...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.7...HEAD
+[1.2.7]: https://github.com/guxi11/wezard/compare/v1.2.6...v1.2.7
 [1.2.6]: https://github.com/guxi11/wezard/compare/v1.2.5...v1.2.6
 [1.2.5]: https://github.com/guxi11/wezard/compare/v1.2.4...v1.2.5
 [1.2.4]: https://github.com/guxi11/wezard/compare/v1.2.3...v1.2.4
