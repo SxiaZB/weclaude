@@ -110,6 +110,7 @@ interface ResolvedSession {
 const rankedJsonlsForCwd = (
   cwd: string,
   only?: CliBackend,
+  exclude?: Set<string>,
 ): Array<{ sessionId: string; jsonlPath: string; mtime: number }> =>
   projectDirsFor(expandHome(cwd))
     .filter(({ backend }) => !only || backend.name === only.name)
@@ -117,8 +118,10 @@ const rankedJsonlsForCwd = (
       let names: string[];
       try { names = readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { return []; }
       return names.flatMap((n) => {
+        const sid = n.replace(/\.jsonl$/, "");
+        if (exclude?.has(sid)) return []; // already bound to another chat/peer — never steal it
         const p = join(dir, n);
-        try { return [{ sessionId: n.replace(/\.jsonl$/, ""), jsonlPath: p, mtime: statSync(p).mtimeMs }]; }
+        try { return [{ sessionId: sid, jsonlPath: p, mtime: statSync(p).mtimeMs }]; }
         catch { return []; }
       });
     })
@@ -128,8 +131,8 @@ const rankedJsonlsForCwd = (
 // `/new`) rotation always leaves a fresh jsonl here, so this is how the mirror
 // re-finds the live session after a rotation it didn't itself record — used by
 // resolveSession's auto-pick and by restoreFromStore's heal path.
-const latestJsonlForCwd = (cwd: string, only?: CliBackend): ResolvedSession | undefined => {
-  const top = rankedJsonlsForCwd(cwd, only)[0];
+const latestJsonlForCwd = (cwd: string, only?: CliBackend, exclude?: Set<string>): ResolvedSession | undefined => {
+  const top = rankedJsonlsForCwd(cwd, only, exclude)[0];
   return top ? { sessionId: top.sessionId, jsonlPath: top.jsonlPath } : undefined;
 };
 
@@ -212,8 +215,8 @@ const findInjectOffset = (path: string, fp: string): number | undefined => {
 // the real session. Reliable for worktree dirs (one session lives there);
 // restore + the drift follower only consult it on cross-dir moves, where that
 // assumption holds.
-const liveSessionForCwd = (cwd: string, only?: CliBackend): ResolvedSession | undefined => {
-  for (const c of rankedJsonlsForCwd(cwd, only)) {
+const liveSessionForCwd = (cwd: string, only?: CliBackend, exclude?: Set<string>): ResolvedSession | undefined => {
+  for (const c of rankedJsonlsForCwd(cwd, only, exclude)) {
     if (jsonlHasUserLine(c.jsonlPath)) return { sessionId: c.sessionId, jsonlPath: c.jsonlPath };
   }
   return undefined;
@@ -2731,10 +2734,37 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // Re-attach a stored binding for `principal`. Returns the resulting state, or
   // undefined if the on-disk transcript is gone (in which case the entry is
   // dropped so the next inbound flows through /new auto-spawn).
+  // Every sessionId already bound to a DIFFERENT principal (live attachment or
+  // persisted store). The cwd-newest heal must never hand one of these to
+  // another peer: a chat's siblings all share one cwd, so "newest jsonl in cwd"
+  // is a different peer's live transcript, not this one's rotation. Healing onto
+  // it collapses N distinct peers onto one sessionId (attach() then dedupes by
+  // sid and silently detaches all-but-one). Excluding claimed sids keeps each
+  // peer on its own session.
+  const sidsClaimedByOthers = (principal: string): Set<string> => {
+    const s = new Set<string>();
+    for (const [k, v] of Object.entries(deps.store.all())) if (k !== principal && v.sessionId) s.add(v.sessionId);
+    for (const [k, a] of byTarget) if (k !== principal && a.sessionId) s.add(a.sessionId);
+    return s;
+  };
+
   const restoreFromStore = async (principal: string): Promise<AttachState | undefined> => {
     const rec = deps.store.get(principal);
     if (!rec) return undefined;
     let jsonlAbs = expandHome(rec.jsonlPath);
+    // Prefer the stored pane id and validate via display-message. Pane ids
+    // (`%N`) are monotonic per tmux server lifetime, so they're stable across
+    // daemon reloads as long as the tmux server didn't restart. With the
+    // shared `wezard` session hosting many chats, listing panes by session
+    // name would mis-route to whichever window happens to be first — never
+    // do that. If the stored pane is dead, leave tmuxPane empty and let
+    // dispatch's respawn check reincarnate via `claude --resume <sid>`.
+    // Resolved BEFORE the heal below: a live pane authoritatively owns
+    // `rec.sessionId` (spawned as `--session-id <uuid>`), so a not-yet-written
+    // jsonl means "no input yet", NOT "rotated away" — healing it onto some
+    // unrelated newest-in-cwd file is exactly the cross-wire we must avoid.
+    const storedPane = (rec.tmuxPane ?? "").trim();
+    const livePane = storedPane && (await tmuxPaneAlive(storedPane)) ? storedPane : "";
     if (!existsSync(jsonlAbs)) {
       // First: the SAME-sid transcript may have merely relocated to a sibling
       // project dir (Claude Code EnterWorktree/ExitWorktree moved it while the
@@ -2749,35 +2779,33 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         rec.jsonlPath = relocated;
         jsonlAbs = relocated;
         deps.store.set(principal, rec);
+      } else if (livePane) {
+        // Live pane, no transcript yet: a freshly-spawned peer that hasn't
+        // received its first turn. The pane owns `rec.sessionId` and will write
+        // `<sid>.jsonl` on first input; keep spawn-mode (the tail tolerates a
+        // missing file). Do NOT heal — that is what made every idle sibling in a
+        // shared cwd collapse onto the same newest jsonl.
+        log.info({ principal, sessionId: rec.sessionId, pane: livePane }, "mirror restore: live pane, transcript not written yet — keeping spawn-mode binding");
       } else {
-        // Recorded session rotated out from under us — a `/clear` or native `/new`
-        // the daemon didn't record (e.g. it restarted while the /clear migration
-        // watcher was still open). The rotation left a newer jsonl in the same
-        // project dir; heal onto it instead of dropping the binding, else the
-        // chat silently loses all further responses. Fail-closed drop only when
-        // the project dir is truly empty.
-        const healed = latestJsonlForCwd(rec.cwd || cfg.wrc.cwd, owner);
+        // Pane dead AND transcript gone. Either the session rotated (`/clear` /
+        // native `/new` the daemon missed, leaving a newer jsonl) or the peer was
+        // spawned-then-killed before writing anything. Heal onto the newest jsonl
+        // in the project dir — but skip any sid already bound to another peer, so
+        // a dead node can't steal a live sibling's transcript. Fail-closed drop
+        // when nothing unclaimed remains.
+        const healed = latestJsonlForCwd(rec.cwd || cfg.wrc.cwd, owner, sidsClaimedByOthers(principal));
         if (!healed) {
-          log.warn({ principal, jsonlPath: rec.jsonlPath }, "mirror restore: jsonl missing and no sibling, dropping entry");
+          log.warn({ principal, jsonlPath: rec.jsonlPath }, "mirror restore: jsonl missing and no unclaimed sibling, dropping entry");
           deps.store.drop(principal);
           return undefined;
         }
-        log.warn({ principal, from: rec.sessionId, to: healed.sessionId }, "mirror restore: recorded jsonl gone, healed to latest in project dir");
+        log.warn({ principal, from: rec.sessionId, to: healed.sessionId }, "mirror restore: recorded jsonl gone, healed to latest unclaimed in project dir");
         rec.sessionId = healed.sessionId;
         rec.jsonlPath = healed.jsonlPath;
         jsonlAbs = healed.jsonlPath;
         deps.store.set(principal, rec);
       }
     }
-    // Prefer the stored pane id and validate via display-message. Pane ids
-    // (`%N`) are monotonic per tmux server lifetime, so they're stable across
-    // daemon reloads as long as the tmux server didn't restart. With the
-    // shared `wezard` session hosting many chats, listing panes by session
-    // name would mis-route to whichever window happens to be first — never
-    // do that. If the stored pane is dead, leave tmuxPane empty and let
-    // dispatch's respawn check reincarnate via `claude --resume <sid>`.
-    const storedPane = (rec.tmuxPane ?? "").trim();
-    const livePane = storedPane && (await tmuxPaneAlive(storedPane)) ? storedPane : "";
 
     // Pane-cwd worktree re-home: the stored jsonl can EXIST yet be stale because
     // the live pane entered/selected a git worktree, switching it to a DIFFERENT
@@ -2796,7 +2824,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // session belonging to a non-primary CLI.
         const paneDir = projectDirFor(jsonlAbs, expandHome(paneCwd));
         if (paneDir !== dirname(jsonlAbs)) {
-          const live = liveSessionForCwd(paneCwd, backendForPath(jsonlAbs));
+          const live = liveSessionForCwd(paneCwd, backendForPath(jsonlAbs), sidsClaimedByOthers(principal));
           if (live && live.sessionId !== rec.sessionId) {
             log.info({ principal, from: rec.sessionId, to: live.sessionId, paneCwd }, "mirror restore: pane in worktree, re-homed to live session");
             rec.sessionId = live.sessionId;
@@ -3182,7 +3210,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         if (!cwd) continue;                                   // pane gone
         const paneDir = projectDirFor(a.jsonlPath, expandHome(cwd));
         if (paneDir === dirname(a.jsonlPath)) continue;       // same project dir — no drift
-        const live = liveSessionForCwd(cwd, backendForPath(a.jsonlPath));
+        const live = liveSessionForCwd(cwd, backendForPath(a.jsonlPath), sidsClaimedByOthers(a.target));
         if (!live || live.sessionId === a.sessionId) continue; // empty dir, or same-sid rename (tail follows it)
         a.runningCwd = expandHome(cwd);                        // migrateAttachment persists this to store
         log.info({ target: a.target, pane: a.tmuxPane, fromDir: dirname(a.jsonlPath), toDir: paneDir, oldSid: a.sessionId, newSid: live.sessionId }, "mirror: pane drifted (worktree), following live session");
