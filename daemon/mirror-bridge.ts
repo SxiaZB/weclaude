@@ -3069,8 +3069,15 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         return;
       }
       const current = listJsonls(projectDir);
+      // Exclude sids already bound to OTHER targets: when several panes in one
+      // cwd fork/spawn concurrently (a graph's #t3/#sp/base all resuming), each
+      // watcher sees ALL the new jsonls, not just its own pane's. Without this a
+      // resume-fork watcher grabs a sibling's freshly-written transcript (newest
+      // + has content) and two tags collapse onto one sessionId. The claimed set
+      // pins each watcher off its siblings' sessions.
+      const claimed = sidsClaimedByOthers(a.target);
       const candidates: string[] = [];
-      for (const name of current) if (!baseline.has(name)) candidates.push(name);
+      for (const name of current) if (!baseline.has(name) && !claimed.has(name.replace(/\.jsonl$/, ""))) candidates.push(name);
       // Pick newest-mtime candidate that has user content. Older candidates
       // without content stay in the running until they accrue — never aborts.
       const ranked = candidates
