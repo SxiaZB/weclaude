@@ -99,11 +99,28 @@ case "$cmd" in
   restart) svc_unload || true; sleep 1; svc_load && echo "daemon: restarted" ;;
   reload)
     # KeepAlive.SuccessfulExit=false, so /shutdown alone won't respawn — kick it.
+    # But two failure modes must be handled or the new daemon silently won't come up:
+    #   1) port race — /shutdown is async; wait for :17890 to free before respawning,
+    #      else the new process loses the bind and crash-loops on ThrottleInterval.
+    #   2) job not bootstrapped (after stop/unload/login) — kickstart errors with
+    #      "Could not find service"; fall back to bootstrap/load instead of no-op.
     http_post /shutdown >/dev/null 2>&1 || true
+    for _ in $(seq 1 50); do http_get /status >/dev/null 2>&1 || break; sleep 0.2; done
     case "$OS" in
-      Darwin) launchctl kickstart -k "gui/$(id -u)/${LABEL}" >/dev/null && echo "daemon: reloaded" ;;
-      Linux)  systemctl --user restart wezard.service && echo "daemon: reloaded" ;;
+      Darwin)
+        if ! launchctl kickstart -k "gui/$(id -u)/${LABEL}" 2>/dev/null; then
+          launchctl bootstrap "gui/$(id -u)" "$HOME_DIR/Library/LaunchAgents/${LABEL}.plist" 2>/dev/null \
+            || launchctl load -w "$HOME_DIR/Library/LaunchAgents/${LABEL}.plist"
+        fi
+        ;;
+      Linux)  systemctl --user restart wezard.service ;;
     esac
+    # readiness poll — don't claim success until it actually binds
+    for _ in $(seq 1 50); do
+      http_get /status >/dev/null 2>&1 && { echo "daemon: reloaded"; exit 0; }
+      sleep 0.2
+    done
+    echo "daemon: reload issued but /status not responding — 'wezard logs'" >&2; exit 1
     ;;
   send)
     chat="${1:-}"; shift || true
