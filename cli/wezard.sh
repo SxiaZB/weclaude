@@ -50,8 +50,12 @@ wezard <subcommand>
 EOF
 }
 
-http_get() { curl -sS --max-time 5 "$DAEMON_BASE$1"; }
-http_post() { curl -sS --max-time 5 -X POST -H 'content-type: application/json' -d "${2:-{\}}" "$DAEMON_BASE$1"; }
+# --noproxy '*' is mandatory: the daemon is on 127.0.0.1, but an http_proxy /
+# all_proxy in the environment makes curl tunnel even localhost through the
+# proxy, which answers refused upstreams with an empty 200 — a false "up" that
+# poisons every readiness probe. Never let a proxy sit between CLI and daemon.
+http_get() { curl -sS --noproxy '*' --max-time 5 "$DAEMON_BASE$1"; }
+http_post() { curl -sS --noproxy '*' --max-time 5 -X POST -H 'content-type: application/json' -d "${2:-{\}}" "$DAEMON_BASE$1"; }
 
 # Run a dist/ entry script, building first when we're sitting in a dev checkout.
 # npm installs ship dist/ in the tarball, so a missing script there means a
@@ -71,15 +75,43 @@ exec_node() {
   exec "$(command -v node)" "$script" "$@"
 }
 
-svc_load() {
+# One launchctl vocabulary, one readiness judge. Every lifecycle command
+# (start/restart/reload) funnels through ensure_up so none can leave the job in
+# a state another can't recover from. Success is judged by the invariant that
+# matters — /status responds on :17890 — never by a launchctl exit code, which
+# lies (un-bootstrapped domains, throttle, load/bootstrap semantics clash).
+PLIST="$HOME_DIR/Library/LaunchAgents/${LABEL}.plist"
+
+# Fast readiness probe — short per-call timeout so a bound-but-wedged /status
+# (e.g. daemon blocked on WS init) fails the poll in ~1s, not the 5s http_get
+# budget. 30 tries × ~1s ceiling ≈ bounded ~30s worst case, not minutes.
+probe()     { curl -sS --noproxy '*' --connect-timeout 1 --max-time 1 "$DAEMON_BASE/status" >/dev/null 2>&1; }
+wait_up()   { for _ in $(seq 1 30); do probe && return 0; sleep 0.3; done; return 1; }
+wait_down() { for _ in $(seq 1 30); do probe || return 0; sleep 0.3; done; return 1; }
+
+# idempotent converge-to-running: kick if already bootstrapped, else bootstrap,
+# else legacy load — then assert it actually bound.
+ensure_up() {
   case "$OS" in
-    Darwin) launchctl load -w "$HOME_DIR/Library/LaunchAgents/${LABEL}.plist" ;;
-    Linux)  systemctl --user start wezard.service ;;
+    Darwin)
+      launchctl kickstart -k "gui/$(id -u)/${LABEL}" 2>/dev/null \
+        || launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
+        || launchctl load -w "$PLIST" 2>/dev/null || true ;;
+    Linux) systemctl --user restart wezard.service ;;
   esac
+  wait_up
 }
-svc_unload() {
+# Guaranteed teardown: drive shutdown through the HTTP /shutdown path, which
+# hard-exits (setTimeout process.exit) regardless of in-flight connections.
+# NEVER SIGTERM a live daemon via bootout — its SIGTERM handler awaits
+# http.close(), which blocks forever on a hung long-poll, wedging launchctl.
+graceful_stop() { http_post /shutdown >/dev/null 2>&1 || true; wait_down; }
+# Remove the job from the domain (so RunAtLoad won't respawn it). Process is
+# already dead from graceful_stop, so bootout is instant — nothing to kill.
+svc_unregister() {
   case "$OS" in
-    Darwin) launchctl unload "$HOME_DIR/Library/LaunchAgents/${LABEL}.plist" ;;
+    Darwin) launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null \
+              || launchctl unload "$PLIST" 2>/dev/null || true ;;
     Linux)  systemctl --user stop wezard.service ;;
   esac
 }
@@ -88,39 +120,29 @@ case "$cmd" in
   init)    exec_node dist/cli/init.js "$@" ;;
   migrate) exec_node dist/cli/migrate.js "$@" ;;
   status)
-    if ! out=$(http_get /status 2>/dev/null); then
-      echo "daemon: down ($DAEMON_BASE)"
-      exit 1
+    if out=$(http_get /status 2>/dev/null); then
+      echo "$out" | jq . 2>/dev/null || echo "$out"
+      exit 0
     fi
-    echo "$out" | jq . 2>/dev/null || echo "$out"
+    # /status unreachable — distinguish "not loaded" from the silent-death case:
+    # launchd shows the job loaded but it never bound the port (crash-loop /
+    # bad config). Surface that instead of a flat "down".
+    echo "daemon: down ($DAEMON_BASE)"
+    if [[ "$OS" == "Darwin" ]] && ex=$(launchctl print "gui/$(id -u)/${LABEL}" 2>/dev/null | sed -n 's/.*last exit code = \([0-9-]*\).*/\1/p'); then
+      [[ -n "$ex" && "$ex" != "0" ]] \
+        && echo "  ↳ launchd job loaded but last exit code = $ex — crash-looping. 'wezard logs' to see why." >&2
+    fi
+    exit 1
     ;;
-  start)   svc_load   && echo "daemon: started" ;;
-  stop)    svc_unload && echo "daemon: stopped" ;;
-  restart) svc_unload || true; sleep 1; svc_load && echo "daemon: restarted" ;;
+  start)   ensure_up && echo "daemon: started"   || { echo "daemon: start failed — 'wezard logs'" >&2; exit 1; } ;;
+  stop)    graceful_stop >/dev/null 2>&1 || true; svc_unregister; echo "daemon: stopped" ;;
+  restart) graceful_stop >/dev/null 2>&1 || true; svc_unregister; ensure_up && echo "daemon: restarted" || { echo "daemon: restart failed — 'wezard logs'" >&2; exit 1; } ;;
   reload)
-    # KeepAlive.SuccessfulExit=false, so /shutdown alone won't respawn — kick it.
-    # But two failure modes must be handled or the new daemon silently won't come up:
-    #   1) port race — /shutdown is async; wait for :17890 to free before respawning,
-    #      else the new process loses the bind and crash-loops on ThrottleInterval.
-    #   2) job not bootstrapped (after stop/unload/login) — kickstart errors with
-    #      "Could not find service"; fall back to bootstrap/load instead of no-op.
-    http_post /shutdown >/dev/null 2>&1 || true
-    for _ in $(seq 1 50); do http_get /status >/dev/null 2>&1 || break; sleep 0.2; done
-    case "$OS" in
-      Darwin)
-        if ! launchctl kickstart -k "gui/$(id -u)/${LABEL}" 2>/dev/null; then
-          launchctl bootstrap "gui/$(id -u)" "$HOME_DIR/Library/LaunchAgents/${LABEL}.plist" 2>/dev/null \
-            || launchctl load -w "$HOME_DIR/Library/LaunchAgents/${LABEL}.plist"
-        fi
-        ;;
-      Linux)  systemctl --user restart wezard.service ;;
-    esac
-    # readiness poll — don't claim success until it actually binds
-    for _ in $(seq 1 50); do
-      http_get /status >/dev/null 2>&1 && { echo "daemon: reloaded"; exit 0; }
-      sleep 0.2
-    done
-    echo "daemon: reload issued but /status not responding — 'wezard logs'" >&2; exit 1
+    # KeepAlive.SuccessfulExit=false, so /shutdown alone won't respawn. Graceful
+    # stop WAITS for :17890 to free (else the respawn loses the bind and
+    # crash-loops on ThrottleInterval), then converge via the shared primitive.
+    graceful_stop >/dev/null 2>&1 || true
+    ensure_up && echo "daemon: reloaded" || { echo "daemon: reload issued but /status not responding — 'wezard logs'" >&2; exit 1; }
     ;;
   send)
     chat="${1:-}"; shift || true
