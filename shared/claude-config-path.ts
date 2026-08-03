@@ -68,6 +68,27 @@ export const isClaudeConfigPath = (raw: string): boolean => {
   return p.split("/").some((seg) => seg === ".claude");
 };
 
+// 段内所有「写重定向」的目标: `>f` `>>f` `2>f` `&>f` `>|f`, 以及 `>` 单独成 token
+// 后跟目标的写法。`2>&1` `>&2` `2>&-` 是 fd 复制, 不落地文件, 跳过; `<` 只读不算。
+//
+// 为什么必须看目标, 而不是"段里出现过 >": 住在 `.claude/skills/**` 里的 skill 脚本,
+// 调用时带任何重定向(哪怕只是 `2>/dev/null`)都会让"段内有 .claude token"和"段内有
+// 重定向"这两个不相干的事实凑成误判。执行脚本不写配置面, CC 不会立原生框, 拦了纯属
+// 白发卡 —— 2026-08-03 现场: 一条 ylog-query 命令在同一会话连发 13 张。
+const redirectTargets = (toks: string[]): string[] => {
+  const targets: string[] = [];
+  for (let i = 0; i < toks.length; i++) {
+    const idx = toks[i]!.indexOf(">");
+    if (idx < 0) continue;
+    const rest = toks[i]!.slice(idx).replace(/^>{1,2}\|?/u, "");
+    if (rest.startsWith("&")) continue; // fd 复制, 目标不是路径
+    if (rest) { targets.push(rest); continue; }
+    const next = toks[i + 1]; // `> file` 分开写
+    if (next !== undefined) { targets.push(next); i++; }
+  }
+  return targets;
+};
+
 const bashHit = (command: string): ClaudeConfigHit | undefined => {
   // 引号感知切分失败(未闭合引号/孤立 &) → 整条当一段看, fail-closed 宁可多发卡。
   const segments = splitSegments(command) ?? [command];
@@ -77,12 +98,13 @@ const bashHit = (command: string): ClaudeConfigHit | undefined => {
     if (rawToks.length === 0) continue;
     recordAssignments(rawToks, vars);
     const toks = rawToks.map((t) => expandVars(t, vars));
+    // 重定向写入(`echo x > ~/.claude/y`)与写命令同等对待; 命令头本身不必是写命令。
+    const redirHit = redirectTargets(toks).find((t) => isClaudeConfigPath(t));
+    if (redirHit) return { path: unquote(redirHit), why: "bash-write" };
     const hitTok = toks.find((t) => isClaudeConfigPath(t));
     if (!hitTok) continue;
     const head = (unquote(toks[0]!).split("/").pop() ?? "").trim();
-    // 重定向写入(`echo x > ~/.claude/y`)与写命令同等对待; 命令头本身不必是写命令。
-    const redirects = /[^0-9<>]?>{1,2}/u.test(seg);
-    if (WRITE_HEADS.has(head) || redirects) return { path: unquote(hitTok), why: "bash-write" };
+    if (WRITE_HEADS.has(head)) return { path: unquote(hitTok), why: "bash-write" };
     // `sed -i` 原地改写; 不带 -i 的 sed 只是读。
     if (head === "sed" && toks.some((t) => t === "-i" || t.startsWith("-i"))) {
       return { path: unquote(hitTok), why: "bash-write" };

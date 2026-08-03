@@ -85,6 +85,39 @@ t("不命中: .claude 只是名字的一部分", () => {
   assert.equal(bash("mkdir -p ~/.claudex/skills"), undefined);
 });
 
+// ── 重定向: 只看目标, 不看"段里出现过 >" ────────────────────────────────
+// 2026-08-03 现场: 住在 .claude/skills 下的 skill 脚本 + `2>/dev/null`, 同一会话
+// 被守卫连发 13 张卡。执行脚本不写配置面, CC 不立原生框, 守卫本无用武之地。
+t("不命中: 执行 .claude 下的脚本 + 重定向到别处（现场样本）", () => {
+  for (const cmd of [
+    'python3 /Users/x/qm-brain/.claude/skills/ylog-query/scripts/run_ylog.py --service pmdj --line-limit 200 2>/dev/null | python3 -c "print(1)"',
+    "bash ~/.claude/skills/foo/run.sh > /tmp/out.log",
+    "bash ~/.claude/skills/foo/run.sh 2>&1 | tee /tmp/out.log",
+    "cat ~/.claude/settings.json > /tmp/bak.json",
+    "python3 .claude/skills/x/gen.py >> /tmp/acc.txt",
+  ]) {
+    assert.equal(bash(cmd), undefined, `不应命中: ${cmd}`);
+  }
+});
+
+t("命中: 重定向目标就是 .claude（守卫真正要拦的）", () => {
+  for (const cmd of [
+    "python3 gen.py > ~/.claude/settings.json",
+    "python3 gen.py >~/.claude/settings.json",
+    "curl -s https://x/y 2> .claude/err.log",
+    "python3 gen.py &> ~/.claude/out.log",
+  ]) {
+    const hit = bash(cmd);
+    assert.equal(hit?.why, "bash-write", `应命中: ${cmd}`);
+    assert.ok(hit && isClaudeConfigPath(hit.path), `path 应是重定向目标: ${cmd} → ${hit?.path}`);
+  }
+});
+
+t("已知盲点: `>|` noclobber 覆写 —— splitSegments 把 `|` 当管道切段(既有行为)", () => {
+  // 改 splitSegments 会牵动 allow-rules 的分段语义, 为这个几乎不出现的写法不划算。
+  assert.equal(bash("python3 gen.py >| ~/.claude/settings.json"), undefined);
+});
+
 // ── 变量间接 ───────────────────────────────────────────────────────────
 // 写命令段里没有字面 `.claude`, 但赋值的值就在同一条命令里 → 展开一层再判。
 // 不展开的话: 规则侧纯赋值段被当无害段跳过后, `Bash(rm *)` 会静默放行这条命令,
