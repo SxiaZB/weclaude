@@ -3359,6 +3359,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       spawned.justSpawned = true;
       // 只有换过 pane 才是断点 —— 首次 /wrc 建会话时 prev 为空, 那不是"不连续", 是开局。
       if (prev) spawned.ctxCut = "new";
+      // A freshly spawned session is empty — nothing in the cache to keep warm.
+      // Pause keepalive like /stop; the first real turn (WeCom inbound, or the
+      // pane going busy after the resume grace) re-earns the budget. Mirrors
+      // interruptPane so /new can't strand a ping loop on an idle blank session.
+      spawned.keepaliveOff = true;
+      spawned.keepaliveOffAt = Date.now();
+      spawned.keepalive = undefined; // re-anchors cleanly on resume
+      persistPause(spawned);
     }
     // Clear the chat's pendingCwd on the BASE record too — the queued switch
     // has just been consumed by this respawn. Without this, a subsequent /new
@@ -3942,12 +3950,20 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         }
         return;
       }
-      // A real inbound is a new conversation → lift any `/stop` keepalive pause
-      // and re-anchor both clocks to now (this turn is real work). Pane-side new
-      // turns re-anchor via the tick's stamps; this covers the WeCom-driven path.
-      a.keepaliveOff = false;
-      if (a.keepalive) { a.keepalive.lastMs = Date.now(); a.keepalive.lastRealMs = Date.now(); }
-      persistPause(a); // clear the persisted pause too, else a reload would re-pause
+      // `/clear` resets to an empty session — nothing in the cache to keep warm,
+      // so pause keepalive like `/stop` instead of lifting it. Every other inbound
+      // is real work: lift any prior pause and re-anchor both clocks to now.
+      // Pane-side new turns re-anchor via the tick's stamps; this covers the
+      // WeCom-driven path.
+      if (isClearCommand(text)) {
+        a.keepaliveOff = true;
+        a.keepaliveOffAt = Date.now();
+        a.keepalive = undefined; // re-anchors cleanly on resume
+      } else {
+        a.keepaliveOff = false;
+        if (a.keepalive) { a.keepalive.lastMs = Date.now(); a.keepalive.lastRealMs = Date.now(); }
+      }
+      persistPause(a); // persist the pause/resume too, else a reload would revert it
       // Finalize prior live stream (if any) so this new turn renders into its
       // own message bubble. Then open a fresh stream tied to the new frame and
       // ack immediately so WeCom doesn't time out while inject queues.
