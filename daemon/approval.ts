@@ -1407,8 +1407,8 @@ const resolveApprover = (
 };
 
 export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBeforeCard }: ApprovalDeps): Handler => {
-  const detailUrlFor = (id: string): string =>
-    buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
+  const detailUrlFor = (id: string, approver?: string): string =>
+    buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id, approver ? targetChatId(approver) : undefined);
 
   // Flush 一个 batch: 单成员 → 普通卡 (与未启用聚合一致); 多成员 → 批量卡。
   // 发送失败时调用 failPending 让每位成员的 handler 走 fallbackOnError 路径,
@@ -1437,7 +1437,7 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
             transcriptTail: m.transcriptTail,
             windowMinutes: batch.windowMinutes,
             danger: batch.danger,
-            detailUrl: detailUrlFor(m.reqId),
+            detailUrl: detailUrlFor(m.reqId, batch.approver),
           });
         })();
     try {
@@ -1883,8 +1883,8 @@ export const installApprovalEventListener = (
 
       const decoded = decodeKey(key);
 
-      const detailUrlFor = (id: string): string =>
-        buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
+      const detailUrlFor = (id: string, approver?: string): string =>
+        buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id, approver ? targetChatId(approver) : undefined);
 
       // Batch 卡分支: 一次性 resolve N 个成员 pending, 单次 update 卡片状态。
       // 必须在普通 decodeKey 分支前匹配 — 否则 batchId 形如 "b...|allow" 也
@@ -1955,7 +1955,7 @@ export const installApprovalEventListener = (
               chatKey: decoded.cancelChatKey,
               transcriptTail: wmeta?.transcriptTail ?? "",
               windowMinutes: cfg.approval.windowMinutes,
-              detailUrl: cbTaskId ? detailUrlFor(cbTaskId) : undefined,
+              detailUrl: cbTaskId ? detailUrlFor(cbTaskId, decoded.cancelChatKey) : undefined,
             }),
           );
           log.info({ chatKey: decoded.cancelChatKey, cbTaskId }, "cancel card updated in place");
@@ -2028,7 +2028,7 @@ export const installApprovalEventListener = (
               chatKey: meta?.chatKey ?? "",
               transcriptTail: meta?.transcriptTail ?? "",
               windowMinutes: cfg.approval.windowMinutes,
-              detailUrl: detailUrlFor(reqId),
+              detailUrl: detailUrlFor(reqId, meta?.chatKey),
             })
           : buildResolvedCard({
               reqId,
@@ -2044,7 +2044,7 @@ export const installApprovalEventListener = (
               sessionId: meta?.sessionId ?? "",
               chatKey: meta?.chatKey ?? "",
               danger: meta?.danger,
-              detailUrl: detailUrlFor(reqId),
+              detailUrl: detailUrlFor(reqId, meta?.chatKey),
             });
         await client.updateTemplateCard(frame, card);
         log.info({ reqId, decision, swept: Boolean(snap) }, "card updated in place");

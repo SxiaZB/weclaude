@@ -264,8 +264,9 @@ interface TailDeps {
   onItem: (item: RenderItem) => void;
   /** Build a click-to-detail URL for a tool_use id; returns "" when disabled
    *  (cfg.daemon.detailLinksInMirror=false) so the tail can skip wrapping the
-   *  bubble in a markdown link. */
-  detailUrlFor: (toolUseId: string) => string;
+   *  bubble in a markdown link. `principal` is the originating chat key, used
+   *  as ww_uniq so all detail links from one chat share one WeCom window. */
+  detailUrlFor: (toolUseId: string, principal?: string) => string;
   /** Originating session/target for the detail page header. */
   sessionId: string;
   target: string;
@@ -536,7 +537,7 @@ const renderToolUseGroupBody = (
 ): string => {
   const renderOne = (c: { toolUseId: string; input: unknown }): { compact: string; url: string } => ({
     compact: safeForMarkdown(renderToolInputCompact(c.input, deps.toolUseInlineMaxChars)),
-    url: deps.detailUrlFor(c.toolUseId),
+    url: deps.detailUrlFor(c.toolUseId, deps.target),
   });
   if (calls.length === 1) {
     const c = calls[0]!;
@@ -630,7 +631,7 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
         // 气泡推送的 gate 挪到非-brief 消费端 (onItem), 见下方 includeToolResults 判断。
         if (toolUseId) recordToolResult(toolUseId, full);
         const compact = safeForMarkdown(oneLineSummary(full, 40));
-        const url = deps.detailUrlFor(toolUseId);
+        const url = deps.detailUrlFor(toolUseId, deps.target);
         out.push({
           kind: "tool_result",
           toolUseId,
@@ -2108,8 +2109,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
 
   // 链接落到 chat 视图: 默认选中本 turn 所属的 #tag, 贴底显示整条会话。turnId 依旧
   // 是凭据 (不可枚举), 只是页面从"一个 turn"扩成"这个 chat 的全部会话"。
-  const briefDetailLink = (turnId: string): string =>
-    `✴️ [View chat details](${buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId)})`;
+  // target 作为 ww_uniq 传下去, 让同 chat 的所有 turn 详情都复用一个 WeCom 窗口。
+  const briefDetailLink = (turnId: string, target: string): string =>
+    `✴️ [View chat details](${buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target))})`;
 
   // 收口一条 loading 气泡: finish=true 写入最终内容, 只生效一次。发送失败退回 standalone。
   // 排队中的 turn 也持有气泡, 所以气泡是显式入参而不是从 a 上取。
@@ -2163,7 +2165,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         log.warn({ sessionId: a.sessionId, turnId }, "brief: queued turn timed out — force-closing the stuck one");
         closeBriefTurn(a);
       }
-      void finishBubble(a, bubble, briefDetailLink(turnId));
+      void finishBubble(a, bubble, briefDetailLink(turnId, a.target));
     }, HARD_TIMEOUT_MS);
     if (a.briefTurnId) {
       (a.briefQueue ??= []).push(q);
@@ -2194,7 +2196,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     a.briefHadTool = false;
     a.briefConcluded = false;
     a.briefLastText = undefined;
-    enqueueStandalone(a, briefDetailLink(turnId));
+    enqueueStandalone(a, briefDetailLink(turnId, a.target));
     log.info({ sessionId: a.sessionId, turnId }, "brief: turn started (CLI-side, no bubble)");
   };
 
@@ -2205,7 +2207,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const earlyLinkBubble = (a: AttachState): void => {
     if (!a.briefTurnId || !a.briefBubble || a.briefBubble.done) return;
     a.briefHadTool = true;
-    void finishBriefBubble(a, briefDetailLink(a.briefTurnId));
+    void finishBriefBubble(a, briefDetailLink(a.briefTurnId, a.target));
   };
 
   // 本轮结论落地, 只生效一次:
@@ -2217,7 +2219,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (!turnId || a.briefConcluded || !body.trim()) return;
     a.briefConcluded = true;
     if (a.briefHadTool || !a.briefBubble) sendStandalone(a, body);
-    else void finishBriefBubble(a, `${body}\n\n${briefDetailLink(turnId)}`);
+    else void finishBriefBubble(a, `${body}\n\n${briefDetailLink(turnId, a.target)}`);
     // 排队中的 turn 已经建了记录但还没跑, 不能被这把扫帚扫成「已完成」。
     const keep = [turnId, ...(a.briefQueue ?? []).map((q) => q.turnId)];
     recordCloseOpenTurns({ target: a.target, sessionId: a.sessionId, exceptIds: keep });
@@ -2231,7 +2233,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // 气泡还开着 (有工具的 turn: 结论只发了 standalone, 气泡留到这里收链接; 或空 turn
     // 没有结论) —— 收口: 统一写详情链接, 保证每个 turn 都有可点入口。
     if (a.briefBubble && !a.briefBubble.done) {
-      void finishBriefBubble(a, briefDetailLink(a.briefTurnId));
+      void finishBriefBubble(a, briefDetailLink(a.briefTurnId, a.target));
     }
     recordTurnClose(a.briefTurnId);
     log.info({ sessionId: a.sessionId, turnId: a.briefTurnId }, "brief: turn closed");
@@ -2631,9 +2633,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // Click-to-detail URL for a tool_use id. Cached on the bridge so both
   // attach() and migrateAttachment() share the same closure. Returns ""
   // when disabled in config — renderLine then drops the markdown wrapping.
-  const detailUrlFor = (id: string): string =>
+  // `principal` flows through to ww_uniq so all detail links from the same
+  // chat reuse one WeCom inner-browser window.
+  const detailUrlFor = (id: string, principal?: string): string =>
     cfg.daemon.detailLinksInMirror && id
-      ? buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id)
+      ? buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id, principal ? stripPrincipalPrefix(principal) : undefined)
       : "";
 
   const attach = ({ sessionId, jsonlPath, target: targetOverride, tmuxPane, tmuxSession, cwd, pendingCwd }: AttachArgs): AttachResult => {
