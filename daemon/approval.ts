@@ -1549,8 +1549,8 @@ const resolveApprover = (
 
 export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarget, flushBeforeCard, nativeModal }: ApprovalDeps): Handler => {
   setCardQuoteMax(cfg.approval.cardQuoteMaxChars);
-  const detailUrlFor = (id: string): string =>
-    buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
+  const detailUrlFor = (id: string, approver?: string): string =>
+    buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id, approver ? targetChatId(approver) : undefined);
 
   // 手机端卡片 quote 区实测只渲染前 2~3 行 —— 长命令在卡上看不全。默认解法已经
   // 挪到卡片自身 (引用区可点进详情页 + 右上角「📄 展开完整命令」按需发全文), 所以
@@ -1658,7 +1658,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
             danger: batch.danger,
             sessionName: batch.sessionName,
             denyReason: batch.denyReason,
-            detailUrl: detailUrlFor(m.reqId),
+            detailUrl: detailUrlFor(m.reqId, batch.approver),
           });
         })();
     try {
@@ -2284,8 +2284,8 @@ export const installApprovalEventListener = (
 
       const decoded = decodeKey(key);
 
-      const detailUrlFor = (id: string): string =>
-        buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id);
+      const detailUrlFor = (id: string, approver?: string): string =>
+        buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id, approver ? targetChatId(approver) : undefined);
 
       // Batch 卡分支: 一次性 resolve N 个成员 pending, 单次 update 卡片状态。
       // 必须在普通 decodeKey 分支前匹配 — 否则 batchId 形如 "b...|allow" 也
@@ -2356,7 +2356,7 @@ export const installApprovalEventListener = (
               chatKey: decoded.cancelChatKey,
               transcriptTail: wmeta?.transcriptTail ?? "",
               windowMinutes: cfg.approval.windowMinutes,
-              detailUrl: cbTaskId ? detailUrlFor(cbTaskId) : undefined,
+              detailUrl: cbTaskId ? detailUrlFor(cbTaskId, decoded.cancelChatKey) : undefined,
             }),
           );
           log.info({ chatKey: decoded.cancelChatKey, cbTaskId }, "cancel card updated in place");
@@ -2431,7 +2431,7 @@ export const installApprovalEventListener = (
               windowMinutes: cfg.approval.windowMinutes,
               sessionName: meta?.sessionName,
               denyReason: meta?.denyReason,
-              detailUrl: detailUrlFor(reqId),
+              detailUrl: detailUrlFor(reqId, meta?.chatKey),
             })
           : buildResolvedCard({
               reqId,
@@ -2449,7 +2449,7 @@ export const installApprovalEventListener = (
               danger: meta?.danger,
               sessionName: meta?.sessionName,
               denyReason: meta?.denyReason,
-              detailUrl: detailUrlFor(reqId),
+              detailUrl: detailUrlFor(reqId, meta?.chatKey),
             });
         await client.updateTemplateCard(frame, card);
         log.info({ reqId, decision, swept: Boolean(snap) }, "card updated in place");

@@ -111,6 +111,7 @@ interface ResolvedSession {
 const rankedJsonlsForCwd = (
   cwd: string,
   only?: CliBackend,
+  exclude?: Set<string>,
 ): Array<{ sessionId: string; jsonlPath: string; mtime: number }> =>
   projectDirsFor(expandHome(cwd))
     .filter(({ backend }) => !only || backend.name === only.name)
@@ -118,8 +119,10 @@ const rankedJsonlsForCwd = (
       let names: string[];
       try { names = readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { return []; }
       return names.flatMap((n) => {
+        const sid = n.replace(/\.jsonl$/, "");
+        if (exclude?.has(sid)) return []; // already bound to another chat/peer — never steal it
         const p = join(dir, n);
-        try { return [{ sessionId: n.replace(/\.jsonl$/, ""), jsonlPath: p, mtime: statSync(p).mtimeMs }]; }
+        try { return [{ sessionId: sid, jsonlPath: p, mtime: statSync(p).mtimeMs }]; }
         catch { return []; }
       });
     })
@@ -129,8 +132,8 @@ const rankedJsonlsForCwd = (
 // `/new`) rotation always leaves a fresh jsonl here, so this is how the mirror
 // re-finds the live session after a rotation it didn't itself record — used by
 // resolveSession's auto-pick and by restoreFromStore's heal path.
-const latestJsonlForCwd = (cwd: string, only?: CliBackend): ResolvedSession | undefined => {
-  const top = rankedJsonlsForCwd(cwd, only)[0];
+const latestJsonlForCwd = (cwd: string, only?: CliBackend, exclude?: Set<string>): ResolvedSession | undefined => {
+  const top = rankedJsonlsForCwd(cwd, only, exclude)[0];
   return top ? { sessionId: top.sessionId, jsonlPath: top.jsonlPath } : undefined;
 };
 
@@ -213,8 +216,8 @@ const findInjectOffset = (path: string, fp: string): number | undefined => {
 // the real session. Reliable for worktree dirs (one session lives there);
 // restore + the drift follower only consult it on cross-dir moves, where that
 // assumption holds.
-const liveSessionForCwd = (cwd: string, only?: CliBackend): ResolvedSession | undefined => {
-  for (const c of rankedJsonlsForCwd(cwd, only)) {
+const liveSessionForCwd = (cwd: string, only?: CliBackend, exclude?: Set<string>): ResolvedSession | undefined => {
+  for (const c of rankedJsonlsForCwd(cwd, only, exclude)) {
     if (jsonlHasUserLine(c.jsonlPath)) return { sessionId: c.sessionId, jsonlPath: c.jsonlPath };
   }
   return undefined;
@@ -262,8 +265,9 @@ interface TailDeps {
   onItem: (item: RenderItem) => void;
   /** Build a click-to-detail URL for a tool_use id; returns "" when disabled
    *  (cfg.daemon.detailLinksInMirror=false) so the tail can skip wrapping the
-   *  bubble in a markdown link. */
-  detailUrlFor: (toolUseId: string) => string;
+   *  bubble in a markdown link. `principal` is the originating chat key, used
+   *  as ww_uniq so all detail links from one chat share one WeCom window. */
+  detailUrlFor: (toolUseId: string, principal?: string) => string;
   /** Originating session/target for the detail page header. */
   sessionId: string;
   target: string;
@@ -534,7 +538,7 @@ const renderToolUseGroupBody = (
 ): string => {
   const renderOne = (c: { toolUseId: string; input: unknown }): { compact: string; url: string } => ({
     compact: safeForMarkdown(renderToolInputCompact(c.input, deps.toolUseInlineMaxChars)),
-    url: deps.detailUrlFor(c.toolUseId),
+    url: deps.detailUrlFor(c.toolUseId, deps.target),
   });
   if (calls.length === 1) {
     const c = calls[0]!;
@@ -628,7 +632,7 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
         // 气泡推送的 gate 挪到非-brief 消费端 (onItem), 见下方 includeToolResults 判断。
         if (toolUseId) recordToolResult(toolUseId, full);
         const compact = safeForMarkdown(oneLineSummary(full, 40));
-        const url = deps.detailUrlFor(toolUseId);
+        const url = deps.detailUrlFor(toolUseId, deps.target);
         out.push({
           kind: "tool_result",
           toolUseId,
@@ -2201,8 +2205,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
 
   // 链接落到 chat 视图: 默认选中本 turn 所属的 #tag, 贴底显示整条会话。turnId 依旧
   // 是凭据 (不可枚举), 只是页面从"一个 turn"扩成"这个 chat 的全部会话"。
-  const briefDetailLink = (turnId: string): string =>
-    `✴️ [View chat details](${buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId)})`;
+  // target 作为 ww_uniq 传下去, 让同 chat 的所有 turn 详情都复用一个 WeCom 窗口。
+  const briefDetailLink = (turnId: string, target: string): string =>
+    `✴️ [View chat details](${buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target))})`;
 
   // 收口一条 loading 气泡: finish=true 写入最终内容, 只生效一次。发送失败退回 standalone。
   // 排队中的 turn 也持有气泡, 所以气泡是显式入参而不是从 a 上取。
@@ -2256,7 +2261,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         log.warn({ sessionId: a.sessionId, turnId }, "brief: queued turn timed out — force-closing the stuck one");
         closeBriefTurn(a);
       }
-      void finishBubble(a, bubble, briefDetailLink(turnId));
+      void finishBubble(a, bubble, briefDetailLink(turnId, a.target));
     }, HARD_TIMEOUT_MS);
     if (a.briefTurnId) {
       (a.briefQueue ??= []).push(q);
@@ -2287,7 +2292,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     a.briefHadTool = false;
     a.briefConcluded = false;
     a.briefLastText = undefined;
-    enqueueStandalone(a, briefDetailLink(turnId));
+    enqueueStandalone(a, briefDetailLink(turnId, a.target));
     log.info({ sessionId: a.sessionId, turnId }, "brief: turn started (CLI-side, no bubble)");
   };
 
@@ -2298,7 +2303,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const earlyLinkBubble = (a: AttachState): void => {
     if (!a.briefTurnId || !a.briefBubble || a.briefBubble.done) return;
     a.briefHadTool = true;
-    void finishBriefBubble(a, briefDetailLink(a.briefTurnId));
+    void finishBriefBubble(a, briefDetailLink(a.briefTurnId, a.target));
   };
 
   // 本轮结论落地, 只生效一次:
@@ -2310,7 +2315,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (!turnId || a.briefConcluded || !body.trim()) return;
     a.briefConcluded = true;
     if (a.briefHadTool || !a.briefBubble) sendStandalone(a, body);
-    else void finishBriefBubble(a, `${body}\n\n${briefDetailLink(turnId)}`);
+    else void finishBriefBubble(a, `${body}\n\n${briefDetailLink(turnId, a.target)}`);
     // 排队中的 turn 已经建了记录但还没跑, 不能被这把扫帚扫成「已完成」。
     const keep = [turnId, ...(a.briefQueue ?? []).map((q) => q.turnId)];
     recordCloseOpenTurns({ target: a.target, sessionId: a.sessionId, exceptIds: keep });
@@ -2324,7 +2329,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // 气泡还开着 (有工具的 turn: 结论只发了 standalone, 气泡留到这里收链接; 或空 turn
     // 没有结论) —— 收口: 统一写详情链接, 保证每个 turn 都有可点入口。
     if (a.briefBubble && !a.briefBubble.done) {
-      void finishBriefBubble(a, briefDetailLink(a.briefTurnId));
+      void finishBriefBubble(a, briefDetailLink(a.briefTurnId, a.target));
     }
     recordTurnClose(a.briefTurnId);
     log.info({ sessionId: a.sessionId, turnId: a.briefTurnId }, "brief: turn closed");
@@ -2352,7 +2357,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // 一个僵尸 turn 上来当活跃 turn, 白收一遍。
     for (const q of a.briefQueue ?? []) {
       closed++;
-      void finishBubble(a, q.bubble, briefDetailLink(q.turnId));
+      void finishBubble(a, q.bubble, briefDetailLink(q.turnId, a.target));
       recordTurnClose(q.turnId);
     }
     a.briefQueue = [];
@@ -2796,9 +2801,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // Click-to-detail URL for a tool_use id. Cached on the bridge so both
   // attach() and migrateAttachment() share the same closure. Returns ""
   // when disabled in config — renderLine then drops the markdown wrapping.
-  const detailUrlFor = (id: string): string =>
+  // `principal` flows through to ww_uniq so all detail links from the same
+  // chat reuse one WeCom inner-browser window.
+  const detailUrlFor = (id: string, principal?: string): string =>
     cfg.daemon.detailLinksInMirror && id
-      ? buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id)
+      ? buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id, principal ? stripPrincipalPrefix(principal) : undefined)
       : "";
 
   const attach = ({ sessionId, jsonlPath, target: targetOverride, tmuxPane, tmuxSession, cwd, pendingCwd }: AttachArgs): AttachResult => {
@@ -2891,10 +2898,37 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // Re-attach a stored binding for `principal`. Returns the resulting state, or
   // undefined if the on-disk transcript is gone (in which case the entry is
   // dropped so the next inbound flows through /new auto-spawn).
+  // Every sessionId already bound to a DIFFERENT principal (live attachment or
+  // persisted store). The cwd-newest heal must never hand one of these to
+  // another peer: a chat's siblings all share one cwd, so "newest jsonl in cwd"
+  // is a different peer's live transcript, not this one's rotation. Healing onto
+  // it collapses N distinct peers onto one sessionId (attach() then dedupes by
+  // sid and silently detaches all-but-one). Excluding claimed sids keeps each
+  // peer on its own session.
+  const sidsClaimedByOthers = (principal: string): Set<string> => {
+    const s = new Set<string>();
+    for (const [k, v] of Object.entries(deps.store.all())) if (k !== principal && v.sessionId) s.add(v.sessionId);
+    for (const [k, a] of byTarget) if (k !== principal && a.sessionId) s.add(a.sessionId);
+    return s;
+  };
+
   const restoreFromStore = async (principal: string): Promise<AttachState | undefined> => {
     const rec = deps.store.get(principal);
     if (!rec) return undefined;
     let jsonlAbs = expandHome(rec.jsonlPath);
+    // Prefer the stored pane id and validate via display-message. Pane ids
+    // (`%N`) are monotonic per tmux server lifetime, so they're stable across
+    // daemon reloads as long as the tmux server didn't restart. With the
+    // shared `wezard` session hosting many chats, listing panes by session
+    // name would mis-route to whichever window happens to be first — never
+    // do that. If the stored pane is dead, leave tmuxPane empty and let
+    // dispatch's respawn check reincarnate via `claude --resume <sid>`.
+    // Resolved BEFORE the heal below: a live pane authoritatively owns
+    // `rec.sessionId` (spawned as `--session-id <uuid>`), so a not-yet-written
+    // jsonl means "no input yet", NOT "rotated away" — healing it onto some
+    // unrelated newest-in-cwd file is exactly the cross-wire we must avoid.
+    const storedPane = (rec.tmuxPane ?? "").trim();
+    const livePane = storedPane && (await tmuxPaneAlive(storedPane)) ? storedPane : "";
     if (!existsSync(jsonlAbs)) {
       // First: the SAME-sid transcript may have merely relocated to a sibling
       // project dir (Claude Code EnterWorktree/ExitWorktree moved it while the
@@ -2909,35 +2943,33 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         rec.jsonlPath = relocated;
         jsonlAbs = relocated;
         deps.store.set(principal, rec);
+      } else if (livePane) {
+        // Live pane, no transcript yet: a freshly-spawned peer that hasn't
+        // received its first turn. The pane owns `rec.sessionId` and will write
+        // `<sid>.jsonl` on first input; keep spawn-mode (the tail tolerates a
+        // missing file). Do NOT heal — that is what made every idle sibling in a
+        // shared cwd collapse onto the same newest jsonl.
+        log.info({ principal, sessionId: rec.sessionId, pane: livePane }, "mirror restore: live pane, transcript not written yet — keeping spawn-mode binding");
       } else {
-        // Recorded session rotated out from under us — a `/clear` or native `/new`
-        // the daemon didn't record (e.g. it restarted while the /clear migration
-        // watcher was still open). The rotation left a newer jsonl in the same
-        // project dir; heal onto it instead of dropping the binding, else the
-        // chat silently loses all further responses. Fail-closed drop only when
-        // the project dir is truly empty.
-        const healed = latestJsonlForCwd(rec.cwd || cfg.wrc.cwd, owner);
+        // Pane dead AND transcript gone. Either the session rotated (`/clear` /
+        // native `/new` the daemon missed, leaving a newer jsonl) or the peer was
+        // spawned-then-killed before writing anything. Heal onto the newest jsonl
+        // in the project dir — but skip any sid already bound to another peer, so
+        // a dead node can't steal a live sibling's transcript. Fail-closed drop
+        // when nothing unclaimed remains.
+        const healed = latestJsonlForCwd(rec.cwd || cfg.wrc.cwd, owner, sidsClaimedByOthers(principal));
         if (!healed) {
-          log.warn({ principal, jsonlPath: rec.jsonlPath }, "mirror restore: jsonl missing and no sibling, dropping entry");
+          log.warn({ principal, jsonlPath: rec.jsonlPath }, "mirror restore: jsonl missing and no unclaimed sibling, dropping entry");
           deps.store.drop(principal);
           return undefined;
         }
-        log.warn({ principal, from: rec.sessionId, to: healed.sessionId }, "mirror restore: recorded jsonl gone, healed to latest in project dir");
+        log.warn({ principal, from: rec.sessionId, to: healed.sessionId }, "mirror restore: recorded jsonl gone, healed to latest unclaimed in project dir");
         rec.sessionId = healed.sessionId;
         rec.jsonlPath = healed.jsonlPath;
         jsonlAbs = healed.jsonlPath;
         deps.store.set(principal, rec);
       }
     }
-    // Prefer the stored pane id and validate via display-message. Pane ids
-    // (`%N`) are monotonic per tmux server lifetime, so they're stable across
-    // daemon reloads as long as the tmux server didn't restart. With the
-    // shared `wezard` session hosting many chats, listing panes by session
-    // name would mis-route to whichever window happens to be first — never
-    // do that. If the stored pane is dead, leave tmuxPane empty and let
-    // dispatch's respawn check reincarnate via `claude --resume <sid>`.
-    const storedPane = (rec.tmuxPane ?? "").trim();
-    const livePane = storedPane && (await tmuxPaneAlive(storedPane)) ? storedPane : "";
 
     // Pane-cwd worktree re-home: the stored jsonl can EXIST yet be stale because
     // the live pane entered/selected a git worktree, switching it to a DIFFERENT
@@ -2956,7 +2988,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // session belonging to a non-primary CLI.
         const paneDir = projectDirFor(jsonlAbs, expandHome(paneCwd));
         if (paneDir !== dirname(jsonlAbs)) {
-          const live = liveSessionForCwd(paneCwd, backendForPath(jsonlAbs));
+          const live = liveSessionForCwd(paneCwd, backendForPath(jsonlAbs), sidsClaimedByOthers(principal));
           if (live && live.sessionId !== rec.sessionId) {
             log.info({ principal, from: rec.sessionId, to: live.sessionId, paneCwd }, "mirror restore: pane in worktree, re-homed to live session");
             rec.sessionId = live.sessionId;
@@ -3201,8 +3233,15 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         return;
       }
       const current = listJsonls(projectDir);
+      // Exclude sids already bound to OTHER targets: when several panes in one
+      // cwd fork/spawn concurrently (a graph's #t3/#sp/base all resuming), each
+      // watcher sees ALL the new jsonls, not just its own pane's. Without this a
+      // resume-fork watcher grabs a sibling's freshly-written transcript (newest
+      // + has content) and two tags collapse onto one sessionId. The claimed set
+      // pins each watcher off its siblings' sessions.
+      const claimed = sidsClaimedByOthers(a.target);
       const candidates: string[] = [];
-      for (const name of current) if (!baseline.has(name)) candidates.push(name);
+      for (const name of current) if (!baseline.has(name) && !claimed.has(name.replace(/\.jsonl$/, ""))) candidates.push(name);
       // Pick newest-mtime candidate that has user content. Older candidates
       // without content stay in the running until they accrue — never aborts.
       const ranked = candidates
@@ -3342,7 +3381,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         if (!cwd) continue;                                   // pane gone
         const paneDir = projectDirFor(a.jsonlPath, expandHome(cwd));
         if (paneDir === dirname(a.jsonlPath)) continue;       // same project dir — no drift
-        const live = liveSessionForCwd(cwd, backendForPath(a.jsonlPath));
+        const live = liveSessionForCwd(cwd, backendForPath(a.jsonlPath), sidsClaimedByOthers(a.target));
         if (!live || live.sessionId === a.sessionId) continue; // empty dir, or same-sid rename (tail follows it)
         a.runningCwd = expandHome(cwd);                        // migrateAttachment persists this to store
         log.info({ target: a.target, pane: a.tmuxPane, fromDir: dirname(a.jsonlPath), toDir: paneDir, oldSid: a.sessionId, newSid: live.sessionId }, "mirror: pane drifted (worktree), following live session");
@@ -3484,6 +3523,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       spawned.justSpawned = true;
       // 只有换过 pane 才是断点 —— 首次 /wrc 建会话时 prev 为空, 那不是"不连续", 是开局。
       if (prev) spawned.ctxCut = "new";
+      // A freshly spawned session is empty — nothing in the cache to keep warm.
+      // Pause keepalive like /stop; the first real turn (WeCom inbound, or the
+      // pane going busy after the resume grace) re-earns the budget. Mirrors
+      // interruptPane so /new can't strand a ping loop on an idle blank session.
+      spawned.keepaliveOff = true;
+      spawned.keepaliveOffAt = Date.now();
+      spawned.keepalive = undefined; // re-anchors cleanly on resume
+      persistPause(spawned);
     }
     // Clear the chat's pendingCwd on the BASE record too — the queued switch
     // has just been consumed by this respawn. Without this, a subsequent /new
@@ -4138,12 +4185,20 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         }
         return;
       }
-      // A real inbound is a new conversation → lift any `/stop` keepalive pause
-      // and re-anchor both clocks to now (this turn is real work). Pane-side new
-      // turns re-anchor via the tick's stamps; this covers the WeCom-driven path.
-      a.keepaliveOff = false;
-      if (a.keepalive) { a.keepalive.lastMs = Date.now(); a.keepalive.lastRealMs = Date.now(); }
-      persistPause(a); // clear the persisted pause too, else a reload would re-pause
+      // `/clear` resets to an empty session — nothing in the cache to keep warm,
+      // so pause keepalive like `/stop` instead of lifting it. Every other inbound
+      // is real work: lift any prior pause and re-anchor both clocks to now.
+      // Pane-side new turns re-anchor via the tick's stamps; this covers the
+      // WeCom-driven path.
+      if (isClearCommand(text)) {
+        a.keepaliveOff = true;
+        a.keepaliveOffAt = Date.now();
+        a.keepalive = undefined; // re-anchors cleanly on resume
+      } else {
+        a.keepaliveOff = false;
+        if (a.keepalive) { a.keepalive.lastMs = Date.now(); a.keepalive.lastRealMs = Date.now(); }
+      }
+      persistPause(a); // persist the pause/resume too, else a reload would revert it
       // Finalize prior live stream (if any) so this new turn renders into its
       // own message bubble. Then open a fresh stream tied to the new frame and
       // ack immediately so WeCom doesn't time out while inject queues.

@@ -136,15 +136,18 @@ const detailRoot = (publicBase: string, fallbackHost: string, fallbackPort: numb
       ? remoteBase.replace(/\/+$/, "")
       : `http://${resolvePublicHost(fallbackHost)}:${fallbackPort}`;
 
-const detailParams = (id: string): string =>
-  new URLSearchParams({ id, forceInnerBrowser: "1", ww_vw: "1000", ww_vh: "800", ww_uniq: id }).toString();
+// ww_uniq 决定 WeCom 内置浏览器窗口复用: 同 chat 的所有 detail 链接共用一个窗口,
+// 而不是每条 id 各开一个。无 chatId 时退回 record id (保留旧行为)。
+const detailParams = (id: string, uniq?: string): string =>
+  new URLSearchParams({ id, forceInnerBrowser: "1", ww_vw: "1000", ww_vh: "800", ww_uniq: uniq ?? id }).toString();
 
 export const buildDetailUrl = (
   publicBase: string,
   fallbackHost: string,
   fallbackPort: number,
   id: string,
-): string => `${detailRoot(publicBase, fallbackHost, fallbackPort)}/detail?${detailParams(id)}`;
+  uniq?: string,
+): string => `${detailRoot(publicBase, fallbackHost, fallbackPort)}/detail?${detailParams(id, uniq)}`;
 
 // Chat 视图入口。id 仍是那条 turn 记录 —— 它既是凭据, 也决定默认选中哪个 #tag。
 export const buildChatUrl = (
@@ -152,7 +155,8 @@ export const buildChatUrl = (
   fallbackHost: string,
   fallbackPort: number,
   id: string,
-): string => `${detailRoot(publicBase, fallbackHost, fallbackPort)}/chat?${detailParams(id)}`;
+  uniq?: string,
+): string => `${detailRoot(publicBase, fallbackHost, fallbackPort)}/chat?${detailParams(id, uniq)}`;
 
 // Chat 视图路由 (页面 + JSON API + SSE)。store 未初始化时全部 503 —— 只可能发生在
 // initDetailPersistence 之前, 正常启动路径不会命中。

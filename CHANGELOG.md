@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [1.2.9] - 2026-08-05
+
+### Fixed
+- `mirror`: `/clear` 与 `/new` 现和 `/stop` 一样暂停保活。二者都把会话重置为空壳 —— 缓存里没有任何真实上下文可保温,继续 ping 只是白烧预算(此前 `/new` 建会话不暂停、`/clear` 在 dispatch 里反而**解除**了暂停)。`/new` 在 `newSession` attach 后落停,`/clear` 在 dispatch 里改为暂停而非解除;停顿持久化,下一个真实 turn(WeCom inbound,或 pane 过 grace 后转 busy)自动恢复。
+
+## [1.2.8] - 2026-08-05
+
+### Fixed
+- `inbound`: `#tag` 后夹一个不可见格式字符(输入法/复制常带的 `U+2060` word-joiner、零宽空格等)时,tag 右边界断言 `(?=\s|$)` 落空 —— 整个 `TAG_RE` 不匹配,`parseTag` 返回空 tag,消息被误路由到**默认会话**而非目标 `#tag` 会话。右边界字符类补入零宽(`U+200B–200D`)、word joiner(`U+2060`)、BOM(`U+FEFF`),与空白同等视作合法分隔。
+
 ## [1.2.7] - 2026-08-01
 
 ### Fixed

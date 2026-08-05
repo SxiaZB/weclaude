@@ -31,7 +31,9 @@ const chatPrincipal = (msg: BaseMessage): string =>
 // "#L45-foo/bar" survive. Only the FIRST tag in a message is honored — that
 // tag is stripped from the forwarded text; any additional #foo tokens flow
 // through verbatim (may be actual references in the user's prompt).
-const TAG_RE = /(^|\s)#([\p{L}\p{N}_-]{1,32})(?=\s|$)/u;
+// 右边界除空白/行尾外,零宽与 word-joiner 等不可见格式字符也算分隔 —— 输入法/复制
+// 常在 tag 后夹一个 U+2060 之类,否则 (?=\s|$) 落空,tag 被吞、消息误落默认会话。
+const TAG_RE = /(^|\s)#([\p{L}\p{N}_-]{1,32})(?=[\s\u200B-\u200D\u2060\uFEFF]|$)/u;
 const parseTag = (text: string): { tag: string; cleaned: string } => {
   const m = TAG_RE.exec(text);
   if (!m) return { tag: "", cleaned: text };

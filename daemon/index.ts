@@ -683,6 +683,10 @@ const main = async (): Promise<void> => {
     scheduler.stop();
     // 同 POST /shutdown: 先把挂着的审批长轮询了结成「稍后续接」, 再关连接。
     log.info(drainForReload(), "pending drained for reload");
+    // Hard-exit watchdog: http.close() blocks until every in-flight connection
+    // (long-poll approvals, keep-alive) drains, which can hang forever. SIGTERM
+    // (launchctl bootout / systemctl stop) must never wedge on that — force exit.
+    setTimeout(() => process.exit(0), 1500).unref();
     await new Promise((r) => setTimeout(r, 200));
     await Promise.allSettled([ws.shutdown(), http.close()]);
     process.exit(0);
