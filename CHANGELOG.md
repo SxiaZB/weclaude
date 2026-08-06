@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.2.12] - 2026-08-06
+
+### Fixed
+- `mirror`: inline peer spawn(`#tag` 首条消息自动建会话)和 graph runner spawn 不再下发 "📂 当前项目" 提示消息到 WeCom — `newSession` 新增 `silent` 选项,隐式路径传 `silent: true` 跳过 `pushProjectInfo`;显式 `/new` 仍正常推送。
+
 ## [1.2.11] - 2026-08-06
 
 ### Added
@@ -132,7 +137,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.11...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.12...HEAD
+[1.2.12]: https://github.com/guxi11/wezard/compare/v1.2.11...v1.2.12
 [1.2.11]: https://github.com/guxi11/wezard/compare/v1.2.10...v1.2.11
 [1.2.10]: https://github.com/guxi11/wezard/compare/v1.2.9...v1.2.10
 [1.2.9]: https://github.com/guxi11/wezard/compare/v1.2.8...v1.2.9

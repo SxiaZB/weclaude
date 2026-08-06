@@ -1490,7 +1490,7 @@ export interface MirrorBridge {
   /** Detach + respawn a target's pane in `cfg.wrc.cwd` or its pendingCwd
    *  override. Used by /new to give the user a fresh claude in the bound
    *  project. Returns the new attachment result. */
-  newSession: (target: string, windowName?: string, cli?: CliBackendName, opts?: { model?: string; cwd?: string }) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
+  newSession: (target: string, windowName?: string, cli?: CliBackendName, opts?: { model?: string; cwd?: string; silent?: boolean }) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
   /** Sibling sessions of `target`'s chat (default + every `#tag`), each with
    *  liveness / busy / last-activity so an agent can see who else is working. */
   peers: (target: string) => Promise<PeerInfo[]>;
@@ -3424,7 +3424,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         if (baseRec?.pendingCwd) deps.store.set(base, { ...baseRec, pendingCwd: undefined });
       }
     }
-    pushProjectInfo(target);
+    if (!opts?.silent) pushProjectInfo(target);
     return { ok: true, sessionId: r.sessionId, cwd: r.cwd };
   };
 

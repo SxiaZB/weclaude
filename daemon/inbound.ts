@@ -461,10 +461,10 @@ export const installInboundRouter = (
   // the user-facing one-line ack. When `who` carries a `#tag` suffix, use
   // the raw tag as the tmux window name so the pane shows readably in the
   // status bar (e.g. `#docs` → window `docs`, not the principal slug).
-  const spawnSession = async (who: string, cli?: CliBackendName): Promise<string> => {
+  const spawnSession = async (who: string, cli?: CliBackendName, silent?: boolean): Promise<string> => {
     if (!("newSession" in bridge)) return "[wezard] /new only available in mirror mode";
     const tag = tagOf(who);
-    const r = await bridge.newSession(who, tag || who, cli);
+    const r = await bridge.newSession(who, tag || who, cli, { silent });
     if (!r.ok) return `[wezard] /new failed: ${r.reason ?? "unknown"}`;
     return `✅ 新会话已建立 \`${r.sessionId}\``;
   };
@@ -489,7 +489,7 @@ export const installInboundRouter = (
   // 复用,不再 respawn —— 否则先到的消息会被注入进一个刚被杀掉的 pane。
   const ensureSession = (who: string): Promise<string> =>
     serializeSpawn(who, async () =>
-      "hasMirrorTarget" in bridge && bridge.hasMirrorTarget(who) ? "✅ 复用已建立的会话" : await spawnSession(who));
+      "hasMirrorTarget" in bridge && bridge.hasMirrorTarget(who) ? "✅ 复用已建立的会话" : await spawnSession(who, undefined, true));
 
   // Prefix user-visible daemon replies with `<emoji> #tag` when the routed
   // session is tagged, so a chat hosting multiple concurrent tagged sessions
