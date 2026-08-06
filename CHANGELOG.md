@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+## [1.2.10] - 2026-08-06
+
+### Changed
+- `mirror`: 保活默认轮次 8 → 6(桥接窗口 ~34min → ~26min)。
+- `mirror`: 保活连击瘦身 —— 一轮连击里只有第一发 ping 带完整指令文案,后续轮次只注入 bare `ping`(指令已在上下文里,cache-write delta 更小、pane 更干净)。`keepaliveStamps` 同步识别 bare `ping`,否则连击轮会被误判为真实活动、重置轮次并自我续命。
+
+### Fixed
+- `mirror`: TUI 里手打 `/clear` 后保活仍继续 —— `migrateAttachment`(所有会话轮换的唯一漏斗)此前不碰保活态,旧时钟接着 ping 空上下文;且其 `store.set` 整记录替换会把 dispatch 刚落盘的 `/clear` 暂停从盘上抹掉(reload 后复活)。现迁移目标判定为真清空时像 `/stop` 一样置 `keepaliveOff` 并清时钟,暂停态随迁移记录一并落盘。
+
 ## [1.2.9] - 2026-08-05
 
 ### Fixed
