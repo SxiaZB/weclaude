@@ -125,12 +125,13 @@ export const lastContextTokens = (jsonlPath: string): number => {
     const rawIn = u.input_tokens ?? 0;
     const cr = u.cache_read_input_tokens ?? 0;
     const cw = u.cache_creation_input_tokens ?? 0;
-    // CodeBuddy's gateway totalizes input_tokens (= cr+cw+fresh); Anthropic-native
-    // keeps the three disjoint. Detect by the model's version style ("4.7-opus"
-    // vs "opus-4-7") — same reconciliation the mirror does for usage accounting.
-    const model = row?.message?.model;
-    const gatewayTotalized = typeof model === "string" && /\d\.\d/.test(model);
-    return gatewayTotalized && rawIn >= cr + cw ? rawIn : rawIn + cr + cw;
+    // A totalized gateway reports input_tokens = cr+cw+fresh; Anthropic-native
+    // keeps the three disjoint (input_tokens = fresh only). The data signal —
+    // input_tokens alone covering both cache tiers — identifies the totalized
+    // shape without betting on a model-name dialect (deepseek-v4-flash is a
+    // totalized gateway but has no digit-dot in its name). Same reconciliation
+    // the mirror + usage accounting use.
+    return rawIn >= cr + cw ? rawIn : rawIn + cr + cw;
   }
   return 0;
 };

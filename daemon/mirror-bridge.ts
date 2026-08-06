@@ -712,13 +712,12 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
       const rawIn = u.input_tokens ?? 0;
       const cr = u.cache_read_input_tokens ?? 0;
       const cw = u.cache_creation_input_tokens ?? 0;
-      // CodeBuddy (claude-internal) 网关把 input_tokens 报成 cr+cw+fresh 的总和,
+      // 网关把 input_tokens 报成 cr+cw+fresh 的总和 (claude-4.7-opus, deepseek-v4-flash),
       // 而 Anthropic 官方 input_tokens 只含 fresh (与 cache_creation/cache_read disjoint)。
-      // 按模型命名风格判定源头: CodeBuddy 是 "claude-4.7-opus" (点号版本),
-      // Anthropic 官方是 "claude-opus-4-7" (纯连字符)。只对 CodeBuddy 风格反推,
-      // 普通 Anthropic-native 会话保持原样, 不影响其 usage 计算。
-      const isGatewayTotalized = typeof model === "string" && /\d\.\d/.test(model);
-      const input = isGatewayTotalized && rawIn >= cr + cw ? rawIn - cr - cw : rawIn;
+      // 判据用数据本身: input_tokens 是否已覆盖两个 cache 档 —— 覆盖即网关口径, 反推 fresh;
+      // 否则按原生口径 (input 即 fresh) 原样保留。不按模型名风格猜, deepseek 无点号版本。
+      const isTotalized = rawIn >= cr + cw;
+      const input = isTotalized ? rawIn - cr - cw : rawIn;
       out.push({
         kind: "turn_usage",
         model,
@@ -3596,11 +3595,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
     const tokens = lastContextTokens(a.jsonlPath);
     const size = tokens > 0 ? `~${fmtTokens(tokens)} tokens` : "未知";
-    // Denominator tracks the ACTUAL ping cadence (idleTriggerMs = ttlSec - marginSec),
-    // not the nominal ttlSec — pings fire marginSec early, so ttlSec would undercount
-    // and let `n` exceed `N` (a 9/8). floor keeps the last shown round the last one that fires.
-    const cadenceSec = Math.max(30, kc.ttlSec - kc.marginSec);
-    const totalRounds = Math.max(1, Math.floor(kc.maxIdleSec / cadenceSec));
+    const totalRounds = Math.max(1, kc.rounds);
     const round = a.keepalive ? (a.keepalive.round += 1) : 1;
     log.info({ target: a.target, tokens, round, totalRounds }, "keepalive: ping injected");
     // Open a chat-detail turn for the real heartbeat exchange: userQuery is the
@@ -3621,7 +3616,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     try {
       const idleTriggerMs = Math.max(30, kc.ttlSec - kc.marginSec) * 1000;
       const ttlMs = kc.ttlSec * 1000;
-      const maxIdleMs = Math.max(kc.ttlSec, kc.maxIdleSec) * 1000;
       const pingSig = normAssistant(kc.ping).slice(0, 40);
       const now = Date.now();
       for (const a of byTarget.values()) {
@@ -3669,10 +3663,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         }
         if (a.keepaliveOff) continue;                          // paused by /stop until real activity returns
         const idleSinceTouch = k.lastMs ? now - k.lastMs : now - mtime;   // last model turn = cache touch
-        const realIdle = k.lastRealMs ? now - k.lastRealMs : Infinity;    // no real turn in window ⇒ dead
         if (idleSinceTouch < idleTriggerMs) continue;          // cache still comfortably warm
         if (idleSinceTouch >= ttlMs) continue;                 // cache already cold — a ping would cold-rewrite for nothing
-        if (realIdle >= maxIdleMs) continue;                   // real work too old — stop, let it die (你的「超5分钟不保活」)
+        if (k.round >= kc.rounds) continue;                    // budget spent — let it go cold
         k.pinging = true;
         k.pingMtime = k.lastMs;                                // settles when a newer turn (the ping's own) appears
         await fireKeepalive(a);

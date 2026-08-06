@@ -29,18 +29,19 @@ export const addInto = (a: ModelTotals, b: ModelTotals): void => {
 export const sumTotal = (t: ModelTotals): number => t.input + t.output + t.cacheCreate + t.cacheRead;
 
 // Pull the four token counts off a raw `message.usage` blob, applying the
-// CodeBuddy gateway totalized-input adjustment when the model id looks dotted
-// (see readUsageEntries below for the full rationale). Returns null if the row
-// carries no meaningful token counts.
+// totalized-input adjustment when `input_tokens` already covers both cache
+// tiers (gateway dialect: claude-4.7-opus, deepseek-v4-flash). Returns null
+// if the row carries no meaningful token counts.
 export const extractTokens = (usage: Record<string, unknown>, model: string): ModelTotals | null => {
   const rawIn = Number(usage.input_tokens ?? 0);
   const output = Number(usage.output_tokens ?? 0);
   const cacheCreate = Number(usage.cache_creation_input_tokens ?? 0);
   const cacheRead = Number(usage.cache_read_input_tokens ?? 0);
-  const isGatewayTotalized = /\d\.\d/.test(model);
-  const input = isGatewayTotalized && rawIn >= cacheRead + cacheCreate
-    ? rawIn - cacheRead - cacheCreate
-    : rawIn;
+  // Same data-based reconciliation as peers.lastContextTokens: input_tokens
+  // >= cache_read+cache_creation ⇔ the gateway totalized it, so back-derive
+  // fresh input; otherwise input_tokens is already the fresh portion.
+  const isTotalized = rawIn >= cacheRead + cacheCreate;
+  const input = isTotalized ? rawIn - cacheRead - cacheCreate : rawIn;
   if (input + output + cacheCreate + cacheRead === 0) return null;
   return { input, output, cacheCreate, cacheRead };
 };
@@ -182,9 +183,9 @@ const readUsageEntries = (path: string, sinceMs: number): UsageEntry[] => {
       const model = String(msg.model ?? "");
       if (!model || model === "<synthetic>") continue;
       const u = (msg.usage ?? {}) as Record<string, unknown>;
-      // CodeBuddy (claude-internal) 网关把 input_tokens 报成 cr+cw+fresh 的合计,
+      // 网关把 input_tokens 报成 cr+cw+fresh 的合计 (claude-4.7-opus, deepseek-v4-flash),
       // 与 Anthropic 官方口径 (input_tokens 仅含 fresh, 与 cache_* 互不相交) 冲突。
-      // extractTokens 按模型名点号版本判定, 只对 CodeBuddy 反推, 不影响原生会话。
+      // extractTokens 按数据判据 (input_tokens 是否覆盖两个 cache 档) 反推, 不依赖模型名。
       const tokens = extractTokens(u, model);
       if (!tokens) continue;
       // Dedup: `--resume` copies the parent transcript into the new session's
