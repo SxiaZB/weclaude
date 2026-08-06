@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [1.2.11] - 2026-08-06
+
+### Added
+- `mirror`: `muteUntilInject` — 新 spawn 的 session 在首次 inject 成功前静默初始输出(greeting/system),避免 `#tag` 自动建会话时把 CLI 开场白推到 WeCom。
+- `mirror`: `earlyTimer` (3s) — inject 后若 CLI 在 3s 内无任何产出,先把 loading 气泡收成 chat detail 链接;首条 item 到达即清除,不影响正常流。
+
+### Fixed
+- `mirror`: `muteUntilInject` 在 inject 失败路径未清除(return 在赋值前),导致会话永久静默。
+- `mirror`: `earlyTimer` 对排队中的 turn 错引 `a.briefBubble`(仍指向前一个活跃 bubble),改为闭包捕获的 bubble ref。
+
 ## [1.2.10] - 2026-08-06
 
 ### Changed
@@ -122,7 +132,11 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.7...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.11...HEAD
+[1.2.11]: https://github.com/guxi11/wezard/compare/v1.2.10...v1.2.11
+[1.2.10]: https://github.com/guxi11/wezard/compare/v1.2.9...v1.2.10
+[1.2.9]: https://github.com/guxi11/wezard/compare/v1.2.8...v1.2.9
+[1.2.8]: https://github.com/guxi11/wezard/compare/v1.2.7...v1.2.8
 [1.2.7]: https://github.com/guxi11/wezard/compare/v1.2.6...v1.2.7
 [1.2.6]: https://github.com/guxi11/wezard/compare/v1.2.5...v1.2.6
 [1.2.5]: https://github.com/guxi11/wezard/compare/v1.2.4...v1.2.5

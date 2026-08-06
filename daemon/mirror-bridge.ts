@@ -1517,6 +1517,8 @@ interface BriefBubble {
   frame: WsFrameHeaders;
   streamId: string;
   hardTimer: NodeJS.Timeout;
+  /** 3s 早收口: inject 后若无 CLI 产出, 先把气泡收成详情链接。首条 item 到达即清。 */
+  earlyTimer?: NodeJS.Timeout;
   done: boolean;
 }
 
@@ -1576,6 +1578,9 @@ interface AttachState {
    *  必须用冷启动时序,否则 paste 校验会在 TUI 抓到 pty 之前超时并重贴一次,
    *  两次 paste 最终都落进输入框 = 提示词重复。一次性,由第一次 dispatch 消费。 */
   justSpawned?: boolean;
+  /** 新 spawn 的 pane 在首次 inject 落地前会产出初始输出 (greeting / system),
+   *  设为 true 时 onItem 全部吞掉, inject 成功后清除。 */
+  muteUntilInject?: boolean;
   /** 待记账的上下文断点 (`/clear` 注入 / `/new` 铸盘 / 观测到 /clear 轮换)。由下一次
    *  recordTurnStart 消费一次 —— 断点属于"断点之后的第一轮", 那才是读不到上文的一轮。 */
   ctxCut?: CtxCut;
@@ -1753,6 +1758,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // for >60s mid-turn and we don't want to drop the bubble while it's chewing.
   const FLUSH_MS = 250;
   const HARD_TIMEOUT_MS = 350_000;
+  /** 首条 CLI 产出到达前的早期超时: 3s 无响应则先收气泡为详情链接。 */
+  const EARLY_LINK_MS = 3_000;
   /** 软收口静默期。后端只能说"这条消息写完了"(codebuddy) 时, 等这么久没有新 item
    *  才认定一轮结束。取值只需盖住"叙述消息落盘 → 紧随其后的 function_call 落盘"
    *  这一段, 与模型思考/工具执行时长无关。 */
@@ -2118,6 +2125,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (!b || b.done) return;
     b.done = true;
     clearTimeout(b.hardTimer);
+    if (b.earlyTimer) { clearTimeout(b.earlyTimer); b.earlyTimer = undefined; }
     if (a.briefBubble === b) a.briefBubble = undefined;
     try {
       await client.replyStream(b.frame, b.streamId, withSessionTag(a.target, content || " "), true);
@@ -2166,6 +2174,13 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       }
       void finishBubble(a, bubble, briefDetailLink(turnId, a.target));
     }, HARD_TIMEOUT_MS);
+    // earlyTimer: 3s 无 CLI 产出 → 先把 loading 气泡收成详情链接, 用户可即时点入。
+    // 首条 item 到达时清除 (handleBriefItem 路径)。用显式 bubble ref 而非 a.briefBubble,
+    // 因为排队中的 turn 还没成为活跃 turn, a.briefBubble 指向的是前一个。
+    bubble.earlyTimer = setTimeout(() => {
+      if (bubble.done) return;
+      void finishBubble(a, bubble, briefDetailLink(turnId, a.target));
+    }, EARLY_LINK_MS);
     if (a.briefTurnId) {
       (a.briefQueue ??= []).push(q);
       log.info({ sessionId: a.sessionId, turnId, queued: a.briefQueue.length }, "brief: turn queued (previous still running)");
@@ -2251,6 +2266,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const handleBriefItem = (a: AttachState, item: RenderItem): void => {
     const turnId = a.briefTurnId;
     if (!turnId) return;
+    // 首条 item 到达 → 清除 earlyTimer (CLI 已有响应, 不需要超时收链接了)。
+    if (a.briefBubble?.earlyTimer) { clearTimeout(a.briefBubble.earlyTimer); a.briefBubble.earlyTimer = undefined; }
     const now = Date.now();
     if (item.kind === "tool_use") {
       a.briefHadTool = true; // 有工具 → 气泡收口写详情链接, 结论另发 standalone
@@ -2370,6 +2387,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   };
 
   const onItem = (a: AttachState, item: RenderItem): void => {
+    // 新 spawn 的 pane 在首次 inject 落地前吞掉所有初始输出 (greeting/system)。
+    if (a.muteUntilInject) return;
     // Keepalive ping turns are cache-warmers: swallow every item from the WeCom
     // paths so the ping/pong never reaches chat. But record the REAL exchange
     // into its chat-detail turn — the actual assistant reply (expected: just
@@ -3373,6 +3392,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const spawned = byTarget.get(target);
     if (spawned) {
       spawned.justSpawned = true;
+      spawned.muteUntilInject = true;
       // 只有换过 pane 才是断点 —— 首次 /wrc 建会话时 prev 为空, 那不是"不连续", 是开局。
       if (prev) spawned.ctxCut = "new";
       // A freshly spawned session is empty — nothing in the cache to keep warm.
@@ -4122,6 +4142,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           sessionId: sid, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane, freshSpawn,
         });
         if (!r.ok) {
+          a.muteUntilInject = false;
           if (s) {
             s.acc = s.acc ? `${s.acc}\n\n[mirror] ✗ ${r.reason ?? "failed"}` : `[mirror] ✗ ${r.reason ?? "failed"}`;
             await finalizeStream(a, s);
@@ -4139,6 +4160,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           }
           return;
         }
+        // inject 成功 → 解除初始输出静默, 后续 onItem 正常流转。
+        a.muteUntilInject = false;
         // Inject "succeeded" but the input box never cleared — the target
         // session may be busy / not consuming input (long task, full context).
         // Hint the user once so a silently-dropped message isn't mistaken for a
