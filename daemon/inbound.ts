@@ -644,7 +644,7 @@ export const installInboundRouter = (
         await replyText(frame, msg, who, "[wezard] /stop only available in mirror mode");
       } else {
         const r = await bridge.interruptPane(who);
-        await replyText(frame, msg, who, r.ok ? "✅ Esc sent · 保活已暂停（下次对话自动恢复）" : `[wezard] /stop failed: ${r.reason ?? "unknown"}`);
+        await replyText(frame, msg, who, r.ok ? "Esc sent, keepalive paused (auto-resumes next turn)" : `[wezard] /stop failed: ${r.reason ?? "unknown"}`);
       }
       return { stop: true };
     }
@@ -656,7 +656,7 @@ export const installInboundRouter = (
         await replyText(frame, msg, who, "[wezard] /n only available in mirror mode");
       } else {
         const r = await bridge.submitPane(who);
-        await replyText(frame, msg, who, r.ok ? "✅ Enter sent" : `[wezard] /n failed: ${r.reason ?? "unknown"}`);
+        await replyText(frame, msg, who, r.ok ? "Enter sent" : `[wezard] /n failed: ${r.reason ?? "unknown"}`);
       }
       return { stop: true };
     }
