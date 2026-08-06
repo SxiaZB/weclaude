@@ -2117,7 +2117,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // 是凭据 (不可枚举), 只是页面从"一个 turn"扩成"这个 chat 的全部会话"。
   // target 作为 ww_uniq 传下去, 让同 chat 的所有 turn 详情都复用一个 WeCom 窗口。
   const briefDetailLink = (turnId: string, target: string): string =>
-    `✴️ [View chat details](${buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target))})`;
+    `🧙 [View chat details](${buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target))})`;
 
   // 收口一条 loading 气泡: finish=true 写入最终内容, 只生效一次。发送失败退回 standalone。
   // 排队中的 turn 也持有气泡, 所以气泡是显式入参而不是从 a 上取。

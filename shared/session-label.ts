@@ -69,5 +69,5 @@ export const tagBadge = (target: string | undefined): string => {
 export const withTagHeader = (target: string | undefined, content: string, seq?: string): string => {
   const tag = tagOfKey(target);
   const head = [tag ? `${labelFor(tag)} \`#${tag}\`` : "", seq ? `\`${seq}\`` : ""].filter(Boolean).join(" ");
-  return head ? `${head}\n\n${content}` : content;
+  return head ? `${head} ${content}` : content;
 };
