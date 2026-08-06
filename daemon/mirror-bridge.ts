@@ -3006,7 +3006,16 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // 迁移是所有会话轮换的唯一漏斗 (注入的 /clear、TUI 里手打的 /clear、resume fork、
     // worktree drift)。只有目标 jsonl 首条用户行是 /clear 的那种才是真清空 —— fork /
     // drift 上下文是延续的, 让 store 去推它那条中性的 "switch"。
-    if (jsonlIsPostClearChild(newJsonlPath)) a.ctxCut = "clear";
+    if (jsonlIsPostClearChild(newJsonlPath)) {
+      a.ctxCut = "clear";
+      // 真清空 = 缓存里已无任何值得保温的内容。像 /stop 一样暂停保活 —— 与
+      // dispatch 里 WeCom 注入 /clear 的暂停对齐;TUI 手打 /clear 只走这个漏斗,
+      // 不在这里停下的话旧时钟会继续 ping 一个空上下文。busy-resume(过 grace)
+      // 或真实 inbound 解除。下方 store.set 一并落盘。
+      a.keepaliveOff = true;
+      a.keepaliveOffAt = Date.now();
+      a.keepalive = undefined;
+    }
     a.tail.stop();
     bySessionId.delete(oldSessionId);
     a.sessionId = newSessionId;
@@ -3038,6 +3047,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       tmuxPane: a.tmuxPane || undefined,
       cwd: a.runningCwd || undefined,
       pendingCwd: a.pendingCwd || undefined,
+      // store.set 是整记录替换 —— 必须带上暂停态,否则迁移会把 dispatch 刚落盘
+      // 的 /clear 暂停(或之前的 /stop 暂停)从盘上抹掉,reload 后保活复活。
+      keepaliveOff: a.keepaliveOff || undefined,
+      keepaliveOffAt: a.keepaliveOffAt || undefined,
     });
     log.info({ target: a.target, oldSessionId, newSessionId, oldJsonlPath, newJsonlPath, startOffset }, "mirror migrated session");
   };
@@ -3573,17 +3586,23 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
 
   const fireKeepalive = async (a: AttachState): Promise<void> => {
     const kc = cfg.wrc.mirror.keepalive;
+    // Only the streak's FIRST ping carries the full instruction; consecutive
+    // pings shrink to a bare "ping" — the instruction is already in context,
+    // and the smaller delta means a smaller cache-write and less pane clutter.
+    // keepaliveStamps matches both forms, so the bare one never reads as real
+    // activity. (round is incremented below, after the inject lands.)
+    const text = (a.keepalive?.round ?? 0) > 0 ? "ping" : kc.ping;
     // Suppress the pane→WeCom echo of the ping user line, then swallow the whole
     // ping turn (reply included). The 60s fail-safe clears the quiet window if
     // the turn somehow never emits turn_end, so a later real turn is never muted;
     // it also closes the detail turn so it can't hang open in the chat timeline.
-    rememberInject(kc.ping);
+    rememberInject(text);
     a.keepaliveQuiet = setTimeout(() => {
       a.keepaliveQuiet = undefined;
       if (a.keepaliveTurnId) { recordTurnClose(a.keepaliveTurnId); a.keepaliveTurnId = undefined; }
     }, 60_000);
     const r = await inject({
-      text: kc.ping, images: [], cfg,
+      text, images: [], cfg,
       log: log.child({ target: a.target, sessionId: a.sessionId, sub: "keepalive" }),
       sessionId: a.sessionId, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane,
     });
@@ -3604,7 +3623,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // closed on the ping's turn_end (or the fail-safe). Kept out of chat.
     const turnId = newTurnId();
     a.keepaliveTurnId = turnId;
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: kc.ping });
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: text });
     if (kc.notify) sendStandalone(a, `KeepAlive ${round}/${totalRounds} · ${size}`);
   };
 

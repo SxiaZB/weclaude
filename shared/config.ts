@@ -114,13 +114,15 @@ const Mirror = z.object({
       // Fire this many seconds BEFORE ttl expiry — the ping needs slack to land
       // and settle. Effective idle trigger = ttlSec - marginSec.
       marginSec: z.number().int().nonnegative().default(45),
-      // Stop keeping alive once the LAST REAL (non-ping) activity is older than
-      // this. The cutoff is measured from genuine work, NOT from our own pings
-      // (which would otherwise self-perpetuate forever). Default = ttlSec, i.e.
-      // keepalive only bridges the first cache-expiry after real work and then
-      // lets it go cold. Raise it (e.g. 1800) to chain pings across a longer
-      // idle wait; pings still stop the moment real-idle crosses this bound.
-      maxIdleSec: z.number().int().positive().default(300),
+      // How many pings to fire after the last REAL (non-ping) turn before
+      // letting the cache go cold. Pings fire at the cadence (ttlSec -
+      // marginSec = 255s) — i.e. always just before the cache would expire.
+      // Real activity resets the count, so 6 pings = ~26min of bridging
+      // restarts from each genuine turn. Each ping is a near-free cache-read;
+      // a single cold-rewrite of a large context costs ~1.25x of its full
+      // size, so a handful of pings beats letting it expire while the user
+      // is still around.
+      rounds: z.number().int().positive().default(6),
       // The ping text. Tiny (small cache-write delta) and self-describing so a
       // human glancing at the pane sees why it's there. The reply is swallowed —
       // never mirrored to chat, the detail store, or usage accounting.

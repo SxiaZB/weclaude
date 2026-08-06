@@ -154,7 +154,12 @@ export const keepaliveStamps = (
 ): { lastMs: number; lastRealMs: number; stamped: boolean } => {
   const turns = tailTurns(jsonlPath, 24);
   const norm = (s: string): string => s.replace(/\s+/gu, "");
-  const isPing = (t: Turn): boolean => t.role === "user" && pingSig.length > 0 && norm(t.text).includes(pingSig);
+  // Streak pings after the first are a bare "ping" (the full instruction is
+  // already in context) — match that exact form too, or a streak turn would
+  // read as REAL activity and re-anchor lastRealMs / reset the round counter.
+  const isPing = (t: Turn): boolean =>
+    t.role === "user" &&
+    ((pingSig.length > 0 && norm(t.text).includes(pingSig)) || norm(t.text).toLowerCase() === "ping");
   const isPong = (t: Turn): boolean => t.role === "assistant" && norm(t.text).replace(/[^a-zA-Z]/g, "").toLowerCase() === "pong";
   let lastMs = 0;
   let lastRealMs = 0;
