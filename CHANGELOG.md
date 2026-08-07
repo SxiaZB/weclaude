@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [1.2.14] - 2026-08-07
+
+### Changed
+- `mirror`: 所有 emoji+tag 前缀和 detail link 文本去掉反引号包裹 —— WeCom markdown 里 backtick 渲染为代码样式,与可点击链接视觉冲突。
+- `mirror`: 默认会话（无 tag）所有推送现统一带 🧙 前缀,不再裸发。
+- `mirror`: KeepAlive 通知也带 chat detail 链接(使用 `keepaliveTurnId`)。
+
+### Fixed
+- `peers`: `keepaliveStamps` 对 ping 后紧跟的 assistant pong 未识别为 keepalive 回复,导致 pong 误算为 real activity 重置 round。
+
 ## [1.2.13] - 2026-08-07
 
 ### Added
@@ -146,7 +156,9 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.12...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.14...HEAD
+[1.2.14]: https://github.com/guxi11/wezard/compare/v1.2.13...v1.2.14
+[1.2.13]: https://github.com/guxi11/wezard/compare/v1.2.12...v1.2.13
 [1.2.12]: https://github.com/guxi11/wezard/compare/v1.2.11...v1.2.12
 [1.2.11]: https://github.com/guxi11/wezard/compare/v1.2.10...v1.2.11
 [1.2.10]: https://github.com/guxi11/wezard/compare/v1.2.9...v1.2.10
