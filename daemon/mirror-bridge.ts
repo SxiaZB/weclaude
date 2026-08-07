@@ -1645,7 +1645,7 @@ interface AttachState {
    *  gate. `pinging`/`pingMtime` guard the inject→settle window (pingMtime holds
    *  `lastMs` at fire; the ping settles once a newer turn — its own — appears).
    *  `round` counts pings since the last real turn — surfaced as `n/N`. */
-  keepalive?: { lastMs: number; lastRealMs: number; seenMtime: number; pinging: boolean; pingMtime: number; round: number };
+  keepalive?: { lastMs: number; lastRealMs: number; seenMtime: number; pinging: boolean; pingMtime: number; round: number; settledAt: number };
   /** Keepalive paused by `/stop`. Stays off until a real turn resumes it — a
    *  WeCom inbound (dispatch) or the pane going busy on a genuine turn — so an
    *  explicitly-stopped session isn't poked until the human comes back. */
@@ -1899,6 +1899,28 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       .catch(() => undefined);
   };
 
+  // Like sendStandalone but skips withSessionTag — content already contains the tag header (e.g. as a link).
+  const sendRaw = (a: AttachState, content: string): void => {
+    const chatId = stripPrincipalPrefix(a.target);
+    a.standalonePending = a.standalonePending
+      .then(async () => {
+        try {
+          await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content } });
+        } catch (e) {
+          log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "raw push failed");
+        }
+        if (a.broadcastTo) {
+          const bcId = stripPrincipalPrefix(a.broadcastTo);
+          try {
+            await client.sendMessage(bcId, { msgtype: "markdown", markdown: { content } });
+          } catch (e) {
+            log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "broadcast raw push failed");
+          }
+        }
+      })
+      .catch(() => undefined);
+  };
+
   // Pre-card preamble recovery. Called right before an approval card when the
   // gating tool_use is NOT yet in the jsonl (mirror mode: CC defers the whole
   // tool-terminated turn's flush until the tool resolves — after the card is
@@ -2137,8 +2159,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const url = buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target));
     const tag = tagOfKey(target);
     return tag
-      ? `[${labelFor(tag)} \`#${tag}\`](${url}) ← View chat details`
-      : `[← View chat details](${url})`;
+      ? `[\`${labelFor(tag)} #${tag}\`](${url}) ← View chat details`
+      : `[🧙](${url}) ← View chat details`;
   };
 
   // 收口一条 loading 气泡: finish=true 写入最终内容, 只生效一次。发送失败退回 standalone。
@@ -2172,7 +2194,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
   };
 
-  const finishBriefBubble = (a: AttachState, content: string): Promise<void> => finishBubble(a, a.briefBubble, content);
+  const finishBriefBubble = (a: AttachState, content: string, raw = false): Promise<void> => finishBubble(a, a.briefBubble, content, raw);
 
   // 让一个已建好记录的 turn 成为活跃 turn。turn 级状态在这里统一归零 —— 唯一入口。
   const openBriefTurn = (a: AttachState, q: QueuedTurn): void => {
@@ -2209,14 +2231,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         log.warn({ sessionId: a.sessionId, turnId }, "brief: queued turn timed out — force-closing the stuck one");
         closeBriefTurn(a);
       }
-      void finishBubble(a, bubble, briefDetailLink(turnId, a.target));
+      void finishBubble(a, bubble, briefDetailLink(turnId, a.target), true);
     }, HARD_TIMEOUT_MS);
     // earlyTimer: 3s 无 CLI 产出 → 先把 loading 气泡收成详情链接, 用户可即时点入。
     // 首条 item 到达时清除 (handleBriefItem 路径)。用显式 bubble ref 而非 a.briefBubble,
     // 因为排队中的 turn 还没成为活跃 turn, a.briefBubble 指向的是前一个。
     bubble.earlyTimer = setTimeout(() => {
       if (bubble.done) return;
-      void finishBubble(a, bubble, briefDetailLink(turnId, a.target));
+      void finishBubble(a, bubble, briefDetailLink(turnId, a.target), true);
     }, EARLY_LINK_MS);
     if (a.briefTurnId) {
       (a.briefQueue ??= []).push(q);
@@ -2247,7 +2269,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     a.briefHadTool = false;
     a.briefConcluded = false;
     a.briefLastText = undefined;
-    enqueueStandalone(a, briefDetailLink(turnId, a.target));
+    sendRaw(a, briefDetailLink(turnId, a.target));
     log.info({ sessionId: a.sessionId, turnId }, "brief: turn started (CLI-side, no bubble)");
   };
 
@@ -2258,7 +2280,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const earlyLinkBubble = (a: AttachState): void => {
     if (!a.briefTurnId || !a.briefBubble || a.briefBubble.done) return;
     a.briefHadTool = true;
-    void finishBriefBubble(a, briefDetailLink(a.briefTurnId, a.target));
+    void finishBriefBubble(a, briefDetailLink(a.briefTurnId, a.target), true);
   };
 
   // 本轮结论落地, 只生效一次:
@@ -2284,7 +2306,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // 气泡还开着 (有工具的 turn: 结论只发了 standalone, 气泡留到这里收链接; 或空 turn
     // 没有结论) —— 收口: 统一写详情链接, 保证每个 turn 都有可点入口。
     if (a.briefBubble && !a.briefBubble.done) {
-      void finishBriefBubble(a, briefDetailLink(a.briefTurnId, a.target));
+      void finishBriefBubble(a, briefDetailLink(a.briefTurnId, a.target), true);
     }
     recordTurnClose(a.briefTurnId);
     log.info({ sessionId: a.sessionId, turnId: a.briefTurnId }, "brief: turn closed");
@@ -3655,7 +3677,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     let lastMs = 0;
     let lastRealMs = 0;
     try { const s = keepaliveStamps(jsonlPath, pingSig); lastMs = s.lastMs; lastRealMs = s.lastRealMs; } catch { /* unreadable tail */ }
-    return { lastMs, lastRealMs, seenMtime: mtime, pinging: false, pingMtime: 0, round: 0 };
+    return { lastMs, lastRealMs, seenMtime: mtime, pinging: false, pingMtime: 0, round: 0, settledAt: 0 };
   };
 
   const fireKeepalive = async (a: AttachState): Promise<void> => {
@@ -3742,6 +3764,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           // (the ping's own user line) appears and the pane goes idle, keep waiting.
           if (busy || k.lastMs <= k.pingMtime) continue;
           k.pinging = false;
+          k.settledAt = now;
           continue;
         }
         // A new real message turn (or a busy pane) re-anchors: reset the round
@@ -3749,8 +3772,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // message-based now, so `/stop`'s Esc settling writes (metadata, no new
         // turn) can no longer self-resume the pause — only a busy pane past grace,
         // or a WeCom inbound in dispatch, does.
-        if (busy || grewSinceLast) {
-          k.round = 0; // real work resets the round counter — pings start from 1/N again
+        // Suppress the grewSinceLast reset for 30s after pinging settles — the
+        // pong's tail flush can lag a tick and would otherwise fake real activity.
+        const justSettled = k.settledAt > 0 && now - k.settledAt < 30_000;
+        if (busy || (grewSinceLast && !justSettled)) {
+          k.round = 0; k.settledAt = 0;
           if (a.keepaliveOff && busy && now - (a.keepaliveOffAt ?? 0) > RESUME_GRACE_MS) { a.keepaliveOff = false; persistPause(a); }
           if (busy) continue;
         }
