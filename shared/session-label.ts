@@ -59,7 +59,7 @@ export const keyOf = (base: string, tag: string): string => (tag ? `${base}#${ta
 /** Trailing-space emoji badge for card titles; "" for untagged targets. */
 export const tagBadge = (target: string | undefined): string => {
   const tag = tagOfKey(target);
-  return tag ? `${labelFor(tag)} ` : "";
+  return tag ? `${labelFor(tag)} ` : "🧙 ";
 };
 
 /** Prefix markdown content with the `emoji \`#tag\`` header; identity when untagged.

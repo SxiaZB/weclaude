@@ -209,7 +209,7 @@ const renderSessionsList = (sessions: SessionInfo[], currentSid: string): string
     const here = s.sessionId === currentSid ? " ⬅️ 当前" : "";
     const dir = s.cwd.replace(/^.*\//, "") || s.cwd || "?";
     const cli = mixed ? ` _(${s.cli})_` : "";
-    return `${s.label || "▫️"} \`${s.sessionId.slice(0, 8)}\` ${dir}${cli}${here}`;
+    return `${s.label || "🧙"} \`${s.sessionId.slice(0, 8)}\` ${dir}${cli}${here}`;
   });
   return [
     "[wezard] 正在运行的会话：",
@@ -726,7 +726,7 @@ export const installInboundRouter = (
       }
       const hit = matchSession(sessions, sc.arg);
       if (!hit) {
-        const avail = sessions.map((s) => `${s.label || "▫️"} ${s.sessionId.slice(0, 8)}`).join("、") || "无";
+        const avail = sessions.map((s) => `${s.label || "🧙"} ${s.sessionId.slice(0, 8)}`).join("、") || "无";
         await replyText(frame, msg, who, `[wezard] 未找到会话 \`${sc.arg}\`。可用：${avail}`);
         return { stop: true };
       }

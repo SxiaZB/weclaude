@@ -148,7 +148,7 @@ const summarizeTag = (target: string, turns: readonly TurnDetailRecord[], now: n
   return {
     target,
     tag,
-    label: labelFor(tag || target),
+    label: tag ? labelFor(tag) : "🧙",
     sessionId: last?.sessionId,
     model: [...turns].reverse().find((r) => r.model)?.model,
     turns: turns.length,

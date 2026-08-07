@@ -3637,7 +3637,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         return {
           target: t,
           tag,
-          label: tag ? labelFor(tag) : "▫️",
+          label: tag ? labelFor(tag) : "🧙",
           sessionId: a?.sessionId || rec?.sessionId || "",
           jsonlPath,
           cwd: a?.runningCwd || rec?.cwd || expandedDefaultCwd,
