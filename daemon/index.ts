@@ -590,7 +590,10 @@ const main = async (): Promise<void> => {
         ensureNode: async (target, node) => {
           const existing = (await m.peers(target)).find((p) => p.target === target);
           if (existing?.paneAlive) return { ok: true };
-          const r = await m.newSession(target, node.tag, node.cli, { model: node.model, cwd: node.cwd, silent: true, broadcastTo: spec.base });
+          // No broadcast plumbing needed: a `base#tag` target strips down to the
+          // same WeCom chatid as `base`, so the node's own pushes already land
+          // in this chat — mirroring them again was pure duplication.
+          const r = await m.newSession(target, node.tag, node.cli, { model: node.model, cwd: node.cwd, silent: true });
           return { ok: r.ok, reason: r.reason };
         },
         send: (target, text) => m.injectText(target, text),

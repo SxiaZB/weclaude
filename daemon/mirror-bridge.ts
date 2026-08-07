@@ -1413,9 +1413,6 @@ export interface AttachArgs {
   cwd?: string;
   /** User-requested next cwd (carry-over on re-attach). */
   pendingCwd?: string;
-  /** When set, every mirror push to `target` is also broadcast to this chat key.
-   *  Used by graph runner so tagged peer output appears in the base chat. */
-  broadcastTo?: string;
 }
 
 export interface AttachResult {
@@ -1493,7 +1490,7 @@ export interface MirrorBridge {
   /** Detach + respawn a target's pane in `cfg.wrc.cwd` or its pendingCwd
    *  override. Used by /new to give the user a fresh claude in the bound
    *  project. Returns the new attachment result. */
-  newSession: (target: string, windowName?: string, cli?: CliBackendName, opts?: { model?: string; cwd?: string; silent?: boolean; broadcastTo?: string }) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
+  newSession: (target: string, windowName?: string, cli?: CliBackendName, opts?: { model?: string; cwd?: string; silent?: boolean }) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
   /** Sibling sessions of `target`'s chat (default + every `#tag`), each with
    *  liveness / busy / last-activity so an agent can see who else is working. */
   peers: (target: string) => Promise<PeerInfo[]>;
@@ -1596,9 +1593,6 @@ interface AttachState {
    *  / STREAMING (a.liveStream is the source of truth in that phase).
    *  Set on dispatch when outboundDeferMs > 0; cleared on promote/exit. */
   outbound?: OutboundState;
-  /** When set, every mirror push to `target` is also broadcast to this chat key.
-   *  Used by graph runner so tagged peer output appears in the base chat. */
-  broadcastTo?: string;
   /** Recent tool_use signatures observed via onItem — `${name}|${stableJSON(input)}`.
    *  flushBeforeCard polls drain() until the to-be-approved tool's sig appears
    *  here, closing the race where the hook fires before Claude Code has
@@ -1900,17 +1894,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
             log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "standalone push failed");
           }
         }
-        // Broadcast to base chat when this is a tagged peer session.
-        if (a.broadcastTo) {
-          const bcId = stripPrincipalPrefix(a.broadcastTo);
-          for (const c of chunks) {
-            try {
-              await client.sendMessage(bcId, { msgtype: "markdown", markdown: { content: c } });
-            } catch (e) {
-              log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "broadcast standalone push failed");
-            }
-          }
-        }
       })
       .catch(() => undefined);
   };
@@ -1924,14 +1907,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content } });
         } catch (e) {
           log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "raw push failed");
-        }
-        if (a.broadcastTo) {
-          const bcId = stripPrincipalPrefix(a.broadcastTo);
-          try {
-            await client.sendMessage(bcId, { msgtype: "markdown", markdown: { content } });
-          } catch (e) {
-            log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "broadcast raw push failed");
-          }
         }
       })
       .catch(() => undefined);
@@ -2193,20 +2168,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     } catch (e) {
       log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "brief: bubble finish failed; standalone fallback");
       if (content.trim()) raw ? sendRaw(a, content) : sendStandalone(a, content);
-    }
-    // Broadcast to base chat when this is a tagged peer session.
-    if (a.broadcastTo && content.trim()) {
-      const bcId = stripPrincipalPrefix(a.broadcastTo);
-      const pieces = splitChunks(content, Math.max(200, cfg.wrc.mirror.chunkChars - TAG_HEADER_BUDGET));
-      const chunks = raw ? pieces : pieces.map((p, i) =>
-        withLinkedTag(a, p, pieces.length > 1 ? `${i + 1}/${pieces.length}` : undefined));
-      for (const c of chunks) {
-        try {
-          await client.sendMessage(bcId, { msgtype: "markdown", markdown: { content: c } });
-        } catch (e) {
-          log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "broadcast bubble finish failed");
-        }
-      }
     }
   };
 
@@ -2733,7 +2694,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       ? buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id, principal ? stripPrincipalPrefix(principal) : undefined)
       : "";
 
-  const attach = ({ sessionId, jsonlPath, target: targetOverride, tmuxPane, tmuxSession, cwd, pendingCwd, broadcastTo }: AttachArgs): AttachResult => {
+  const attach = ({ sessionId, jsonlPath, target: targetOverride, tmuxPane, tmuxSession, cwd, pendingCwd }: AttachArgs): AttachResult => {
     const target = resolveTarget(targetOverride);
     if (!target) return { ok: false, reason: "no target chat (set wrc.mirror.pushChat or defaultChat, or pass target)" };
     // Note: jsonlPath may not exist yet on the auto-spawn path — claude only
@@ -2772,7 +2733,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       pendingCwd: carryPending,
       tail: { stop: () => undefined, drain: () => undefined }, // placeholder; replaced below
       standalonePending: Promise.resolve(),
-      broadcastTo,
       recentToolSigs: new Map(),
     };
     a.tail = startMirrorTail({
@@ -3420,7 +3380,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     target: string,
     windowName?: string,
     cli?: CliBackendName,
-    opts?: { model?: string; cwd?: string; silent?: boolean; broadcastTo?: string },
+    opts?: { model?: string; cwd?: string; silent?: boolean },
   ): Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string; info?: string }> => {
     const prev = byTarget.get(target);
     // Resolution precedence (all chat-scoped except the running-cwd fallback):
@@ -3476,7 +3436,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       cwd: r.cwd,
       // Explicit "" clears any carried-over pending — it has just been applied.
       pendingCwd: "",
-      broadcastTo: opts?.broadcastTo,
     });
     if (!att.ok) return { ok: false, reason: att.reason };
     // 首条注入吃冷时序(injectText 走 /mirror/spawn 时已经硬编码 freshSpawn:true,
@@ -3983,10 +3942,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       }
       // freshSpawn: true — the pane was just minted by /mirror/spawn, the TUI
       // is still warming up so the verifier in injectViaTmux needs the slack.
-      return await inject({
+      const r = await inject({
         text, images: [], cfg, log: log.child({ principal: target, sessionId: sid, sub: "init-demo" }),
         sessionId: sid, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane, freshSpawn: true,
       });
+      // 与 dispatch 同一约定: 首条 inject 落地 = 解除新 pane 的初始输出静默。
+      // 漏掉这一步的后果不只是少几条气泡 —— onItem 在 mute 分支整体早退, 连
+      // recordTurnStart 都不会跑, 于是 graph/send_peer 拉起来的节点在 chat 列表
+      // 和 chat 详情里彻底不存在(它从来没被 WeCom 侧 dispatch 过, 没有第二次机会)。
+      if (r.ok) {
+        a.muteUntilInject = false;
+        a.justSpawned = false;
+      }
+      return r;
     },
     interruptPane: async (target) => {
       const a = byTarget.get(target);
