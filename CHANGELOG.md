@@ -4,7 +4,16 @@
 
 ## [Unreleased]
 
-## [1.2.12] - 2026-08-06
+## [1.2.13] - 2026-08-07
+
+### Added
+- `mirror`: 所有 standalone 消息和 finalized bubble 的 emoji+tag 前缀现在是可点击的 chat detail 链接(有活跃 turn 时);无 tag 的默认会话使用 🧙 作为链接图标。
+
+### Fixed
+- `inbound`: `/stop` 成功时不再回复消息,仅失败时通知。
+- `mirror`: KeepAlive 通知只在第 1、3、6 轮发送(不再每轮都推)。
+- `mirror`: KeepAlive 轮次计数修复 —— ping/pong 结算后的 mtime 抖动不再误触 `grewSinceLast` 重置 round(添加 30s `settledAt` 宽限窗口)。
+- `mirror`: chat detail 链接格式统一:emoji+tag 包在反引号内作为链接文本,🧙 作为无 tag 会话的默认图标,"← View chat details" 变为普通文本提示。
 
 ### Fixed
 - `mirror`: inline peer spawn(`#tag` 首条消息自动建会话)和 graph runner spawn 不再下发 "📂 当前项目" 提示消息到 WeCom — `newSession` 新增 `silent` 选项,隐式路径传 `silent: true` 跳过 `pushProjectInfo`;显式 `/new` 仍正常推送。
