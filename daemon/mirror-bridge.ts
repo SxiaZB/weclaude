@@ -1829,9 +1829,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       try {
         if (card) {
           s.cardSent = true;
-          await client.replyStreamWithCard(s.frame, s.streamId, withSessionTag(a.target, s.acc || " "), true, { templateCard: card });
+          await client.replyStreamWithCard(s.frame, s.streamId, withLinkedTag(a, s.acc || " ", undefined, s.turnId), true, { templateCard: card });
         } else {
-          await client.replyStream(s.frame, s.streamId, withSessionTag(a.target, s.acc || " "), true);
+          await client.replyStream(s.frame, s.streamId, withLinkedTag(a, s.acc || " ", undefined, s.turnId), true);
         }
         log.info({ sessionId: a.sessionId, turnId: s.turnId, accLen: s.acc.length, tools: s.tools.length, withCard: !!card }, "stream finalize");
       } catch (e) {
@@ -1868,13 +1868,29 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
 
   // Standalone fallback (no live stream / stream dead). Per-attachment FIFO so
   // pushes from a single mirror stay ordered; different mirrors run in parallel.
+  // Linked tag prefix: emoji+tag becomes a chat-detail link. Falls back to
+  // plain withSessionTag when no turnId is available (no active turn to link).
+  const linkedTagPrefix = (target: string, turnId: string | undefined): string => {
+    if (!turnId) return "";
+    const url = buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target));
+    const tag = tagOfKey(target);
+    return tag ? `[\`${labelFor(tag)} #${tag}\`](${url})` : `[🧙](${url})`;
+  };
+
+  const withLinkedTag = (a: AttachState, content: string, seq?: string, turnId?: string): string => {
+    const prefix = linkedTagPrefix(a.target, turnId ?? a.briefTurnId);
+    if (prefix) {
+      const seqBit = seq ? ` \`${seq}\`` : "";
+      return `${prefix}${seqBit} ${content}`;
+    }
+    return withSessionTag(a.target, content, seq);
+  };
+
   const sendStandalone = (a: AttachState, content: string): void => {
     const chatId = stripPrincipalPrefix(a.target);
-    // Tag AFTER splitting — one header per bubble, so chunk 2..N stay
-    // attributable to the session instead of arriving anonymous.
     const pieces = splitChunks(content, Math.max(200, cfg.wrc.mirror.chunkChars - TAG_HEADER_BUDGET));
     const chunks = pieces.map((p, i) =>
-      withSessionTag(a.target, p, pieces.length > 1 ? `${i + 1}/${pieces.length}` : undefined));
+      withLinkedTag(a, p, pieces.length > 1 ? `${i + 1}/${pieces.length}` : undefined));
     a.standalonePending = a.standalonePending
       .then(async () => {
         for (const c of chunks) {
@@ -2054,7 +2070,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     flushPendingStandalone(a);
     void (async () => {
       try {
-        await client.replyStream(out.frame, out.streamId, withSessionTag(a.target, bubbleMd || " "), true);
+        await client.replyStream(out.frame, out.streamId, withLinkedTag(a, bubbleMd || " "), true);
       } catch (e) {
         log.warn(
           { sessionId: a.sessionId, err: (e as Error).message },
@@ -2173,7 +2189,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (b.earlyTimer) { clearTimeout(b.earlyTimer); b.earlyTimer = undefined; }
     if (a.briefBubble === b) a.briefBubble = undefined;
     try {
-      await client.replyStream(b.frame, b.streamId, raw ? (content || " ") : withSessionTag(a.target, content || " "), true);
+      await client.replyStream(b.frame, b.streamId, raw ? (content || " ") : withLinkedTag(a, content || " "), true);
     } catch (e) {
       log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "brief: bubble finish failed; standalone fallback");
       if (content.trim()) raw ? sendRaw(a, content) : sendStandalone(a, content);
@@ -2183,7 +2199,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const bcId = stripPrincipalPrefix(a.broadcastTo);
       const pieces = splitChunks(content, Math.max(200, cfg.wrc.mirror.chunkChars - TAG_HEADER_BUDGET));
       const chunks = raw ? pieces : pieces.map((p, i) =>
-        withSessionTag(a.target, p, pieces.length > 1 ? `${i + 1}/${pieces.length}` : undefined));
+        withLinkedTag(a, p, pieces.length > 1 ? `${i + 1}/${pieces.length}` : undefined));
       for (const c of chunks) {
         try {
           await client.sendMessage(bcId, { msgtype: "markdown", markdown: { content: c } });
