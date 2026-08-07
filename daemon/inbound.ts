@@ -640,11 +640,9 @@ export const installInboundRouter = (
     // Authorized `/stop` — Esc the live pane to interrupt whatever Claude is
     // currently doing. Mirror-mode only; bails cleanly when no attachment.
     if (isStopCommand(text)) {
-      if (!("interruptPane" in bridge)) {
-        await replyText(frame, msg, who, "[wezard] /stop only available in mirror mode");
-      } else {
+      if ("interruptPane" in bridge) {
         const r = await bridge.interruptPane(who);
-        await replyText(frame, msg, who, r.ok ? "Esc sent, keepalive paused (auto-resumes next turn)" : `[wezard] /stop failed: ${r.reason ?? "unknown"}`);
+        if (!r.ok) await replyText(frame, msg, who, `[wezard] /stop failed: ${r.reason ?? "unknown"}`);
       }
       return { stop: true };
     }
