@@ -1874,16 +1874,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     if (!turnId) return "";
     const url = buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target));
     const tag = tagOfKey(target);
-    return tag ? `[\`${labelFor(tag)} #${tag}\`](${url})` : `[🧙](${url})`;
+    return tag ? `[${labelFor(tag)} #${tag}](${url})` : `[🧙](${url})`;
   };
 
   const withLinkedTag = (a: AttachState, content: string, seq?: string, turnId?: string): string => {
     const prefix = linkedTagPrefix(a.target, turnId ?? a.briefTurnId);
     if (prefix) {
-      const seqBit = seq ? ` \`${seq}\`` : "";
+      const seqBit = seq ? ` ${seq}` : "";
       return `${prefix}${seqBit} ${content}`;
     }
-    return withSessionTag(a.target, content, seq);
+    const tag = tagOfKey(a.target);
+    const seqBit = seq ? ` ${seq}` : "";
+    const head = tag ? `${labelFor(tag)} #${tag}${seqBit}` : `🧙${seqBit}`;
+    return `${head} ${content}`;
   };
 
   const sendStandalone = (a: AttachState, content: string): void => {
@@ -2175,7 +2178,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const url = buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target));
     const tag = tagOfKey(target);
     return tag
-      ? `[\`${labelFor(tag)} #${tag}\`](${url}) ← View chat details`
+      ? `[${labelFor(tag)} #${tag}](${url}) ← View chat details`
       : `[🧙](${url}) ← View chat details`;
   };
 
@@ -3736,7 +3739,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const turnId = newTurnId();
     a.keepaliveTurnId = turnId;
     recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: text });
-    if (kc.notify && (round === 1 || round === 3 || round === 6)) sendStandalone(a, `KeepAlive ${round}/${totalRounds} · ${size}`);
+    if (kc.notify && (round === 1 || round === 3 || round === 6))
+      sendRaw(a, withLinkedTag(a, `KeepAlive ${round}/${totalRounds} · ${size}`, undefined, turnId));
   };
 
   let keepaliveTicking = false;

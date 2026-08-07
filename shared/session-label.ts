@@ -68,6 +68,6 @@ export const tagBadge = (target: string | undefined): string => {
  *  alone when the session is untagged. */
 export const withTagHeader = (target: string | undefined, content: string, seq?: string): string => {
   const tag = tagOfKey(target);
-  const head = [tag ? `${labelFor(tag)} \`#${tag}\`` : "", seq ? `\`${seq}\`` : ""].filter(Boolean).join(" ");
+  const head = [tag ? `${labelFor(tag)} #${tag}` : "", seq ?? ""].filter(Boolean).join(" ");
   return head ? `${head} ${content}` : content;
 };

@@ -164,11 +164,14 @@ export const keepaliveStamps = (
   let lastMs = 0;
   let lastRealMs = 0;
   let stamped = false;
-  for (const t of turns) {
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i]!;
     const ms = t.ms ?? 0;
     if (ms > 0) stamped = true;
     if (ms > lastMs) lastMs = ms;
-    if (ms > lastRealMs && !isPing(t) && !isPong(t)) lastRealMs = ms;
+    const isKeepalive = isPing(t) || isPong(t) ||
+      (t.role === "assistant" && i > 0 && isPing(turns[i - 1]!));
+    if (ms > lastRealMs && !isKeepalive) lastRealMs = ms;
   }
   return { lastMs, lastRealMs, stamped };
 };
