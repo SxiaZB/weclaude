@@ -1413,6 +1413,9 @@ export interface AttachArgs {
   cwd?: string;
   /** User-requested next cwd (carry-over on re-attach). */
   pendingCwd?: string;
+  /** When set, every mirror push to `target` is also broadcast to this chat key.
+   *  Used by graph runner so tagged peer output appears in the base chat. */
+  broadcastTo?: string;
 }
 
 export interface AttachResult {
@@ -1490,7 +1493,7 @@ export interface MirrorBridge {
   /** Detach + respawn a target's pane in `cfg.wrc.cwd` or its pendingCwd
    *  override. Used by /new to give the user a fresh claude in the bound
    *  project. Returns the new attachment result. */
-  newSession: (target: string, windowName?: string, cli?: CliBackendName, opts?: { model?: string; cwd?: string; silent?: boolean }) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
+  newSession: (target: string, windowName?: string, cli?: CliBackendName, opts?: { model?: string; cwd?: string; silent?: boolean; broadcastTo?: string }) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
   /** Sibling sessions of `target`'s chat (default + every `#tag`), each with
    *  liveness / busy / last-activity so an agent can see who else is working. */
   peers: (target: string) => Promise<PeerInfo[]>;
@@ -1593,6 +1596,9 @@ interface AttachState {
    *  / STREAMING (a.liveStream is the source of truth in that phase).
    *  Set on dispatch when outboundDeferMs > 0; cleared on promote/exit. */
   outbound?: OutboundState;
+  /** When set, every mirror push to `target` is also broadcast to this chat key.
+   *  Used by graph runner so tagged peer output appears in the base chat. */
+  broadcastTo?: string;
   /** Recent tool_use signatures observed via onItem — `${name}|${stableJSON(input)}`.
    *  flushBeforeCard polls drain() until the to-be-approved tool's sig appears
    *  here, closing the race where the hook fires before Claude Code has
@@ -1878,6 +1884,17 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
             log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "standalone push failed");
           }
         }
+        // Broadcast to base chat when this is a tagged peer session.
+        if (a.broadcastTo) {
+          const bcId = stripPrincipalPrefix(a.broadcastTo);
+          for (const c of chunks) {
+            try {
+              await client.sendMessage(bcId, { msgtype: "markdown", markdown: { content: c } });
+            } catch (e) {
+              log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "broadcast standalone push failed");
+            }
+          }
+        }
       })
       .catch(() => undefined);
   };
@@ -2116,22 +2133,42 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // 链接落到 chat 视图: 默认选中本 turn 所属的 #tag, 贴底显示整条会话。turnId 依旧
   // 是凭据 (不可枚举), 只是页面从"一个 turn"扩成"这个 chat 的全部会话"。
   // target 作为 ww_uniq 传下去, 让同 chat 的所有 turn 详情都复用一个 WeCom 窗口。
-  const briefDetailLink = (turnId: string, target: string): string =>
-    `🧙 [View chat details](${buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target))})`;
+  const briefDetailLink = (turnId: string, target: string): string => {
+    const url = buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target));
+    const tag = tagOfKey(target);
+    return tag
+      ? `[${labelFor(tag)} \`#${tag}\`](${url}) ← View chat details`
+      : `[← View chat details](${url})`;
+  };
 
   // 收口一条 loading 气泡: finish=true 写入最终内容, 只生效一次。发送失败退回 standalone。
   // 排队中的 turn 也持有气泡, 所以气泡是显式入参而不是从 a 上取。
-  const finishBubble = async (a: AttachState, b: BriefBubble | undefined, content: string): Promise<void> => {
+  // raw=true skips withSessionTag (used when content already contains the linked tag header).
+  const finishBubble = async (a: AttachState, b: BriefBubble | undefined, content: string, raw = false): Promise<void> => {
     if (!b || b.done) return;
     b.done = true;
     clearTimeout(b.hardTimer);
     if (b.earlyTimer) { clearTimeout(b.earlyTimer); b.earlyTimer = undefined; }
     if (a.briefBubble === b) a.briefBubble = undefined;
     try {
-      await client.replyStream(b.frame, b.streamId, withSessionTag(a.target, content || " "), true);
+      await client.replyStream(b.frame, b.streamId, raw ? (content || " ") : withSessionTag(a.target, content || " "), true);
     } catch (e) {
       log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "brief: bubble finish failed; standalone fallback");
-      if (content.trim()) sendStandalone(a, content);
+      if (content.trim()) raw ? sendRaw(a, content) : sendStandalone(a, content);
+    }
+    // Broadcast to base chat when this is a tagged peer session.
+    if (a.broadcastTo && content.trim()) {
+      const bcId = stripPrincipalPrefix(a.broadcastTo);
+      const pieces = splitChunks(content, Math.max(200, cfg.wrc.mirror.chunkChars - TAG_HEADER_BUDGET));
+      const chunks = raw ? pieces : pieces.map((p, i) =>
+        withSessionTag(a.target, p, pieces.length > 1 ? `${i + 1}/${pieces.length}` : undefined));
+      for (const c of chunks) {
+        try {
+          await client.sendMessage(bcId, { msgtype: "markdown", markdown: { content: c } });
+        } catch (e) {
+          log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "broadcast bubble finish failed");
+        }
+      }
     }
   };
 
@@ -2658,7 +2695,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       ? buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id, principal ? stripPrincipalPrefix(principal) : undefined)
       : "";
 
-  const attach = ({ sessionId, jsonlPath, target: targetOverride, tmuxPane, tmuxSession, cwd, pendingCwd }: AttachArgs): AttachResult => {
+  const attach = ({ sessionId, jsonlPath, target: targetOverride, tmuxPane, tmuxSession, cwd, pendingCwd, broadcastTo }: AttachArgs): AttachResult => {
     const target = resolveTarget(targetOverride);
     if (!target) return { ok: false, reason: "no target chat (set wrc.mirror.pushChat or defaultChat, or pass target)" };
     // Note: jsonlPath may not exist yet on the auto-spawn path — claude only
@@ -2668,7 +2705,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // Replace any existing attach with the same sessionId or same target. The
     // sessionId clash is the "/wrc again from same window" case; the target
     // clash is "different window steals my WeCom chat" — both end the previous.
+    // Guard: if a DIFFERENT principal already owns this sessionId, refuse rather
+    // than detaching it — prevents cross-wire when concurrent restoreFromStore
+    // calls race or heal logic picks the same newest jsonl.
     const prevBySid = bySessionId.get(sessionId);
+    if (prevBySid && prevBySid.target !== target) {
+      log.warn({ sessionId, existingTarget: prevBySid.target, incomingTarget: target }, "mirror attach: sessionId already bound to another principal, refusing");
+      return { ok: false, reason: `sessionId ${sessionId} already bound to ${prevBySid.target}` };
+    }
     if (prevBySid) detach(prevBySid, "sessionId reattach");
     const prevByTarget = byTarget.get(target);
     // Carry over pending request only when caller didn't explicitly say
@@ -2690,6 +2734,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       pendingCwd: carryPending,
       tail: { stop: () => undefined, drain: () => undefined }, // placeholder; replaced below
       standalonePending: Promise.resolve(),
+      broadcastTo,
       recentToolSigs: new Map(),
     };
     a.tail = startMirrorTail({
@@ -3020,6 +3065,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // migration omits it (→ tail from EOF) because the fork file is seeded with
   // the FULL prior transcript and replaying from 0 would re-dump it to WeCom.
   const migrateAttachment = (a: AttachState, newSessionId: string, newJsonlPath: string, startOffset?: number): void => {
+    // Guard: if newSessionId is already bound to a DIFFERENT principal, abort —
+    // prevents silent cross-wire (path B: /clear rotation or drift landing on
+    // a sibling's live session).
+    const incumbent = bySessionId.get(newSessionId);
+    if (incumbent && incumbent.target !== a.target) {
+      log.warn({ target: a.target, newSessionId, incumbentTarget: incumbent.target }, "migrateAttachment: target sid owned by another principal, aborting migration");
+      return;
+    }
     const oldSessionId = a.sessionId;
     const oldJsonlPath = a.jsonlPath;
     // 迁移是所有会话轮换的唯一漏斗 (注入的 /clear、TUI 里手打的 /clear、resume fork、
@@ -3329,7 +3382,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     target: string,
     windowName?: string,
     cli?: CliBackendName,
-    opts?: { model?: string; cwd?: string; silent?: boolean },
+    opts?: { model?: string; cwd?: string; silent?: boolean; broadcastTo?: string },
   ): Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string; info?: string }> => {
     const prev = byTarget.get(target);
     // Resolution precedence (all chat-scoped except the running-cwd fallback):
@@ -3385,6 +3438,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       cwd: r.cwd,
       // Explicit "" clears any carried-over pending — it has just been applied.
       pendingCwd: "",
+      broadcastTo: opts?.broadcastTo,
     });
     if (!att.ok) return { ok: false, reason: att.reason };
     // 首条注入吃冷时序(injectText 走 /mirror/spawn 时已经硬编码 freshSpawn:true,
@@ -3644,7 +3698,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const turnId = newTurnId();
     a.keepaliveTurnId = turnId;
     recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: text });
-    if (kc.notify) sendStandalone(a, `KeepAlive ${round}/${totalRounds} · ${size}`);
+    if (kc.notify && (round === 1 || round === 3 || round === 6)) sendStandalone(a, `KeepAlive ${round}/${totalRounds} · ${size}`);
   };
 
   let keepaliveTicking = false;
