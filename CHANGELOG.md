@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.2.15] - 2026-08-07
+
+### Fixed
+- `session-label`: `withTagHeader` 对无 tag 默认会话不加前缀 —— approval vote 回执、plan 卡、error 等经 `withTagHeader` 发送的消息无 🧙 标识。现统一为所有 target 都带前缀(tagged → `emoji #tag`，untagged → `🧙`)。
+
 ## [1.2.14] - 2026-08-07
 
 ### Changed
@@ -156,7 +161,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.14...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.15...HEAD
+[1.2.15]: https://github.com/guxi11/wezard/compare/v1.2.14...v1.2.15
 [1.2.14]: https://github.com/guxi11/wezard/compare/v1.2.13...v1.2.14
 [1.2.13]: https://github.com/guxi11/wezard/compare/v1.2.12...v1.2.13
 [1.2.12]: https://github.com/guxi11/wezard/compare/v1.2.11...v1.2.12

@@ -1883,10 +1883,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const seqBit = seq ? ` ${seq}` : "";
       return `${prefix}${seqBit} ${content}`;
     }
-    const tag = tagOfKey(a.target);
-    const seqBit = seq ? ` ${seq}` : "";
-    const head = tag ? `${labelFor(tag)} #${tag}${seqBit}` : `🧙${seqBit}`;
-    return `${head} ${content}`;
+    return withSessionTag(a.target, content, seq);
   };
 
   const sendStandalone = (a: AttachState, content: string): void => {
