@@ -375,7 +375,8 @@ const composeInbound = (
   const { tag: typed, cleaned } = parseTag(rawBody);
   const q = parseQuote(msg.quote);
   const tag = typed || q?.tag || "";
-  const consumed = !q || inContext(sessionKey(chatPrincipal(msg), tag), q.body);
+  // 剥完头什么都不剩(折叠气泡这类纯 chrome 的引用)⇒ 没有可搬运的内容,只留路由。
+  const consumed = !q || !q.body.trim() || inContext(sessionKey(chatPrincipal(msg), tag), q.body);
   if (cleaned.trim()) {
     return { text: consumed ? cleaned : `${renderQuotePrefix(q.body)}${cleaned}`, tag, promoted: false };
   }

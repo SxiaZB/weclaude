@@ -61,9 +61,16 @@ export const keyOf = (base: string, tag: string): string => (tag ? `${base}#${ta
 // 头部 emoji 取自固定表 —— 用户消息以这些 emoji 开头且后接 `#tag` 的概率可忽略。
 // 分片序号 (`2/5`) 也属于头,一并吃掉 —— 留在 body 里会污染"引用内容是否已在
 // 目标 context 里"的比对。
+// 头有两种形态,都要认:裸 `🦊 #fix …`,以及 mirror 的 chat-detail 链接形态
+// `[🦊 #fix](https://…) …`(无 tag 时是 `[🧙](url)`)。链接里的 URL 若留在 body
+// 里,既污染比对又会被当成用户内容贴进 prompt。
+// 分片序号 (`2/5`) 与折叠气泡的 `← View chat details` 提示同理,一并算作头。
 const HEAD_EMOJI = [...ANIMALS, "🧙", "❔"];
+const EMO = `(?:${HEAD_EMOJI.join("|")})`;
+const TAG_PART = `(?:\\s+#([\\p{L}\\p{N}_-]{1,32}))?`;
 const HEADER_RE = new RegExp(
-  `^(?:${HEAD_EMOJI.join("|")})(?:\\s+#([\\p{L}\\p{N}_-]{1,32}))?(?:\\s+\\d+/\\d+)?(?![\\p{L}\\p{N}_-])\\s*`,
+  `^(?:\\[${EMO}${TAG_PART}\\]\\([^)]*\\)|${EMO}${TAG_PART})` +
+    `(?:\\s+\\d+/\\d+)?(?:\\s*←\\s*View chat details)?(?![\\p{L}\\p{N}_-])\\s*`,
   "u",
 );
 
@@ -73,7 +80,7 @@ export const parseTagHeader = (text: string): { fromBot: boolean; tag: string; b
   const t = text.trim();
   const m = HEADER_RE.exec(t);
   return m
-    ? { fromBot: true, tag: m[1] ?? "", body: t.slice(m[0].length) }
+    ? { fromBot: true, tag: m[1] ?? m[2] ?? "", body: t.slice(m[0].length) }
     : { fromBot: false, tag: "", body: t };
 };
 
