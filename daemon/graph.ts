@@ -18,6 +18,7 @@
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 import type { CliBackendName } from "../shared/cli-backends.js";
+import type { TurnOrigin } from "../shared/detail-store.js";
 
 export interface GraphNodeSpec {
   /** Session tag, without `#`. */
@@ -75,7 +76,9 @@ export interface GraphRun {
 export interface GraphDeps {
   /** Create the tagged session if it isn't already live; no-op otherwise. */
   ensureNode: (target: string, node: GraphNodeSpec) => Promise<{ ok: boolean; reason?: string }>;
-  send: (target: string, text: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** `origin` is attribution, not routing: it rides along so the turn this
+   *  inject opens can say in chat details who sent it and on which round. */
+  send: (target: string, text: string, origin: TurnOrigin) => Promise<{ ok: boolean; reason?: string }>;
   isBusy: (target: string) => Promise<boolean>;
   lastText: (target: string) => Promise<string>;
   /** Push a progress bubble to the chat so the human sees the loop advance. */
@@ -161,6 +164,20 @@ export const stopRun = (runId: string): boolean => {
 const renderStep = (s: StepRecord, total: number): string =>
   `轮 ${s.round}/${total} · \`#${s.tag}\` ${s.status === "done" ? "✅" : s.status === "timeout" ? "⏱" : "❌"}`;
 
+const clip = (s: string, max: number): string => {
+  const t = s.replace(/\s+/g, " ").trim();
+  return t.length > max ? `${t.slice(0, max)}…` : t;
+};
+
+/** A step bubble carries the traffic, not just the tick: `▸` what the graph
+ *  asked, `◂` what the node answered — same glyphs peek_peer renders a peer
+ *  conversation with. Otherwise the whole exchange happens in panes nobody is
+ *  watching and the chat only ever sees "2/6 ✅". */
+const renderTraffic = (s: StepRecord, total: number, runId: string): string =>
+  [`🕸 \`${runId}\` ${renderStep(s, total)}`, `▸ ${clip(s.prompt, 500)}`, s.reply ? `◂ ${clip(s.reply, 900)}` : ""]
+    .filter(Boolean)
+    .join("\n");
+
 /** Validate a spec before spending a spawn on it. Returns "" when valid. */
 export const validateSpec = (spec: GraphSpec): string => {
   if (!spec.base.trim()) return "base (chat) 未解析";
@@ -205,11 +222,18 @@ export const startGraph = (spec: GraphSpec, deps: GraphDeps): GraphRun => {
     const ctx: Record<string, string> = { last: "" };
     for (let round = 1; round <= rounds; round++) {
       ctx.round = String(round);
-      for (const step of spec.steps) {
+      for (const [i, step] of spec.steps.entries()) {
         if (aborted()) { finish("stopped"); return; }
         const node = spec.nodes.find((n) => n.tag === step.to)!;
         const target = targetOf(spec.base, step.to);
         const prompt = interpolate(step.prompt, ctx);
+        // fromTag = 上一个**走过**的步骤 (跨轮时是上一轮的末步), 也就是 `{{last}}`
+        // 的来源。取自 history 而不是 spec.steps[i-1] —— 早退/超时后两者会分叉。
+        const prev = run.history[run.history.length - 1];
+        const origin: TurnOrigin = {
+          runId, round, rounds, step: i + 1, steps: spec.steps.length,
+          ...(prev ? { fromTag: prev.tag } : {}),
+        };
         const rec: StepRecord = { round, tag: step.to, prompt, reply: "", status: "running", startedAt: Date.now() };
         run.history.push(rec);
         deps.notify(spec.base, `🕸 \`${runId}\` 轮 ${round}/${rounds} → \`#${step.to}\` 开始`);
@@ -222,7 +246,7 @@ export const startGraph = (spec: GraphSpec, deps: GraphDeps): GraphRun => {
           finish("error", `节点 #${step.to} 就绪失败: ${ready.reason ?? "unknown"}`);
           return;
         }
-        const sent = await deps.send(target, prompt);
+        const sent = await deps.send(target, prompt, origin);
         if (!sent.ok) {
           rec.status = "error";
           rec.reason = sent.reason;
@@ -242,11 +266,11 @@ export const startGraph = (spec: GraphSpec, deps: GraphDeps): GraphRun => {
           // A timeout is not fatal: the agent may simply be slow, and the reply
           // captured so far is still worth handing to the next node. Report and
           // keep walking — stalling the whole graph on one slow step is worse.
-          deps.notify(spec.base, `🕸 \`${runId}\` ${renderStep(rec, rounds)} (超时, 继续)`);
+          deps.notify(spec.base, `${renderTraffic(rec, rounds, runId)}\n(超时, 继续)`);
           continue;
         }
         rec.status = "done";
-        deps.notify(spec.base, `🕸 \`${runId}\` ${renderStep(rec, rounds)}`);
+        deps.notify(spec.base, renderTraffic(rec, rounds, runId));
         if (converged(rec.reply, spec.until)) { finish("converged"); return; }
       }
     }

@@ -32,11 +32,11 @@ import type { MirrorStore } from "./mirror-store.js";
 import { hasMirrorAskq, runMirrorAskqFlow, hasMirrorPlan, mootMirrorPlan, runMirrorPlanFlow } from "./approval.js";
 import { spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl, buildChatUrl } from "./detail.js";
-import type { CtxCut, TurnUsage } from "./detail.js";
+import type { CtxCut, TurnOrigin, TurnUsage } from "./detail.js";
 import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
 import { splitMarkdown } from "../shared/md-chunk.js";
 import { randomTip } from "./tips.js";
-import { stripAnsi, compactPane, paneIsBusy, paneIsStalled, transcriptStalled, summarizeTail, lastAssistantText, lastContextTokens, keepaliveStamps, type PeerInfo } from "./peers.js";
+import { stripAnsi, compactPane, paneIsBusy, paneIsStalled, transcriptStalled, summarizeTail, lastAssistantText, lastContextTokens, keepaliveStamps, tailTurns, renderDialog, type PeerInfo } from "./peers.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -1467,7 +1467,7 @@ export interface MirrorBridge {
    *  the user sees the full PreToolUse → approval card → assistant mirror
    *  loop end-to-end. Skips the live-stream/replyStream machinery — the tail
    *  pushes assistant output via the standalone path. */
-  injectText: (target: string, text: string) => Promise<{ ok: boolean; reason?: string }>;
+  injectText: (target: string, text: string, origin?: TurnOrigin) => Promise<{ ok: boolean; reason?: string }>;
   /** Send Esc to the live tmux pane bound to `target` — interrupts whatever
    *  Claude is currently doing (active generation / open prompt). No-op for
    *  spawn-mode attachments (no live TTY to interrupt). */
@@ -1497,6 +1497,10 @@ export interface MirrorBridge {
   /** Live tmux pane tail of `target` — what that agent's terminal shows right
    *  now, including in-flight tool calls the transcript hasn't recorded yet. */
   peekPane: (target: string, rows?: number) => Promise<{ ok: boolean; reason?: string; pane?: string; busy?: boolean }>;
+  /** Last `n` turns of `target`'s conversation, read from its transcript. The
+   *  default way to observe a peer; `peekPane` is the fallback for a session
+   *  whose jsonl isn't bound/written yet. */
+  peekTurns: (target: string, n?: number) => Promise<{ ok: boolean; reason?: string; dialog?: string; busy?: boolean }>;
   /** Mid-turn check for one target. False for cold/dead panes (nothing running). */
   isBusy: (target: string) => Promise<boolean>;
   /** Latest assistant message of `target` — the handoff payload between agents. */
@@ -1584,6 +1588,10 @@ interface AttachState {
   /** 待记账的上下文断点 (`/clear` 注入 / `/new` 铸盘 / 观测到 /clear 轮换)。由下一次
    *  recordTurnStart 消费一次 —— 断点属于"断点之后的第一轮", 那才是读不到上文的一轮。 */
   ctxCut?: CtxCut;
+  /** 待记账的 graph 归因, 与 ctxCut 同一套路: injectText 盖章, 下一次 recordTurnStart
+   *  消费一次。带时间戳是因为注入未必真的开出一轮 (pane 死了 / 文本被吞), 陈旧的
+   *  印章若一直留着, 会把很久以后某条真人消息误标成 graph 派的。 */
+  pendingOrigin?: { origin: TurnOrigin; at: number };
   /** Set when `/clear` was injected: the next user prompt will land in a fresh
    *  jsonl with a new sessionId. A watcher polls the project dir to migrate
    *  this attachment onto the new file. Cleared once migration completes or
@@ -2207,9 +2215,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return cut;
   };
 
+  // graph 归因同样一次性: 一次注入只解释它开出的那一轮。超过 ORIGIN_TTL_MS 还没被
+  // 认领 = 那次注入没能开出 turn, 印章作废 —— 宁可少标一轮, 也不能把人打的字冒认成
+  // graph 派的 (归因错了比没有更糟)。
+  const ORIGIN_TTL_MS = 5 * 60_000;
+  const consumeOrigin = (a: AttachState): TurnOrigin | undefined => {
+    const p = a.pendingOrigin;
+    a.pendingOrigin = undefined;
+    return p && Date.now() - p.at <= ORIGIN_TTL_MS ? p.origin : undefined;
+  };
+
   const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string, isSlash = false, userQuery = ""): Promise<void> => {
     const turnId = newTurnId();
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: userQuery.trim() || undefined, cut: consumeCut(a) });
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: userQuery.trim() || undefined, cut: consumeCut(a), origin: consumeOrigin(a) });
     // hardTimer 兜底: turn 若无终句 / turn_end 收口 (卡死/漏收), 到点仍收气泡。
     const bubble: BriefBubble = { frame, streamId, hardTimer: undefined as unknown as NodeJS.Timeout, done: false };
     const q: QueuedTurn = { turnId, bubble, isSlash };
@@ -2252,7 +2270,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const turnId = newTurnId();
     const query = a.pendingBriefQuery?.replace(/^> ?/gm, "").trim();
     a.pendingBriefQuery = undefined;
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: query || undefined, cut: consumeCut(a) });
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: query || undefined, cut: consumeCut(a), origin: consumeOrigin(a) });
     a.briefTurnId = turnId;
     a.briefBubble = undefined;
     a.briefIsSlash = false;
@@ -3724,6 +3742,20 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return { ok: true, pane: compactPane(raw, rows), busy: paneIsBusy(raw) };
   };
 
+  // Reading a peer's conversation is a transcript job, not a terminal job: the
+  // jsonl holds whole role-tagged messages, while a pane capture is ANSI-laden
+  // and clipped at the viewport edge. Only `busy` still comes from the pane.
+  const peekTurns = async (
+    target: string,
+    n = 6,
+  ): Promise<{ ok: boolean; reason?: string; dialog?: string; busy?: boolean }> => {
+    const jsonl = jsonlOf(target);
+    const busy = await isBusy(target);
+    if (!jsonl || !existsSync(jsonl)) return { ok: false, reason: "no transcript bound for target", busy };
+    const dialog = renderDialog(tailTurns(jsonl, n));
+    return dialog ? { ok: true, dialog, busy } : { ok: false, reason: "transcript has no turns yet", busy };
+  };
+
   // ── Prompt-cache keepalive ──────────────────────────────────────────
   // Anthropic's prompt cache expires ~5min after the last request. A pane that
   // goes idle (agent parked on a peer, background task running) lets the whole
@@ -3883,6 +3915,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     attach,
     peers,
     peekPane,
+    peekTurns,
     isBusy,
     lastText,
     status: () => {
@@ -4019,7 +4052,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // 队列内单条失败已在 sendStandalone 里 warn 过, 这里吞掉, 不阻塞发卡。
       }
     },
-    injectText: async (target, text) => {
+    injectText: async (target, text, origin) => {
       // Lazy restore, same as dispatch: a peer session that hasn't been talked
       // to in this process lifetime (or any session after a reload) has an empty
       // in-memory slot but a perfectly good persisted binding. Without this, an
@@ -4031,6 +4064,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // recentInjects dedupe (otherwise the user sees their own demo prompt
       // echoed back as a quoted bubble).
       rememberInject(text);
+      // 印章要早于 inject 落地 —— tail 是独立轮询的, 它可能在 inject 的 promise
+      // resolve 之前就看到 user 行并开出 turn, 那时归因必须已经在位。
+      if (origin) a.pendingOrigin = { origin, at: Date.now() };
       const sid = a.sessionId;
       const paneAlive = a.tmuxPane ? await tmuxPaneAlive(a.tmuxPane) : false;
       if (!paneAlive) {

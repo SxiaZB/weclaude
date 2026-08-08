@@ -46,6 +46,7 @@ export const renderChatPage = (): string =>
       <span class="h" id="tb-h"></span>
       <span class="sub" id="tb-sub"></span>
     </div>
+    <div class="gbar" id="gbar" hidden></div>
     <div class="thread" id="thread"><div class="thread-in" id="thread-in"></div></div>
     <div class="statusbar">
       <span id="sb" style="display:contents"></span>

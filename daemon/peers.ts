@@ -99,6 +99,16 @@ export const summarizeTail = (jsonlPath: string, n = 3, per = 80): string => {
   return turns.map((t) => `${t.role === "user" ? "你" : "AI"}: ${stripMd(t.text).slice(0, per)}`).join(" · ");
 };
 
+/** Readable multi-turn rendering of a transcript tail — "what has been said in
+ *  that session", for one agent reading another's conversation. Strictly better
+ *  than a pane capture for *reading*: whole messages (the viewport truncates),
+ *  no ANSI / TUI chrome, already role-tagged. The pane remains the only honest
+ *  source for `busy`. */
+export const renderDialog = (turns: readonly Turn[], per = 800): string =>
+  turns
+    .map((t) => `${t.role === "user" ? "▸" : "◂"} ${t.text.length > per ? `${t.text.slice(0, per)}…` : t.text}`)
+    .join("\n");
+
 /** The peer's most recent assistant message — the handoff payload when one
  *  agent drives another ("take #fix's conclusion and review it"). */
 export const lastAssistantText = (jsonlPath: string, max = 4000): string => {
