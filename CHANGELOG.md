@@ -6,7 +6,7 @@
 
 ### Added
 - `keepalive`: stall 恢复,**纯规则判定、不让 model 自判**。transcript 末轮是 synthetic API-error/limit 行(`API Error: Connection closed mid-response` / `You've hit your session limit`),或空闲 pane footer 出现错误横幅 —— 判定某轮因限流/接口失败中途夭折,ping 改发 `resumePing`(直接“继续未完成的工作”)。新增 config `keepalive.resumeOnStall`(默认开)/ `keepalive.resumePing`;`transcriptStalled` / `paneIsStalled` 两个规则信号。
-- `inbound`: **引用即路由** —— 直接「引用」某个 `#tag` 会话的气泡来回复,等价于手打该 tag,消息投递到那个会话;且 quote 内容**不再进 prompt**(被引用的那条本就在目标会话自己的上下文里,重复贴入纯属污染)。识别依据是出站气泡的 `emoji #tag` 头(`parseTagHeader`),用户自己发的行首 `#tag` 消息同样可被引用。若自己另打了 `#other`,则视为“把这段转给别的会话”,quote 仍按原样作为上下文渲染。text / mixed 两条入站路径一致。
+- `inbound`: **引用即路由** —— 直接「引用」某个 `#tag` 会话的气泡来回复,等价于手打该 tag,消息投递到那个会话;且 quote 内容**不再进 prompt**(被引用的那条本就在目标会话自己的上下文里,重复贴入纯属污染)。识别依据是出站气泡的 `emoji #tag` 头(`parseTagHeader`),用户自己发的行首 `#tag` 消息同样可被引用。引用之外自己打的 `#tag` 优先级更高。配套规则:引用内容若**已在目标会话 context 尾部**(先比对最近一条出站气泡,miss 再归一化匹配目标 transcript 末 12 轮)则只保留这层路由绑定、正文丢弃;不在(跨会话转发 / 引同事的消息 / 目标已 `/clear`)才照旧渲染成引用块。text / image / mixed 三条入站路径统一走 `composeInbound`,图片消息因此也能被引用路由到 `#tag` 会话。
 - `keepalive`: ping 的 assistant 回复只要不是纯 "pong" 即视为 real activity —— 从 chat 里放行(un-swallow)整轮续跑内容,并重锚 `lastRealMs` / 重置 round 预算。据此“回复是 pong 还是其他内容”刷新真实输出时钟。
 
 ### Changed

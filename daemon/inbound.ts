@@ -7,7 +7,7 @@ import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import type { Bridge } from "./cc-bridge.js";
 import type { MirrorBridge } from "./mirror-bridge.js";
-import type { PeerInfo } from "./peers.js";
+import { tailTurns, type PeerInfo } from "./peers.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
 import type { CliBackendName } from "../shared/cli-backends.js";
 import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim } from "./claim.js";
@@ -17,7 +17,11 @@ import { computeUsage, renderUsageReport } from "./usage.js";
 import { computeAuditReport } from "./audit.js";
 import { syncProjectConfig, renderSyncReport } from "./cfg-sync.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
-import { tagOfKey, withTagHeader, parseTagHeader } from "../shared/session-label.js";
+import { tagOfKey, baseOfKey, withTagHeader, parseTagHeader } from "../shared/session-label.js";
+
+/** 判定"引用内容是否已在目标会话上下文里"时回看的轮数 —— 引用的通常是最近几轮
+ *  里的某条气泡,再往前用户多半是真想把老内容重新拎出来说事。 */
+const QUOTE_TAIL_TURNS = 12;
 
 // Chat-binding key: stable id for "this conversation thread". Used as
 // session-map key, mirror target, defaultChat. NOT used for auth.
@@ -852,11 +856,10 @@ export const installInboundRouter = (
       }
     }
     if (texts.length === 0 && images.length === 0 && !msg.quote) return;
-    // Strip the routing `#tag` from the concatenated body before forwarding —
-    // it was consumed by parseTag above; leaving it in would leak into Claude.
-    const joined = texts.join("\n");
-    const bodyForClaude = tag ? parseTag(joined).cleaned : joined;
-    await send(frame, msg, who, routeTag && !tag ? bodyForClaude : withQuote(msg, bodyForClaude), images);
+    // Re-compose on the per-item stripped text: drops the routing `#tag` (it was
+    // consumed above; leaving it in would leak into Claude) and attaches the
+    // quote only when it isn't already in the target's context.
+    await send(frame, msg, who, composeInbound(msg, texts.join("\n"), quoteInContext).text, images);
   });
 
   // template_card_event is handled in approval module; no listener here.
