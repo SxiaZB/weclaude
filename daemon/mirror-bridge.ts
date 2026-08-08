@@ -713,13 +713,12 @@ const renderLine = (raw: string, deps: TailDeps): RenderItem[] => {
       const rawIn = u.input_tokens ?? 0;
       const cr = u.cache_read_input_tokens ?? 0;
       const cw = u.cache_creation_input_tokens ?? 0;
-      // CodeBuddy (claude-internal) 网关把 input_tokens 报成 cr+cw+fresh 的总和,
+      // 网关把 input_tokens 报成 cr+cw+fresh 的总和 (claude-4.7-opus, deepseek-v4-flash),
       // 而 Anthropic 官方 input_tokens 只含 fresh (与 cache_creation/cache_read disjoint)。
-      // 按模型命名风格判定源头: CodeBuddy 是 "claude-4.7-opus" (点号版本),
-      // Anthropic 官方是 "claude-opus-4-7" (纯连字符)。只对 CodeBuddy 风格反推,
-      // 普通 Anthropic-native 会话保持原样, 不影响其 usage 计算。
-      const isGatewayTotalized = typeof model === "string" && /\d\.\d/.test(model);
-      const input = isGatewayTotalized && rawIn >= cr + cw ? rawIn - cr - cw : rawIn;
+      // 判据用数据本身: input_tokens 是否已覆盖两个 cache 档 —— 覆盖即网关口径, 反推 fresh;
+      // 否则按原生口径 (input 即 fresh) 原样保留。不按模型名风格猜, deepseek 无点号版本。
+      const isTotalized = rawIn >= cr + cw;
+      const input = isTotalized ? rawIn - cr - cw : rawIn;
       out.push({
         kind: "turn_usage",
         model,
@@ -1582,7 +1581,7 @@ export interface MirrorBridge {
   /** Detach + respawn a target's pane in `cfg.wrc.cwd` or its pendingCwd
    *  override. Used by /new to give the user a fresh claude in the bound
    *  project. Returns the new attachment result. */
-  newSession: (target: string, windowName?: string, cli?: CliBackendName, opts?: { model?: string; cwd?: string }) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
+  newSession: (target: string, windowName?: string, cli?: CliBackendName, opts?: { model?: string; cwd?: string; silent?: boolean }) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
   /** Sibling sessions of `target`'s chat (default + every `#tag`), each with
    *  liveness / busy / last-activity so an agent can see who else is working. */
   peers: (target: string) => Promise<PeerInfo[]>;
@@ -1609,6 +1608,8 @@ interface BriefBubble {
   frame: WsFrameHeaders;
   streamId: string;
   hardTimer: NodeJS.Timeout;
+  /** 3s 早收口: inject 后若无 CLI 产出, 先把气泡收成详情链接。首条 item 到达即清。 */
+  earlyTimer?: NodeJS.Timeout;
   done: boolean;
 }
 
@@ -1673,6 +1674,9 @@ interface AttachState {
    *  this and bails — otherwise a recovering tmux server would suddenly paste a
    *  long-abandoned message into the pane. */
   injectGen?: number;
+  /** 新 spawn 的 pane 在首次 inject 落地前会产出初始输出 (greeting / system),
+   *  设为 true 时 onItem 全部吞掉, inject 成功后清除。 */
+  muteUntilInject?: boolean;
   /** 待记账的上下文断点 (`/clear` 注入 / `/new` 铸盘 / 观测到 /clear 轮换)。由下一次
    *  recordTurnStart 消费一次 —— 断点属于"断点之后的第一轮", 那才是读不到上文的一轮。 */
   ctxCut?: CtxCut;
@@ -1731,7 +1735,7 @@ interface AttachState {
    *  gate. `pinging`/`pingMtime` guard the inject→settle window (pingMtime holds
    *  `lastMs` at fire; the ping settles once a newer turn — its own — appears).
    *  `round` counts pings since the last real turn — surfaced as `n/N`. */
-  keepalive?: { lastMs: number; lastRealMs: number; seenMtime: number; pinging: boolean; pingMtime: number; round: number };
+  keepalive?: { lastMs: number; lastRealMs: number; seenMtime: number; pinging: boolean; pingMtime: number; round: number; settledAt: number };
   /** Keepalive paused by `/stop`. Stays off until a real turn resumes it — a
    *  WeCom inbound (dispatch) or the pane going busy on a genuine turn — so an
    *  explicitly-stopped session isn't poked until the human comes back. */
@@ -1850,6 +1854,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // for >60s mid-turn and we don't want to drop the bubble while it's chewing.
   const FLUSH_MS = 250;
   const HARD_TIMEOUT_MS = 350_000;
+  /** 首条 CLI 产出到达前的早期超时: 3s 无响应则先收气泡为详情链接。 */
+  const EARLY_LINK_MS = 3_000;
   /** 软收口静默期。后端只能说"这条消息写完了"(codebuddy) 时, 等这么久没有新 item
    *  才认定一轮结束。取值只需盖住"叙述消息落盘 → 紧随其后的 function_call 落盘"
    *  这一段, 与模型思考/工具执行时长无关。 */
@@ -1913,9 +1919,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       try {
         if (card) {
           s.cardSent = true;
-          await client.replyStreamWithCard(s.frame, s.streamId, withSessionTag(a.target, s.acc || " "), true, { templateCard: card });
+          await client.replyStreamWithCard(s.frame, s.streamId, withLinkedTag(a, s.acc || " ", undefined, s.turnId), true, { templateCard: card });
         } else {
-          await client.replyStream(s.frame, s.streamId, withSessionTag(a.target, s.acc || " "), true);
+          await client.replyStream(s.frame, s.streamId, withLinkedTag(a, s.acc || " ", undefined, s.turnId), true);
         }
         log.info({ sessionId: a.sessionId, turnId: s.turnId, accLen: s.acc.length, tools: s.tools.length, withCard: !!card }, "stream finalize");
       } catch (e) {
@@ -1952,13 +1958,29 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
 
   // Standalone fallback (no live stream / stream dead). Per-attachment FIFO so
   // pushes from a single mirror stay ordered; different mirrors run in parallel.
+  // Linked tag prefix: emoji+tag becomes a chat-detail link. Falls back to
+  // plain withSessionTag when no turnId is available (no active turn to link).
+  const linkedTagPrefix = (target: string, turnId: string | undefined): string => {
+    if (!turnId) return "";
+    const url = buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target));
+    const tag = tagOfKey(target);
+    return tag ? `[${labelFor(tag)} #${tag}](${url})` : `[🧙](${url})`;
+  };
+
+  const withLinkedTag = (a: AttachState, content: string, seq?: string, turnId?: string): string => {
+    const prefix = linkedTagPrefix(a.target, turnId ?? a.briefTurnId);
+    if (prefix) {
+      const seqBit = seq ? ` ${seq}` : "";
+      return `${prefix}${seqBit} ${content}`;
+    }
+    return withSessionTag(a.target, content, seq);
+  };
+
   const sendStandalone = (a: AttachState, content: string): void => {
     const chatId = stripPrincipalPrefix(a.target);
-    // Tag AFTER splitting — one header per bubble, so chunk 2..N stay
-    // attributable to the session instead of arriving anonymous.
     const pieces = splitChunks(content, Math.max(200, cfg.wrc.mirror.chunkChars - TAG_HEADER_BUDGET));
     const chunks = pieces.map((p, i) =>
-      withSessionTag(a.target, p, pieces.length > 1 ? `${i + 1}/${pieces.length}` : undefined));
+      withLinkedTag(a, p, pieces.length > 1 ? `${i + 1}/${pieces.length}` : undefined));
     a.standalonePending = a.standalonePending
       .then(async () => {
         for (const c of chunks) {
@@ -1967,6 +1989,20 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           } catch (e) {
             log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "standalone push failed");
           }
+        }
+      })
+      .catch(() => undefined);
+  };
+
+  // Like sendStandalone but skips withSessionTag — content already contains the tag header (e.g. as a link).
+  const sendRaw = (a: AttachState, content: string): void => {
+    const chatId = stripPrincipalPrefix(a.target);
+    a.standalonePending = a.standalonePending
+      .then(async () => {
+        try {
+          await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content } });
+        } catch (e) {
+          log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "raw push failed");
         }
       })
       .catch(() => undefined);
@@ -2105,7 +2141,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     flushPendingStandalone(a);
     void (async () => {
       try {
-        await client.replyStream(out.frame, out.streamId, withSessionTag(a.target, bubbleMd || " "), true);
+        await client.replyStream(out.frame, out.streamId, withLinkedTag(a, bubbleMd || " "), true);
       } catch (e) {
         log.warn(
           { sessionId: a.sessionId, err: (e as Error).message },
@@ -2206,25 +2242,32 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // 链接落到 chat 视图: 默认选中本 turn 所属的 #tag, 贴底显示整条会话。turnId 依旧
   // 是凭据 (不可枚举), 只是页面从"一个 turn"扩成"这个 chat 的全部会话"。
   // target 作为 ww_uniq 传下去, 让同 chat 的所有 turn 详情都复用一个 WeCom 窗口。
-  const briefDetailLink = (turnId: string, target: string): string =>
-    `✴️ [View chat details](${buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target))})`;
+  const briefDetailLink = (turnId: string, target: string): string => {
+    const url = buildChatUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, turnId, stripPrincipalPrefix(target));
+    const tag = tagOfKey(target);
+    return tag
+      ? `[${labelFor(tag)} #${tag}](${url}) ← View chat details`
+      : `[🧙](${url}) ← View chat details`;
+  };
 
   // 收口一条 loading 气泡: finish=true 写入最终内容, 只生效一次。发送失败退回 standalone。
   // 排队中的 turn 也持有气泡, 所以气泡是显式入参而不是从 a 上取。
-  const finishBubble = async (a: AttachState, b: BriefBubble | undefined, content: string): Promise<void> => {
+  // raw=true skips withSessionTag (used when content already contains the linked tag header).
+  const finishBubble = async (a: AttachState, b: BriefBubble | undefined, content: string, raw = false): Promise<void> => {
     if (!b || b.done) return;
     b.done = true;
     clearTimeout(b.hardTimer);
+    if (b.earlyTimer) { clearTimeout(b.earlyTimer); b.earlyTimer = undefined; }
     if (a.briefBubble === b) a.briefBubble = undefined;
     try {
-      await client.replyStream(b.frame, b.streamId, withSessionTag(a.target, content || " "), true);
+      await client.replyStream(b.frame, b.streamId, raw ? (content || " ") : withLinkedTag(a, content || " "), true);
     } catch (e) {
       log.warn({ sessionId: a.sessionId, err: (e as Error).message }, "brief: bubble finish failed; standalone fallback");
-      if (content.trim()) sendStandalone(a, content);
+      if (content.trim()) raw ? sendRaw(a, content) : sendStandalone(a, content);
     }
   };
 
-  const finishBriefBubble = (a: AttachState, content: string): Promise<void> => finishBubble(a, a.briefBubble, content);
+  const finishBriefBubble = (a: AttachState, content: string, raw = false): Promise<void> => finishBubble(a, a.briefBubble, content, raw);
 
   // 让一个已建好记录的 turn 成为活跃 turn。turn 级状态在这里统一归零 —— 唯一入口。
   const openBriefTurn = (a: AttachState, q: QueuedTurn): void => {
@@ -2261,8 +2304,15 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         log.warn({ sessionId: a.sessionId, turnId }, "brief: queued turn timed out — force-closing the stuck one");
         closeBriefTurn(a);
       }
-      void finishBubble(a, bubble, briefDetailLink(turnId, a.target));
+      void finishBubble(a, bubble, briefDetailLink(turnId, a.target), true);
     }, HARD_TIMEOUT_MS);
+    // earlyTimer: 3s 无 CLI 产出 → 先把 loading 气泡收成详情链接, 用户可即时点入。
+    // 首条 item 到达时清除 (handleBriefItem 路径)。用显式 bubble ref 而非 a.briefBubble,
+    // 因为排队中的 turn 还没成为活跃 turn, a.briefBubble 指向的是前一个。
+    bubble.earlyTimer = setTimeout(() => {
+      if (bubble.done) return;
+      void finishBubble(a, bubble, briefDetailLink(turnId, a.target), true);
+    }, EARLY_LINK_MS);
     if (a.briefTurnId) {
       (a.briefQueue ??= []).push(q);
       log.info({ sessionId: a.sessionId, turnId, queued: a.briefQueue.length }, "brief: turn queued (previous still running)");
@@ -2292,7 +2342,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     a.briefHadTool = false;
     a.briefConcluded = false;
     a.briefLastText = undefined;
-    enqueueStandalone(a, briefDetailLink(turnId, a.target));
+    sendRaw(a, briefDetailLink(turnId, a.target));
     log.info({ sessionId: a.sessionId, turnId }, "brief: turn started (CLI-side, no bubble)");
   };
 
@@ -2303,7 +2353,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const earlyLinkBubble = (a: AttachState): void => {
     if (!a.briefTurnId || !a.briefBubble || a.briefBubble.done) return;
     a.briefHadTool = true;
-    void finishBriefBubble(a, briefDetailLink(a.briefTurnId, a.target));
+    void finishBriefBubble(a, briefDetailLink(a.briefTurnId, a.target), true);
   };
 
   // 本轮结论落地, 只生效一次:
@@ -2329,7 +2379,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // 气泡还开着 (有工具的 turn: 结论只发了 standalone, 气泡留到这里收链接; 或空 turn
     // 没有结论) —— 收口: 统一写详情链接, 保证每个 turn 都有可点入口。
     if (a.briefBubble && !a.briefBubble.done) {
-      void finishBriefBubble(a, briefDetailLink(a.briefTurnId, a.target));
+      void finishBriefBubble(a, briefDetailLink(a.briefTurnId, a.target), true);
     }
     recordTurnClose(a.briefTurnId);
     log.info({ sessionId: a.sessionId, turnId: a.briefTurnId }, "brief: turn closed");
@@ -2420,6 +2470,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const handleBriefItem = (a: AttachState, item: RenderItem): void => {
     const turnId = a.briefTurnId;
     if (!turnId) return;
+    // 首条 item 到达 → 清除 earlyTimer (CLI 已有响应, 不需要超时收链接了)。
+    if (a.briefBubble?.earlyTimer) { clearTimeout(a.briefBubble.earlyTimer); a.briefBubble.earlyTimer = undefined; }
     const now = Date.now();
     if (item.kind === "tool_use") {
       a.briefHadTool = true; // 有工具 → 气泡收口写详情链接, 结论另发 standalone
@@ -2539,6 +2591,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   };
 
   const onItem = (a: AttachState, item: RenderItem): void => {
+    // 新 spawn 的 pane 在首次 inject 落地前吞掉所有初始输出 (greeting/system)。
+    if (a.muteUntilInject) return;
     // Keepalive ping turns are cache-warmers: swallow every item from the WeCom
     // paths so the ping/pong never reaches chat. But record the REAL exchange
     // into its chat-detail turn — the actual assistant reply (expected: just
@@ -2818,7 +2872,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // Replace any existing attach with the same sessionId or same target. The
     // sessionId clash is the "/wrc again from same window" case; the target
     // clash is "different window steals my WeCom chat" — both end the previous.
+    // Guard: if a DIFFERENT principal already owns this sessionId, refuse rather
+    // than detaching it — prevents cross-wire when concurrent restoreFromStore
+    // calls race or heal logic picks the same newest jsonl.
     const prevBySid = bySessionId.get(sessionId);
+    if (prevBySid && prevBySid.target !== target) {
+      log.warn({ sessionId, existingTarget: prevBySid.target, incomingTarget: target }, "mirror attach: sessionId already bound to another principal, refusing");
+      return { ok: false, reason: `sessionId ${sessionId} already bound to ${prevBySid.target}` };
+    }
     if (prevBySid) detach(prevBySid, "sessionId reattach");
     const prevByTarget = byTarget.get(target);
     // Carry over pending request only when caller didn't explicitly say
@@ -3162,12 +3223,29 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // migration omits it (→ tail from EOF) because the fork file is seeded with
   // the FULL prior transcript and replaying from 0 would re-dump it to WeCom.
   const migrateAttachment = (a: AttachState, newSessionId: string, newJsonlPath: string, startOffset?: number): void => {
+    // Guard: if newSessionId is already bound to a DIFFERENT principal, abort —
+    // prevents silent cross-wire (path B: /clear rotation or drift landing on
+    // a sibling's live session).
+    const incumbent = bySessionId.get(newSessionId);
+    if (incumbent && incumbent.target !== a.target) {
+      log.warn({ target: a.target, newSessionId, incumbentTarget: incumbent.target }, "migrateAttachment: target sid owned by another principal, aborting migration");
+      return;
+    }
     const oldSessionId = a.sessionId;
     const oldJsonlPath = a.jsonlPath;
     // 迁移是所有会话轮换的唯一漏斗 (注入的 /clear、TUI 里手打的 /clear、resume fork、
     // worktree drift)。只有目标 jsonl 首条用户行是 /clear 的那种才是真清空 —— fork /
     // drift 上下文是延续的, 让 store 去推它那条中性的 "switch"。
-    if (jsonlIsPostClearChild(newJsonlPath)) a.ctxCut = "clear";
+    if (jsonlIsPostClearChild(newJsonlPath)) {
+      a.ctxCut = "clear";
+      // 真清空 = 缓存里已无任何值得保温的内容。像 /stop 一样暂停保活 —— 与
+      // dispatch 里 WeCom 注入 /clear 的暂停对齐;TUI 手打 /clear 只走这个漏斗,
+      // 不在这里停下的话旧时钟会继续 ping 一个空上下文。busy-resume(过 grace)
+      // 或真实 inbound 解除。下方 store.set 一并落盘。
+      a.keepaliveOff = true;
+      a.keepaliveOffAt = Date.now();
+      a.keepalive = undefined;
+    }
     a.tail.stop();
     bySessionId.delete(oldSessionId);
     a.sessionId = newSessionId;
@@ -3199,6 +3277,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       tmuxPane: a.tmuxPane || undefined,
       cwd: a.runningCwd || undefined,
       pendingCwd: a.pendingCwd || undefined,
+      // store.set 是整记录替换 —— 必须带上暂停态,否则迁移会把 dispatch 刚落盘
+      // 的 /clear 暂停(或之前的 /stop 暂停)从盘上抹掉,reload 后保活复活。
+      keepaliveOff: a.keepaliveOff || undefined,
+      keepaliveOffAt: a.keepaliveOffAt || undefined,
     });
     log.info({ target: a.target, oldSessionId, newSessionId, oldJsonlPath, newJsonlPath, startOffset }, "mirror migrated session");
   };
@@ -3521,6 +3603,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const spawned = byTarget.get(target);
     if (spawned) {
       spawned.justSpawned = true;
+      spawned.muteUntilInject = true;
       // 只有换过 pane 才是断点 —— 首次 /wrc 建会话时 prev 为空, 那不是"不连续", 是开局。
       if (prev) spawned.ctxCut = "new";
       // A freshly spawned session is empty — nothing in the cache to keep warm.
@@ -3552,7 +3635,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         if (baseRec?.pendingCwd) deps.store.set(base, { ...baseRec, pendingCwd: undefined });
       }
     }
-    pushProjectInfo(target);
+    if (!opts?.silent) pushProjectInfo(target);
     return { ok: true, sessionId: r.sessionId, cwd: r.cwd };
   };
 
@@ -3673,7 +3756,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         return {
           target: t,
           tag,
-          label: tag ? labelFor(tag) : "▫️",
+          label: tag ? labelFor(tag) : "🧙",
           sessionId: a?.sessionId || rec?.sessionId || "",
           jsonlPath,
           cwd: a?.runningCwd || rec?.cwd || expandedDefaultCwd,
@@ -3729,22 +3812,28 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     let lastMs = 0;
     let lastRealMs = 0;
     try { const s = keepaliveStamps(jsonlPath, pingSig); lastMs = s.lastMs; lastRealMs = s.lastRealMs; } catch { /* unreadable tail */ }
-    return { lastMs, lastRealMs, seenMtime: mtime, pinging: false, pingMtime: 0, round: 0 };
+    return { lastMs, lastRealMs, seenMtime: mtime, pinging: false, pingMtime: 0, round: 0, settledAt: 0 };
   };
 
   const fireKeepalive = async (a: AttachState): Promise<void> => {
     const kc = cfg.wrc.mirror.keepalive;
+    // Only the streak's FIRST ping carries the full instruction; consecutive
+    // pings shrink to a bare "ping" — the instruction is already in context,
+    // and the smaller delta means a smaller cache-write and less pane clutter.
+    // keepaliveStamps matches both forms, so the bare one never reads as real
+    // activity. (round is incremented below, after the inject lands.)
+    const text = (a.keepalive?.round ?? 0) > 0 ? "ping" : kc.ping;
     // Suppress the pane→WeCom echo of the ping user line, then swallow the whole
     // ping turn (reply included). The 60s fail-safe clears the quiet window if
     // the turn somehow never emits turn_end, so a later real turn is never muted;
     // it also closes the detail turn so it can't hang open in the chat timeline.
-    rememberInject(kc.ping);
+    rememberInject(text);
     a.keepaliveQuiet = setTimeout(() => {
       a.keepaliveQuiet = undefined;
       if (a.keepaliveTurnId) { recordTurnClose(a.keepaliveTurnId); a.keepaliveTurnId = undefined; }
     }, 60_000);
     const r = await inject({
-      text: kc.ping, images: [], cfg,
+      text, images: [], cfg,
       log: log.child({ target: a.target, sessionId: a.sessionId, sub: "keepalive" }),
       sessionId: a.sessionId, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane,
     });
@@ -3756,11 +3845,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
     const tokens = lastContextTokens(a.jsonlPath);
     const size = tokens > 0 ? `~${fmtTokens(tokens)} tokens` : "未知";
-    // Denominator tracks the ACTUAL ping cadence (idleTriggerMs = ttlSec - marginSec),
-    // not the nominal ttlSec — pings fire marginSec early, so ttlSec would undercount
-    // and let `n` exceed `N` (a 9/8). floor keeps the last shown round the last one that fires.
-    const cadenceSec = Math.max(30, kc.ttlSec - kc.marginSec);
-    const totalRounds = Math.max(1, Math.floor(kc.maxIdleSec / cadenceSec));
+    const totalRounds = Math.max(1, kc.rounds);
     const round = a.keepalive ? (a.keepalive.round += 1) : 1;
     log.info({ target: a.target, tokens, round, totalRounds }, "keepalive: ping injected");
     // Open a chat-detail turn for the real heartbeat exchange: userQuery is the
@@ -3769,8 +3854,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // closed on the ping's turn_end (or the fail-safe). Kept out of chat.
     const turnId = newTurnId();
     a.keepaliveTurnId = turnId;
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: kc.ping });
-    if (kc.notify) sendStandalone(a, `KeepAlive ${round}/${totalRounds} · ${size}`);
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: text });
+    if (kc.notify && (round === 1 || round === 3 || round === 6))
+      sendRaw(a, withLinkedTag(a, `KeepAlive ${round}/${totalRounds} · ${size}`, undefined, turnId));
   };
 
   let keepaliveTicking = false;
@@ -3781,7 +3867,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     try {
       const idleTriggerMs = Math.max(30, kc.ttlSec - kc.marginSec) * 1000;
       const ttlMs = kc.ttlSec * 1000;
-      const maxIdleMs = Math.max(kc.ttlSec, kc.maxIdleSec) * 1000;
       const pingSig = normAssistant(kc.ping).slice(0, 40);
       const now = Date.now();
       for (const a of byTarget.values()) {
@@ -3815,6 +3900,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           // (the ping's own user line) appears and the pane goes idle, keep waiting.
           if (busy || k.lastMs <= k.pingMtime) continue;
           k.pinging = false;
+          k.settledAt = now;
           continue;
         }
         // A new real message turn (or a busy pane) re-anchors: reset the round
@@ -3822,17 +3908,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // message-based now, so `/stop`'s Esc settling writes (metadata, no new
         // turn) can no longer self-resume the pause — only a busy pane past grace,
         // or a WeCom inbound in dispatch, does.
-        if (busy || grewSinceLast) {
-          k.round = 0; // real work resets the round counter — pings start from 1/N again
+        // Suppress the grewSinceLast reset for 30s after pinging settles — the
+        // pong's tail flush can lag a tick and would otherwise fake real activity.
+        const justSettled = k.settledAt > 0 && now - k.settledAt < 30_000;
+        if (busy || (grewSinceLast && !justSettled)) {
+          k.round = 0; k.settledAt = 0;
           if (a.keepaliveOff && busy && now - (a.keepaliveOffAt ?? 0) > RESUME_GRACE_MS) { a.keepaliveOff = false; persistPause(a); }
           if (busy) continue;
         }
         if (a.keepaliveOff) continue;                          // paused by /stop until real activity returns
         const idleSinceTouch = k.lastMs ? now - k.lastMs : now - mtime;   // last model turn = cache touch
-        const realIdle = k.lastRealMs ? now - k.lastRealMs : Infinity;    // no real turn in window ⇒ dead
         if (idleSinceTouch < idleTriggerMs) continue;          // cache still comfortably warm
         if (idleSinceTouch >= ttlMs) continue;                 // cache already cold — a ping would cold-rewrite for nothing
-        if (realIdle >= maxIdleMs) continue;                   // real work too old — stop, let it die (你的「超5分钟不保活」)
+        if (k.round >= kc.rounds) continue;                    // budget spent — let it go cold
         k.pinging = true;
         k.pingMtime = k.lastMs;                                // settles when a newer turn (the ping's own) appears
         await fireKeepalive(a);
@@ -4014,10 +4102,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       }
       // freshSpawn: true — the pane was just minted by /mirror/spawn, the TUI
       // is still warming up so the verifier in injectViaTmux needs the slack.
-      return await inject({
+      const r = await inject({
         text, images: [], cfg, log: log.child({ principal: target, sessionId: sid, sub: "init-demo" }),
         sessionId: sid, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane, freshSpawn: true,
       });
+      // 与 dispatch 同一约定: 首条 inject 落地 = 解除新 pane 的初始输出静默。
+      // 漏掉这一步的后果不只是少几条气泡 —— onItem 在 mute 分支整体早退, 连
+      // recordTurnStart 都不会跑, 于是 graph/send_peer 拉起来的节点在 chat 列表
+      // 和 chat 详情里彻底不存在(它从来没被 WeCom 侧 dispatch 过, 没有第二次机会)。
+      if (r.ok) {
+        a.muteUntilInject = false;
+        a.justSpawned = false;
+      }
+      return r;
     },
     interruptPane: async (target, opts) => {
       const a = byTarget.get(target);
@@ -4344,6 +4441,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // Without this, a tmux server that unwedges after the user gave up would
         // paste a minutes-old message into a session that has moved on.
         if ((a.injectGen ?? 0) !== myGen) {
+          // Lift the spawn mute here too: this inject will never land, so the
+          // pane's output (including whatever /stop interrupted) would otherwise
+          // stay swallowed by onItem until some later message injects cleanly.
+          a.muteUntilInject = false;
           log.warn({ target: a.target, sessionId: sid, myGen, gen: a.injectGen }, "inject aborted — superseded by /stop or watchdog");
           return;
         }
@@ -4353,6 +4454,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           sessionId: sid, jsonlPath: a.jsonlPath, tmuxTarget: a.tmuxPane, freshSpawn,
         });
         if (!r.ok) {
+          a.muteUntilInject = false;
           if (s) {
             s.acc = s.acc ? `${s.acc}\n\n[mirror] ✗ ${r.reason ?? "failed"}` : `[mirror] ✗ ${r.reason ?? "failed"}`;
             await finalizeStream(a, s);
@@ -4370,6 +4472,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
           }
           return;
         }
+        // inject 成功 → 解除初始输出静默, 后续 onItem 正常流转。
+        a.muteUntilInject = false;
         // Inject "succeeded" but the input box never cleared — the target
         // session may be busy / not consuming input (long task, full context).
         // Hint the user once so a silently-dropped message isn't mistaken for a

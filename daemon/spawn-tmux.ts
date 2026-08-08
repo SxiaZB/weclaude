@@ -148,13 +148,62 @@ const safeWindowName = (s: string): string => {
   return (slug || "claude").slice(0, isPrincipal ? 8 : 24);
 };
 
-// Time the daemon waits between launching claude and returning. Covers shell
-// rc sourcing + claude TUI grabbing the pty + reaching interactive state so
-// the very next paste-buffer inject lands inside claude's input box AND the
-// trailing Enter is honored as submit (not eaten by the startup banner).
-// 1.5s used to leave Enter racing with TUI init — text would land but the
-// submit got dropped, leaving the prompt typed-but-unsent.
-const TUI_SETTLE_MS = 3000;
+// Minimum settle before first poll: shell rc needs time to source before
+// capture-pane contains anything meaningful. Too short → wasted polls against
+// a blank screen; too long → added latency on happy path.
+const MIN_SETTLE_MS = 1500;
+// Max time to wait for TUI readiness. Covers slow machines / heavy .zshrc.
+const TUI_READY_TIMEOUT_MS = 15_000;
+// Poll interval for capture-pane checks.
+const POLL_MS = 400;
+
+// Patterns indicating the TUI reached interactive state (input box visible).
+// Covers Claude Code, Claude Internal, and CodeBuddy TUIs across versions.
+const TUI_READY_RE = /for shortcuts|auto mode|Try "|>\s*$/m;
+
+// Patterns indicating an interactive prompt that consumed our Enter — the
+// command is sitting unsent in the shell line.
+const BLOCKER_RE = /Would you like to update|oh-my-zsh|Do you want to update/i;
+
+const capturePaneBottom = async (pane: string, rows: number): Promise<string> => {
+  const r = await runTmux(["capture-pane", "-t", pane, "-p", "-S", `-${rows}`]);
+  return r.ok ? r.stdout : "";
+};
+
+// Active verification that the TUI launched and is ready for input. Replaces
+// the old blind sleep(3000). On success returns true; on timeout returns false
+// (caller decides whether to treat as fatal). Retries Enter once if it detects
+// the command was typed but not submitted.
+const waitForTuiReady = async (pane: string, cmd: string, log: Logger): Promise<boolean> => {
+  await sleep(MIN_SETTLE_MS);
+  const deadline = Date.now() + TUI_READY_TIMEOUT_MS;
+  let retriedEnter = false;
+  let resent = false;
+  while (Date.now() < deadline) {
+    const cap = await capturePaneBottom(pane, 20);
+    if (TUI_READY_RE.test(cap)) return true;
+    // Shell prompt eating our Enter: an interactive blocker (omz update, etc.)
+    // swallowed it. Dismiss with "N" + Enter, then re-send the full command.
+    if (!resent && BLOCKER_RE.test(cap)) {
+      log.warn({ pane }, "spawn-tmux: interactive blocker detected, dismissing");
+      await runTmux(["send-keys", "-t", pane, "N", "Enter"]);
+      await sleep(800);
+      await runTmux(["send-keys", "-t", pane, cmd, "Enter"]);
+      resent = true;
+    }
+    // If after half the budget we still see nothing, maybe Enter was lost in
+    // shell rc sourcing. Retry Enter once (safe: if claude already started, an
+    // extra Enter on an empty input box is a no-op).
+    if (!retriedEnter && !resent && (Date.now() - (deadline - TUI_READY_TIMEOUT_MS)) > TUI_READY_TIMEOUT_MS / 2) {
+      log.warn({ pane }, "spawn-tmux: TUI not seen at half-budget, retrying Enter");
+      await runTmux(["send-keys", "-t", pane, "Enter"]);
+      retriedEnter = true;
+    }
+    await sleep(POLL_MS);
+  }
+  log.warn({ pane }, "spawn-tmux: TUI ready timeout, proceeding anyway");
+  return false;
+};
 
 export interface SpawnArgs {
   cfg: Config;
@@ -322,11 +371,11 @@ export const spawnTmuxClaude = async ({ cfg, log, resumeSessionId, windowName, c
     return { ok: false, reason: `tmux send-keys failed: ${sent.stderr.trim() || sent.code}` };
   }
 
-  // Settle so the next paste-buffer inject doesn't race claude's TUI startup.
-  // Note: claude does NOT create the transcript jsonl until it processes the
-  // first user input, so we don't wait for the file here — mirror tail tolerates
-  // a missing jsonl and starts emitting once claude writes the first line.
-  await sleep(TUI_SETTLE_MS);
+  // Actively verify the TUI reached interactive state before returning.
+  // claude does NOT create the transcript jsonl until it processes the first
+  // user input, so we don't wait for the file — mirror tail tolerates a
+  // missing jsonl and starts emitting once claude writes the first line.
+  await waitForTuiReady(tmuxPane, cmd, log);
 
   log.info({ tmuxName, tmuxPane, sessionId, jsonlPath, cwd, cli: backend.name }, "spawn-tmux: ready");
   return { ok: true, sessionId, jsonlPath, tmuxPane, tmuxSession: tmuxName, cwd, cli: backend.name };

@@ -59,7 +59,7 @@ export const keyOf = (base: string, tag: string): string => (tag ? `${base}#${ta
 /** Trailing-space emoji badge for card titles; "" for untagged targets. */
 export const tagBadge = (target: string | undefined): string => {
   const tag = tagOfKey(target);
-  return tag ? `${labelFor(tag)} ` : "";
+  return tag ? `${labelFor(tag)} ` : "🧙 ";
 };
 
 /** Every `#tag`-looking token in a quoted message, in order of appearance.
@@ -94,6 +94,6 @@ export const tagsInQuote = (quoted: string): string[] => {
  *  alone when the session is untagged. */
 export const withTagHeader = (target: string | undefined, content: string, seq?: string): string => {
   const tag = tagOfKey(target);
-  const head = [tag ? `${labelFor(tag)} \`#${tag}\`` : "", seq ? `\`${seq}\`` : ""].filter(Boolean).join(" ");
-  return head ? `${head}\n\n${content}` : content;
+  const head = [tag ? `${labelFor(tag)} #${tag}` : "🧙", seq ?? ""].filter(Boolean).join(" ");
+  return `${head} ${content}`;
 };

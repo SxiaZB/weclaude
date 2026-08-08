@@ -209,7 +209,7 @@ const renderSessionsList = (sessions: SessionInfo[], currentSid: string): string
     const here = s.sessionId === currentSid ? " ⬅️ 当前" : "";
     const dir = s.cwd.replace(/^.*\//, "") || s.cwd || "?";
     const cli = mixed ? ` _(${s.cli})_` : "";
-    return `${s.label || "▫️"} \`${s.sessionId.slice(0, 8)}\` ${dir}${cli}${here}`;
+    return `${s.label || "🧙"} \`${s.sessionId.slice(0, 8)}\` ${dir}${cli}${here}`;
   });
   return [
     "[wezard] 正在运行的会话：",
@@ -493,10 +493,10 @@ export const installInboundRouter = (
   // the user-facing one-line ack. When `who` carries a `#tag` suffix, use
   // the raw tag as the tmux window name so the pane shows readably in the
   // status bar (e.g. `#docs` → window `docs`, not the principal slug).
-  const spawnSession = async (who: string, cli?: CliBackendName): Promise<string> => {
+  const spawnSession = async (who: string, cli?: CliBackendName, silent?: boolean): Promise<string> => {
     if (!("newSession" in bridge)) return "[wezard] /new only available in mirror mode";
     const tag = tagOf(who);
-    const r = await bridge.newSession(who, tag || who, cli);
+    const r = await bridge.newSession(who, tag || who, cli, { silent });
     if (!r.ok) return `[wezard] /new failed: ${r.reason ?? "unknown"}`;
     return `✅ 新会话已建立 \`${r.sessionId}\``;
   };
@@ -521,7 +521,7 @@ export const installInboundRouter = (
   // 复用,不再 respawn —— 否则先到的消息会被注入进一个刚被杀掉的 pane。
   const ensureSession = (who: string): Promise<string> =>
     serializeSpawn(who, async () =>
-      "hasMirrorTarget" in bridge && bridge.hasMirrorTarget(who) ? "✅ 复用已建立的会话" : await spawnSession(who));
+      "hasMirrorTarget" in bridge && bridge.hasMirrorTarget(who) ? "✅ 复用已建立的会话" : await spawnSession(who, undefined, true));
 
   // Prefix user-visible daemon replies with `<emoji> #tag` when the routed
   // session is tagged, so a chat hosting multiple concurrent tagged sessions
@@ -672,23 +672,18 @@ export const installInboundRouter = (
     // Authorized `/stop` — Esc the live pane to interrupt whatever Claude is
     // currently doing. Mirror-mode only; bails cleanly when no attachment.
     if (isStopCommand(text)) {
-      if (!("interruptPane" in bridge)) {
-        await replyText(frame, msg, who, "[wezard] /stop only available in mirror mode");
-      } else {
+      if ("interruptPane" in bridge) {
         // teardown: /stop is the user's "shut this up" button, so it must also
         // close hanging bubbles and free the inject queue — not just press Esc.
-        // Report both halves separately: a live pane that refuses Esc is a very
-        // different situation from a chat that was merely stuck on a dead bubble.
+        // Stay silent on a clean stop (the pane going quiet IS the receipt);
+        // only speak up when a half actually failed — a live pane that refuses
+        // Esc is a very different situation from a chat merely stuck on a bubble.
         const r = await bridge.interruptPane(who, { teardown: true });
         if (!r.ok) {
           await replyText(frame, msg, who, `[wezard] /stop failed: ${r.reason ?? "unknown"}`);
-        } else {
-          const parts = [
-            r.escOk ? "✅ Esc sent" : `⚠️ Esc 未送达（${r.escReason ?? "unknown"}）`,
-            r.torndown ? `已收口 ${r.torndown} 个挂起气泡` : "无挂起气泡",
-            "保活已暂停（下次对话自动恢复）",
-          ];
-          await replyText(frame, msg, who, parts.join(" · "));
+        } else if (!r.escOk) {
+          const torndown = r.torndown ? ` · 已收口 ${r.torndown} 个挂起气泡` : "";
+          await replyText(frame, msg, who, `⚠️ Esc 未送达（${r.escReason ?? "unknown"}）${torndown} · 保活已暂停`);
         }
       }
       return { stop: true };
@@ -701,7 +696,7 @@ export const installInboundRouter = (
         await replyText(frame, msg, who, "[wezard] /n only available in mirror mode");
       } else {
         const r = await bridge.submitPane(who);
-        await replyText(frame, msg, who, r.ok ? "✅ Enter sent" : `[wezard] /n failed: ${r.reason ?? "unknown"}`);
+        await replyText(frame, msg, who, r.ok ? "Enter sent" : `[wezard] /n failed: ${r.reason ?? "unknown"}`);
       }
       return { stop: true };
     }
@@ -773,7 +768,7 @@ export const installInboundRouter = (
       }
       const hit = matchSession(sessions, sc.arg);
       if (!hit) {
-        const avail = sessions.map((s) => `${s.label || "▫️"} ${s.sessionId.slice(0, 8)}`).join("、") || "无";
+        const avail = sessions.map((s) => `${s.label || "🧙"} ${s.sessionId.slice(0, 8)}`).join("、") || "无";
         await replyText(frame, msg, who, `[wezard] 未找到会话 \`${sc.arg}\`。可用：${avail}`);
         return { stop: true };
       }

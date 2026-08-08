@@ -4,6 +4,61 @@
 
 ## [Unreleased]
 
+### Changed
+- `peers`: `/peers` 输出重排 —— 摘要文本剥掉 markdown 活跃字符(反引号/星号/竖线,来自 transcript 的原文会被 WeCom 渲染成代码块而撕裂排版),同值字段(项目目录 / CLI)上提到标题行,条目之间空行分隔。
+- `mirror`: 移除 `broadcastTo` 转发管道 —— `base#tag` 与 `base` 剥出来是同一个 WeCom chatid,节点自己的推送本就落在这个会话里,再广播一次纯属重复。
+
+### Fixed
+- `mirror`: `injectText` 成功后清除 `muteUntilInject` / `justSpawned`。graph 拉起的节点由 `newSession` 置静音、再由 `injectText` 注入,而清除静音只写在 WeCom dispatch 路径上 —— 结果 `onItem` 永远在静音分支早退,节点既不推气泡也不 `recordTurnStart`,在 chat 列表和 chat 详情里完全不存在。
+
+## [1.2.15] - 2026-08-07
+
+### Fixed
+- `session-label`: `withTagHeader` 对无 tag 默认会话不加前缀 —— approval vote 回执、plan 卡、error 等经 `withTagHeader` 发送的消息无 🧙 标识。现统一为所有 target 都带前缀(tagged → `emoji #tag`，untagged → `🧙`)。
+
+## [1.2.14] - 2026-08-07
+
+### Changed
+- `mirror`: 所有 emoji+tag 前缀和 detail link 文本去掉反引号包裹 —— WeCom markdown 里 backtick 渲染为代码样式,与可点击链接视觉冲突。
+- `mirror`: 默认会话（无 tag）所有推送现统一带 🧙 前缀,不再裸发。
+- `mirror`: KeepAlive 通知也带 chat detail 链接(使用 `keepaliveTurnId`)。
+
+### Fixed
+- `peers`: `keepaliveStamps` 对 ping 后紧跟的 assistant pong 未识别为 keepalive 回复,导致 pong 误算为 real activity 重置 round。
+
+## [1.2.13] - 2026-08-07
+
+### Added
+- `mirror`: 所有 standalone 消息和 finalized bubble 的 emoji+tag 前缀现在是可点击的 chat detail 链接(有活跃 turn 时);无 tag 的默认会话使用 🧙 作为链接图标。
+
+### Fixed
+- `inbound`: `/stop` 成功时不再回复消息,仅失败时通知。
+- `mirror`: KeepAlive 通知只在第 1、3、6 轮发送(不再每轮都推)。
+- `mirror`: KeepAlive 轮次计数修复 —— ping/pong 结算后的 mtime 抖动不再误触 `grewSinceLast` 重置 round(添加 30s `settledAt` 宽限窗口)。
+- `mirror`: chat detail 链接格式统一:emoji+tag 包在反引号内作为链接文本,🧙 作为无 tag 会话的默认图标,"← View chat details" 变为普通文本提示。
+
+### Fixed
+- `mirror`: inline peer spawn(`#tag` 首条消息自动建会话)和 graph runner spawn 不再下发 "📂 当前项目" 提示消息到 WeCom — `newSession` 新增 `silent` 选项,隐式路径传 `silent: true` 跳过 `pushProjectInfo`;显式 `/new` 仍正常推送。
+
+## [1.2.11] - 2026-08-06
+
+### Added
+- `mirror`: `muteUntilInject` — 新 spawn 的 session 在首次 inject 成功前静默初始输出(greeting/system),避免 `#tag` 自动建会话时把 CLI 开场白推到 WeCom。
+- `mirror`: `earlyTimer` (3s) — inject 后若 CLI 在 3s 内无任何产出,先把 loading 气泡收成 chat detail 链接;首条 item 到达即清除,不影响正常流。
+
+### Fixed
+- `mirror`: `muteUntilInject` 在 inject 失败路径未清除(return 在赋值前),导致会话永久静默。
+- `mirror`: `earlyTimer` 对排队中的 turn 错引 `a.briefBubble`(仍指向前一个活跃 bubble),改为闭包捕获的 bubble ref。
+
+## [1.2.10] - 2026-08-06
+
+### Changed
+- `mirror`: 保活默认轮次 8 → 6(桥接窗口 ~34min → ~26min)。
+- `mirror`: 保活连击瘦身 —— 一轮连击里只有第一发 ping 带完整指令文案,后续轮次只注入 bare `ping`(指令已在上下文里,cache-write delta 更小、pane 更干净)。`keepaliveStamps` 同步识别 bare `ping`,否则连击轮会被误判为真实活动、重置轮次并自我续命。
+
+### Fixed
+- `mirror`: TUI 里手打 `/clear` 后保活仍继续 —— `migrateAttachment`(所有会话轮换的唯一漏斗)此前不碰保活态,旧时钟接着 ping 空上下文;且其 `store.set` 整记录替换会把 dispatch 刚落盘的 `/clear` 暂停从盘上抹掉(reload 后复活)。现迁移目标判定为真清空时像 `/stop` 一样置 `keepaliveOff` 并清时钟,暂停态随迁移记录一并落盘。
+
 ## [1.2.9] - 2026-08-05
 
 ### Fixed
@@ -113,7 +168,15 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.7...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.15...HEAD
+[1.2.15]: https://github.com/guxi11/wezard/compare/v1.2.14...v1.2.15
+[1.2.14]: https://github.com/guxi11/wezard/compare/v1.2.13...v1.2.14
+[1.2.13]: https://github.com/guxi11/wezard/compare/v1.2.12...v1.2.13
+[1.2.12]: https://github.com/guxi11/wezard/compare/v1.2.11...v1.2.12
+[1.2.11]: https://github.com/guxi11/wezard/compare/v1.2.10...v1.2.11
+[1.2.10]: https://github.com/guxi11/wezard/compare/v1.2.9...v1.2.10
+[1.2.9]: https://github.com/guxi11/wezard/compare/v1.2.8...v1.2.9
+[1.2.8]: https://github.com/guxi11/wezard/compare/v1.2.7...v1.2.8
 [1.2.7]: https://github.com/guxi11/wezard/compare/v1.2.6...v1.2.7
 [1.2.6]: https://github.com/guxi11/wezard/compare/v1.2.5...v1.2.6
 [1.2.5]: https://github.com/guxi11/wezard/compare/v1.2.4...v1.2.5

@@ -152,6 +152,19 @@ const makeClaude = (name: CliBackendName, bin: string): CliBackend => {
 //      fallback path in renderLine (goalStartOf on string content) should
 //      catch it if codebuddy uses the same marker text, but this needs
 //      confirmation from a real /goal session.
+// CodeBuddy usage → snake_case shape that lastContextTokens / extractTokens expect.
+const normalizeCbUsage = (pd: Record<string, unknown>) => {
+  const u = pd.usage as Record<string, unknown> | undefined;
+  if (!u) return undefined;
+  const details = (u.inputTokensDetails ?? []) as Array<{ cached_tokens?: number }>;
+  return {
+    input_tokens: Number(u.inputTokens ?? 0),
+    output_tokens: Number(u.outputTokens ?? 0),
+    cache_read_input_tokens: details[0]?.cached_tokens ?? 0,
+    cache_creation_input_tokens: 0,
+  };
+};
+
 const normalizeCodebuddy = (raw: unknown): NormalizedTranscriptLine | null => {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
@@ -182,7 +195,7 @@ const normalizeCodebuddy = (raw: unknown): NormalizedTranscriptLine | null => {
         content: blocks,
         id: providerData.messageId as string | undefined,
         model: providerData.model as string | undefined,
-        usage: providerData.usage as NormalizedTranscriptLine["message"] extends { usage?: infer U } ? U : undefined,
+        usage: normalizeCbUsage(providerData),
       };
       // status:"completed" 只说明这条记录写完了 —— codebuddy 把中途叙述和最终答复
       // 写成同形的独立 message, 映射成 stop_reason:"end_turn" 会让"中间说一句"就把
@@ -207,7 +220,7 @@ const normalizeCodebuddy = (raw: unknown): NormalizedTranscriptLine | null => {
     return {
       type: "assistant",
       ...uuids,
-      message: { role: "assistant", content: [{ type: "tool_use", id: callId, name, input }] },
+      message: { role: "assistant", content: [{ type: "tool_use", id: callId, name, input }], usage: normalizeCbUsage(providerData) },
     };
   }
 

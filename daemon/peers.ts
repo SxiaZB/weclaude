@@ -125,12 +125,13 @@ export const lastContextTokens = (jsonlPath: string): number => {
     const rawIn = u.input_tokens ?? 0;
     const cr = u.cache_read_input_tokens ?? 0;
     const cw = u.cache_creation_input_tokens ?? 0;
-    // CodeBuddy's gateway totalizes input_tokens (= cr+cw+fresh); Anthropic-native
-    // keeps the three disjoint. Detect by the model's version style ("4.7-opus"
-    // vs "opus-4-7") — same reconciliation the mirror does for usage accounting.
-    const model = row?.message?.model;
-    const gatewayTotalized = typeof model === "string" && /\d\.\d/.test(model);
-    return gatewayTotalized && rawIn >= cr + cw ? rawIn : rawIn + cr + cw;
+    // A totalized gateway reports input_tokens = cr+cw+fresh; Anthropic-native
+    // keeps the three disjoint (input_tokens = fresh only). The data signal —
+    // input_tokens alone covering both cache tiers — identifies the totalized
+    // shape without betting on a model-name dialect (deepseek-v4-flash is a
+    // totalized gateway but has no digit-dot in its name). Same reconciliation
+    // the mirror + usage accounting use.
+    return rawIn >= cr + cw ? rawIn : rawIn + cr + cw;
   }
   return 0;
 };
@@ -153,16 +154,24 @@ export const keepaliveStamps = (
 ): { lastMs: number; lastRealMs: number; stamped: boolean } => {
   const turns = tailTurns(jsonlPath, 24);
   const norm = (s: string): string => s.replace(/\s+/gu, "");
-  const isPing = (t: Turn): boolean => t.role === "user" && pingSig.length > 0 && norm(t.text).includes(pingSig);
+  // Streak pings after the first are a bare "ping" (the full instruction is
+  // already in context) — match that exact form too, or a streak turn would
+  // read as REAL activity and re-anchor lastRealMs / reset the round counter.
+  const isPing = (t: Turn): boolean =>
+    t.role === "user" &&
+    ((pingSig.length > 0 && norm(t.text).includes(pingSig)) || norm(t.text).toLowerCase() === "ping");
   const isPong = (t: Turn): boolean => t.role === "assistant" && norm(t.text).replace(/[^a-zA-Z]/g, "").toLowerCase() === "pong";
   let lastMs = 0;
   let lastRealMs = 0;
   let stamped = false;
-  for (const t of turns) {
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i]!;
     const ms = t.ms ?? 0;
     if (ms > 0) stamped = true;
     if (ms > lastMs) lastMs = ms;
-    if (ms > lastRealMs && !isPing(t) && !isPong(t)) lastRealMs = ms;
+    const isKeepalive = isPing(t) || isPong(t) ||
+      (t.role === "assistant" && i > 0 && isPing(turns[i - 1]!));
+    if (ms > lastRealMs && !isKeepalive) lastRealMs = ms;
   }
   return { lastMs, lastRealMs, stamped };
 };
