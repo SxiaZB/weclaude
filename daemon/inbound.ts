@@ -135,6 +135,7 @@ const parseCfgSyncCommand = (text: string): { apply: boolean } | undefined => {
 };
 const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
+const isKillCommand = (text: string): boolean => text.trim() === "/kill";
 const isEnterCommand = (text: string): boolean => text.trim() === "/n";
 const isRevealCommand = (text: string): boolean => text.trim() === "/reveal";
 const isHelpCommand = (text: string): boolean => /^\/(?:help|\?|h)$/i.test(text.trim());
@@ -151,6 +152,7 @@ const renderHelp = (): string =>
     "`/clear` 清空当前会话上下文 (有待切项目时自动升级为 /new)",
     "`/sessions` 列出 live 会话 · `/sessions <emoji|id>` 切换",
     "`/stop` 打断当前生成 (Esc)",
+    "`/kill` 结束本会话并移除 tmux pane (下条消息自动新开)",
     "`/n` 向 CLI 输入回车 (Enter)",
     "`/reveal` 把终端的 tmux 窗口切到本会话",
     "",
@@ -653,6 +655,18 @@ export const installInboundRouter = (
       if ("interruptPane" in bridge) {
         const r = await bridge.interruptPane(who);
         if (!r.ok) await replyText(frame, msg, who, `[wezard] /stop failed: ${r.reason ?? "unknown"}`);
+      }
+      return { stop: true };
+    }
+    // Authorized `/kill` — end this session for good: Esc the pane, kill it,
+    // and drop the binding (no `--resume` resurrection). Routed by `#tag` like
+    // /stop, so `/kill #docs` only takes down that sibling.
+    if (isKillCommand(text)) {
+      if (!("killPane" in bridge)) {
+        await replyText(frame, msg, who, "[wezard] /kill only available in mirror mode");
+      } else {
+        const r = await bridge.killPane(who);
+        await replyText(frame, msg, who, r.ok ? "🗑️ 会话已结束，pane 已移除" : `[wezard] /kill failed: ${r.reason ?? "unknown"}`);
       }
       return { stop: true };
     }

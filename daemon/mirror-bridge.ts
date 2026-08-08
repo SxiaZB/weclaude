@@ -1472,6 +1472,10 @@ export interface MirrorBridge {
    *  Claude is currently doing (active generation / open prompt). No-op for
    *  spawn-mode attachments (no live TTY to interrupt). */
   interruptPane: (target: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** Tear the session down: Esc the pane, kill it, detach, and drop the
+   *  persisted binding so nothing resurrects it. The chat auto-spawns a fresh
+   *  session on its next message. */
+  killPane: (target: string) => Promise<{ ok: boolean; reason?: string }>;
   /** Send a bare Enter to the live tmux pane bound to `target` — confirms a
    *  prompt / press-enter-to-continue, or submits the input box as-is. No-op
    *  for spawn-mode attachments (no live TTY). */
@@ -2227,7 +2231,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
 
   const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string, isSlash = false, userQuery = ""): Promise<void> => {
     const turnId = newTurnId();
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: userQuery.trim() || undefined, cut: consumeCut(a), origin: consumeOrigin(a) });
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, cwd: a.runningCwd || undefined, userQuery: userQuery.trim() || undefined, cut: consumeCut(a), origin: consumeOrigin(a) });
     // hardTimer 兜底: turn 若无终句 / turn_end 收口 (卡死/漏收), 到点仍收气泡。
     const bubble: BriefBubble = { frame, streamId, hardTimer: undefined as unknown as NodeJS.Timeout, done: false };
     const q: QueuedTurn = { turnId, bubble, isSlash };
@@ -3765,8 +3769,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // anchored to the last REAL (non-ping) activity, NOT to our own pings — so a
   // dead session is never kept warm forever, and once real work is older than
   // `maxIdleSec` we stop and let the cache die.
-  const fmtTokens = (n: number): string =>
-    n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
   // After `/stop`, ignore pane-busy as a resume signal for this long — long
   // enough for an in-flight ping (interrupted by the same /stop's Esc) to settle,
   // so it can't self-resume the pause. A genuine new turn after this window does.
@@ -3816,10 +3818,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       return;
     }
     const tokens = lastContextTokens(a.jsonlPath);
-    const size = tokens > 0 ? `~${fmtTokens(tokens)} tokens` : "未知";
-    const totalRounds = Math.max(1, kc.rounds);
     const round = a.keepalive ? (a.keepalive.round += 1) : 1;
-    log.info({ target: a.target, tokens, round, totalRounds }, "keepalive: ping injected");
+    log.info({ target: a.target, tokens, round, totalRounds: Math.max(1, kc.rounds) }, "keepalive: ping injected");
     // Open a chat-detail turn for the real heartbeat exchange: userQuery is the
     // actual ping we injected; the assistant reply (expected: just "pong"), any
     // tool calls, and usage are grafted on from the swallowed items in onItem;
@@ -3827,8 +3827,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const turnId = newTurnId();
     a.keepaliveTurnId = turnId;
     recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: text });
-    if (kc.notify && (round === 1 || round === 3 || round === 6))
-      sendRaw(a, withLinkedTag(a, `KeepAlive ${round}/${totalRounds} · ${size}`, undefined, turnId));
   };
 
   let keepaliveTicking = false;
@@ -4118,6 +4116,29 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // Any in-flight ping's quiet window + detail turn are left to close on their
       // own turn_end (or the 60s fail-safe), so the interrupted pong stays out of chat.
       log.info({ target, sessionId: a.sessionId, pane: a.tmuxPane }, "mirror /stop — Esc sent to pane, keepalive paused");
+      return { ok: true };
+    },
+    killPane: async (target) => {
+      // paneOf (not byTarget.get) so a binding surviving only in the persisted
+      // store — e.g. after a reload that couldn't re-attach — is still killable.
+      const a = byTarget.get(target);
+      const pane = a?.tmuxPane || paneOf(target);
+      if (!a && !pane) return { ok: false, reason: "no session bound to target" };
+      if (pane && (await tmuxPaneAlive(pane))) {
+        // Esc first, like /stop: a mid-generation CLI gets a beat to unwind and
+        // flush its transcript before the TTY is yanked out from under it.
+        await tmuxRun(["send-keys", "-t", pane, "Escape"]);
+        await sleepMs(250);
+        const r = await tmuxRun(["kill-pane", "-t", pane]);
+        if (r.code !== 0) return { ok: false, reason: `kill-pane failed: ${r.stdout.slice(-200) || r.code}` };
+      }
+      if (a) detach(a, "/kill");
+      // Drop the persisted record too — keeping it would let the next inbound
+      // resurrect this very session via the dead-pane `--resume` self-heal,
+      // which is the opposite of what /kill means. The chat then auto-spawns a
+      // fresh session on its next message.
+      deps.store.drop(target);
+      log.info({ target, sessionId: a?.sessionId, pane }, "mirror /kill — pane killed, binding dropped");
       return { ok: true };
     },
     submitPane: async (target) => {

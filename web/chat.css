@@ -89,6 +89,11 @@ body { overflow: hidden; overscroll-behavior: none }
 }
 .topbar .em { font-size: 18px }
 .topbar .h { font-size: 15px; font-weight: 600; font-family: ui-monospace, Menlo, monospace }
+.topbar .cwd {
+  flex: none; font-size: 11px; color: #57606a; font-family: ui-monospace, Menlo, monospace;
+  background: #f6f8fa; border: 1px solid #eaeef2; border-radius: 5px; padding: 1px 6px;
+  max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .topbar .sub {
   font-size: 11px; color: #8c959f; font-family: ui-monospace, Menlo, monospace;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

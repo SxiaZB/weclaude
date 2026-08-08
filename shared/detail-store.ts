@@ -101,6 +101,7 @@ export interface TurnDetailRecord {
   closed: boolean;
   target?: string;
   sessionId?: string;
+  cwd?: string;        // 本轮运行时该 pane 的实际工作目录 (可能与 cfg.wrc.cwd 不同)
   userQuery?: string;  // 触发本轮的用户输入原文 (mirror 侧 dispatch 的 text)
   cut?: CtxCut;        // 本轮之前的上下文断点; undefined = 与上一轮同一上下文
   origin?: TurnOrigin; // 本轮由 graph 注入; undefined = 人 (或 peer) 直接发起

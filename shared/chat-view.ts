@@ -30,6 +30,8 @@ export interface TagSummary {
   /** Stable animal emoji, keyed on the tag string (survives /clear). */
   label: string;
   sessionId?: string;
+  /** 最近一轮记到的工作目录 —— 同一 chat 的兄弟会话可以各跑各的 cwd。 */
+  cwd?: string;
   model?: string;
   turns: number;
   lastTs: number;
@@ -183,6 +185,7 @@ const summarizeTag = (target: string, turns: readonly TurnDetailRecord[], now: n
     tag,
     label: tag ? labelFor(tag) : "🧙",
     sessionId: last?.sessionId,
+    cwd: [...turns].reverse().find((r) => r.cwd)?.cwd,
     model: [...turns].reverse().find((r) => r.model)?.model,
     turns: turns.length,
     lastTs: turns.reduce((m, r) => Math.max(m, r.updatedAt), 0),

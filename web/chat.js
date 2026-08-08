@@ -149,6 +149,8 @@
     if (u.tools) bits.push(u.tools + ' 工具');
     var tok = (u.output || 0) + (u.input || 0);
     if (tok) bits.push(fmtTok(tok) + ' tok');
+    // 目录只取最后一段: 兄弟会话常常一个在主仓、一个在 worktree, 差别就在这一段。
+    if (t.cwd) bits.push('📁 ' + (t.cwd.replace(/\/+$/, '').split('/').filter(Boolean).pop() || t.cwd));
     // graph 驱动的会话单独标出来 —— 它的 userQuery 长得和真人消息一样, 不标就
     // 分不清是有人在跟它说话, 还是某个 run 在喂它。
     var g = t.origin
@@ -218,10 +220,20 @@
     }));
   };
 
+  // cwd 只显示尾部两段 —— 顶栏放不下全路径, 而"哪个项目/哪个 worktree"恰好就在
+  // 尾部; 全路径留在 title 里。~ 前缀在服务端不可知, 客户端也无从展开, 原样保留。
+  var shortCwd = function (p) {
+    var seg = String(p).replace(/\/+$/, '').split('/').filter(Boolean);
+    return seg.length <= 2 ? p : '…/' + seg.slice(-2).join('/');
+  };
+
   var topbar = function () {
     var t = curTag();
     $('#tb-em').textContent = t ? t.label : '💬';
     $('#tb-h').textContent = t ? (t.tag ? '#' + t.tag : 'default') : '';
+    var cwdEl = $('#tb-cwd');
+    cwdEl.hidden = !(t && t.cwd);
+    if (t && t.cwd) { cwdEl.textContent = '📁 ' + shortCwd(t.cwd); cwdEl.title = t.cwd; }
     $('#tb-sub').textContent = S.target;
   };
 

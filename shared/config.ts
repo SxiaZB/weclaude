@@ -127,8 +127,6 @@ const Mirror = z.object({
       // human glancing at the pane sees why it's there. The reply is swallowed —
       // never mirrored to chat, the detail store, or usage accounting.
       ping: z.string().default('keepalive — reply with just "pong", take no other action'),
-      // Push a one-line "KeepAlive · ~Nk" note to chat on each ping.
-      notify: z.boolean().default(true),
       // Stall recovery, gated PURELY by rule — never by the model's own judgment.
       // When the newest transcript turn is a synthetic API-error/limit line
       // ("API Error: Connection closed mid-response", "You've hit your session
