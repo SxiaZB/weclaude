@@ -17,7 +17,7 @@ import { computeUsage, renderUsageReport } from "./usage.js";
 import { computeAuditReport } from "./audit.js";
 import { syncProjectConfig, renderSyncReport } from "./cfg-sync.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
-import { tagOfKey, withTagHeader } from "../shared/session-label.js";
+import { tagOfKey, withTagHeader, parseTagHeader } from "../shared/session-label.js";
 
 // Chat-binding key: stable id for "this conversation thread". Used as
 // session-map key, mirror target, defaultChat. NOT used for auth.
@@ -310,9 +310,7 @@ const quoteToText = (q: QuoteContent): string => {
   if (q.msgtype === "file") return "[文件]";
   return "";
 };
-const renderQuotePrefix = (q: QuoteContent | undefined): string => {
-  if (!q) return "";
-  const body = quoteToText(q).trim();
+const renderQuotePrefix = (body: string): string => {
   if (!body) return "";
   // Quote each line so multi-line引用渲染整洁; trailing blank line separates
   // from the user's actual message.
@@ -326,11 +324,10 @@ const renderQuotePrefix = (q: QuoteContent | undefined): string => {
 // any punctuation/whitespace/markup churn while keeping content fidelity.
 const canonForCompare = (s: string): string => s.replace(/[^\p{L}\p{N}]/gu, "");
 
-const isLastResponseQuote = (target: string, quoted: string): boolean => {
-  const last = getLastResponse(target);
-  if (!last || !quoted) return false;
-  const a = canonForCompare(last);
-  const b = canonForCompare(quoted);
+/** `haystack` 里是否已包含 `needle`(两边都归一化后的子串匹配)。 */
+const canonContains = (haystack: string, needle: string): boolean => {
+  const a = canonForCompare(haystack);
+  const b = canonForCompare(needle);
   if (a.length < 4 || b.length < 6) return false; // too short — false-positive risk
   // Substring match (prefix subsumes; suffix covers tool-heavy turns where the
   // tracked `s.acc` interleaves tool entries before the final text). Both
@@ -339,41 +336,49 @@ const isLastResponseQuote = (target: string, quoted: string): boolean => {
   return a.includes(b);
 };
 
-const withQuote = (msg: BaseMessage, text: string): string => {
-  if (!msg.quote) return text;
-  // Drop the quote when the user is replying to wezard's most recent message
-  // in this chat — claude already has that turn in its context, surfacing it
-  // again is redundant noise. Older self-quotes still flow through (the user
-  // is genuinely pointing back to something earlier).
-  const quoted = quoteToText(msg.quote).trim();
-  if (isLastResponseQuote(chatPrincipal(msg), quoted)) return text;
-  const prefix = renderQuotePrefix(msg.quote);
-  return prefix ? `${prefix}${text}` : text;
+const isLastResponseQuote = (target: string, quoted: string): boolean =>
+  canonContains(getLastResponse(target) ?? "", quoted);
+
+// ── 引用即路由 ─────────────────────────────────────────────────────────
+// 群里要跟 `#fix` 说话,手打 tag 太慢 —— 直接引用它的气泡即可。每条出站气泡都
+// 带 `emoji #tag` 头 (withTagHeader),所以引用文本自带路由信息;用户自己发的
+// 行首 `#fix 干活` 同样算数(限行首,否则正文里随手写的 #123 会误判)。
+// `body` 是剥掉头/tag 后的净引用内容,用于跟目标 context 比对。
+const parseQuote = (q: QuoteContent | undefined): { tag: string; body: string } | null => {
+  const raw = q ? quoteToText(q).trim() : "";
+  if (!raw) return null;
+  const head = parseTagHeader(raw);
+  if (head.fromBot) return { tag: head.tag, body: head.body };
+  const m = TAG_RE.exec(raw);
+  return m && m.index === 0 ? { tag: m[2] ?? "", body: parseTag(raw).cleaned } : { tag: "", body: raw };
 };
 
-// Effective body for a text message.
-// - Normal: strip the bot @mention, attach any quote as a markdown context prefix.
-// - Pure-quote re-trigger: when the user adds NO new text and just quotes a
-//   message, promote the quoted message to the body (strip its @mention so
-//   "@wezard /usage" → "/usage" hits the command path). WeCom silently dedups
-//   identical text sends, so re-quoting the same command is the only way to
-//   re-fire it — this makes that work. Self-quotes of wezard's own last reply
-//   are excluded (would echo wezard's text back as a command).
-// Also extracts the leading `#tag` (if any) from the effective body; the
-// returned `text` has the tag stripped so command matchers see clean
-// "/new"/"/pwd"/etc.
-const resolveTextBody = (msg: TextMessage): { text: string; tag: string; promoted: boolean } => {
-  const body = maybeStripMentions(msg, msg.text?.content ?? "");
-  if (body.trim()) {
-    const { tag, cleaned } = parseTag(body);
-    return { text: withQuote(msg, cleaned), tag, promoted: false };
+// 一条入站消息的最终「投递目标 tag + 给 claude 的正文」。text / image / mixed
+// 三条路径共用,两条规则:
+//   1. 引用自带的 tag 决定投递目标;引用之外自己打的 `#tag` 优先级更高。
+//   2. 引用内容若已经在目标会话的 context 尾部,就只保留上面那层路由绑定、正文
+//      丢弃(重复贴回去纯属污染);不在则说明它是真载荷(跨会话转发 / 引同事的
+//      消息 / 目标已 `/clear`),照旧渲染成 markdown 引用块。
+// 纯引用不打字时,沿用旧的"把引用内容提成正文"重触发路径 —— 但同样只在内容不
+// 在目标上下文里时才有意义,否则那只是一次对该会话的空 nudge。
+const composeInbound = (
+  msg: BaseMessage,
+  rawBody: string,
+  inContext: (target: string, quoted: string) => boolean,
+): { text: string; tag: string; promoted: boolean } => {
+  const { tag: typed, cleaned } = parseTag(rawBody);
+  const q = parseQuote(msg.quote);
+  const tag = typed || q?.tag || "";
+  const consumed = !q || inContext(sessionKey(chatPrincipal(msg), tag), q.body);
+  if (cleaned.trim()) {
+    return { text: consumed ? cleaned : `${renderQuotePrefix(q.body)}${cleaned}`, tag, promoted: false };
   }
-  const quoted = msg.quote ? quoteToText(msg.quote).trim() : "";
-  if (quoted && !isLastResponseQuote(chatPrincipal(msg), quoted)) {
-    const { tag, cleaned } = parseTag(maybeStripMentions(msg, quoted).trim());
-    return { text: cleaned, tag, promoted: true };
+  if (q && !consumed) {
+    // 提成正文时也剥一次 @mention,让 "@wezard /usage" → "/usage" 命中命令路径。
+    const p = parseTag(maybeStripMentions(msg, q.body).trim());
+    return { text: p.cleaned, tag: p.tag || tag, promoted: true };
   }
-  return { text: withQuote(msg, body), tag: "", promoted: false };
+  return { text: cleaned, tag, promoted: false };
 };
 
 const isAllowed = (cfg: Config, principals: string[]): boolean => {
@@ -461,12 +466,13 @@ export const installInboundRouter = (
   // the user-facing one-line ack. When `who` carries a `#tag` suffix, use
   // the raw tag as the tmux window name so the pane shows readably in the
   // status bar (e.g. `#docs` → window `docs`, not the principal slug).
-  const spawnSession = async (who: string, cli?: CliBackendName, silent?: boolean): Promise<string> => {
-    if (!("newSession" in bridge)) return "[wezard] /new only available in mirror mode";
+  // On success there is NO reply: newSession already pushed the single
+  // "created + cwd" bubble. Only failures produce user-facing text.
+  const spawnSession = async (who: string, cli?: CliBackendName, silent?: boolean): Promise<{ err?: string }> => {
+    if (!("newSession" in bridge)) return { err: "[wezard] /new only available in mirror mode" };
     const tag = tagOf(who);
     const r = await bridge.newSession(who, tag || who, cli, { silent });
-    if (!r.ok) return `[wezard] /new failed: ${r.reason ?? "unknown"}`;
-    return `✅ 新会话已建立 \`${r.sessionId}\``;
+    return r.ok ? {} : { err: `[wezard] /new failed: ${r.reason ?? "unknown"}` };
   };
 
   // 同一 `#tag` 的两条消息会并发落进 gate,双双判定「未附着」→ 双 spawn,后者
@@ -482,14 +488,14 @@ export const installInboundRouter = (
   };
 
   // 显式 /new:排队但仍强制重开(用户就是要换一个)。
-  const autoSpawnAndAttach = (who: string, cli?: CliBackendName): Promise<string> =>
+  const autoSpawnAndAttach = (who: string, cli?: CliBackendName): Promise<{ err?: string }> =>
     serializeSpawn(who, () => spawnSession(who, cli));
 
   // 隐式建会话(裸 `#tag` 第一条消息):轮到自己时若前一条已经把会话建好,直接
   // 复用,不再 respawn —— 否则先到的消息会被注入进一个刚被杀掉的 pane。
-  const ensureSession = (who: string): Promise<string> =>
+  const ensureSession = (who: string): Promise<{ err?: string }> =>
     serializeSpawn(who, async () =>
-      "hasMirrorTarget" in bridge && bridge.hasMirrorTarget(who) ? "✅ 复用已建立的会话" : await spawnSession(who, undefined, true));
+      "hasMirrorTarget" in bridge && bridge.hasMirrorTarget(who) ? {} : await spawnSession(who, undefined, true));
 
   // Prefix user-visible daemon replies with `<emoji> #tag` when the routed
   // session is tagged, so a chat hosting multiple concurrent tagged sessions
@@ -631,8 +637,8 @@ export const installInboundRouter = (
     // very first message from a fresh user. When routed with a `#tag`, the
     // tag becomes both the mirror-store key and the tmux window name.
     if (isNewCommand(text)) {
-      const reply = await autoSpawnAndAttach(who, cliOfNewCommand(text));
-      await replyText(frame, msg, who, reply);
+      const { err } = await autoSpawnAndAttach(who, cliOfNewCommand(text));
+      if (err) await replyText(frame, msg, who, err);
       return { stop: true };
     }
     // 事件订阅 / 广播 / 定时已全部迁移到 MCP 工具(subscribe_topic /
@@ -748,14 +754,27 @@ export const installInboundRouter = (
     // to auto-spawn: this inbound becomes both the binding signal and the
     // first prompt — attach, then fall through to dispatch.
     if ("hasMirrorTarget" in bridge && !bridge.hasMirrorTarget(who)) {
-      const reply = await ensureSession(who);
-      if (!reply.startsWith("✅")) {
-        await replyText(frame, msg, who, reply);
+      const { err } = await ensureSession(who);
+      if (err) {
+        await replyText(frame, msg, who, err);
         return { stop: true };
       }
       // attached — fall through to dispatch
     }
     return { stop: false };
+  };
+
+  // 「引用内容是否已经在目标会话的 context 里」。两级:先查刚发出去的最后一条
+  // 气泡(内存,headless 模式也有);miss 再读目标会话 transcript 的尾部若干轮
+  // —— 引用的往往是几轮之前的气泡,只比对最后一条会漏。目标未挂载(尚未 attach /
+  // headless)时读不到 transcript,退化成"保留引用",宁可多给上下文。
+  const quoteInContext = (target: string, quoted: string): boolean => {
+    if (isLastResponseQuote(baseOfKey(target), quoted)) return true;
+    const mirrors = (bridge as { status?: () => { mirrors?: Array<{ target: string; jsonlPath: string }> } })
+      .status?.().mirrors ?? [];
+    const jsonl = mirrors.find((m) => m.target === target)?.jsonlPath;
+    if (!jsonl) return false;
+    return canonContains(tailTurns(jsonl, QUOTE_TAIL_TURNS).map((t) => t.text).join("\n"), quoted);
   };
 
   const send = async (frame: WsFrame<BaseMessage>, msg: BaseMessage, who: string, text: string, images: string[] = []): Promise<void> => {
@@ -770,7 +789,7 @@ export const installInboundRouter = (
   client.on("message.text", async (frame: WsFrame<TextMessage>) => {
     const msg = frame.body;
     if (!msg) return;
-    const { text, tag, promoted } = resolveTextBody(msg);
+    const { text, tag, promoted } = composeInbound(msg, maybeStripMentions(msg, msg.text?.content ?? ""), quoteInContext);
     const who = sessionKey(chatPrincipal(msg), tag);
     log.info({ msgid: msg.msgid, len: text.length, tag, hasQuote: !!msg.quote, promoted }, "rx text");
     const { stop } = await gate(frame, msg, text, who);
@@ -782,8 +801,10 @@ export const installInboundRouter = (
     const msg = frame.body;
     if (!msg) return;
     log.info({ msgid: msg.msgid, hasQuote: !!msg.quote }, "rx image");
-    // Images carry no text — always route to the chat's default session.
-    const who = chatPrincipal(msg);
+    // Images carry no text of their own — the quote (if any) is the only
+    // routing signal; without it they land on the chat's default session.
+    const { text, tag } = composeInbound(msg, "", quoteInContext);
+    const who = sessionKey(chatPrincipal(msg), tag);
     const { stop } = await gate(frame, msg, "", who);
     if (stop) return;
     const path = await downloadToInbox({ client, log, inboxDir }, msg.image.url, msg.image.aeskey, msg.msgid, 0);
@@ -795,7 +816,7 @@ export const installInboundRouter = (
     // each via macOS clipboard + Ctrl+V into the live TTY (matches Claude
     // Code's documented image paste flow → image content block, no Read tool
     // turn). Spawn-mode falls back to `@<path>` automatically.
-    await send(frame, msg, who, withQuote(msg, ""), [path]);
+    await send(frame, msg, who, text, [path]);
   });
 
   client.on("message.mixed", async (frame: WsFrame<MixedMessage>) => {
@@ -808,7 +829,7 @@ export const installInboundRouter = (
       .filter((it) => it.msgtype === "text")
       .map((it) => (it as { text?: { content?: string } }).text?.content ?? "")
       .join("\n");
-    const { tag } = parseTag(maybeStripMentions(msg, rawText));
+    const { tag } = composeInbound(msg, maybeStripMentions(msg, rawText), quoteInContext);
     const who = sessionKey(chatPrincipal(msg), tag);
     const { stop } = await gate(frame, msg, "", who);
     if (stop) return;
@@ -835,7 +856,7 @@ export const installInboundRouter = (
     // it was consumed by parseTag above; leaving it in would leak into Claude.
     const joined = texts.join("\n");
     const bodyForClaude = tag ? parseTag(joined).cleaned : joined;
-    await send(frame, msg, who, withQuote(msg, bodyForClaude), images);
+    await send(frame, msg, who, routeTag && !tag ? bodyForClaude : withQuote(msg, bodyForClaude), images);
   });
 
   // template_card_event is handled in approval module; no listener here.

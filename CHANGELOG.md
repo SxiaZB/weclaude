@@ -4,11 +4,18 @@
 
 ## [Unreleased]
 
+### Added
+- `keepalive`: stall 恢复,**纯规则判定、不让 model 自判**。transcript 末轮是 synthetic API-error/limit 行(`API Error: Connection closed mid-response` / `You've hit your session limit`),或空闲 pane footer 出现错误横幅 —— 判定某轮因限流/接口失败中途夭折,ping 改发 `resumePing`(直接“继续未完成的工作”)。新增 config `keepalive.resumeOnStall`(默认开)/ `keepalive.resumePing`;`transcriptStalled` / `paneIsStalled` 两个规则信号。
+- `inbound`: **引用即路由** —— 直接「引用」某个 `#tag` 会话的气泡来回复,等价于手打该 tag,消息投递到那个会话;且 quote 内容**不再进 prompt**(被引用的那条本就在目标会话自己的上下文里,重复贴入纯属污染)。识别依据是出站气泡的 `emoji #tag` 头(`parseTagHeader`),用户自己发的行首 `#tag` 消息同样可被引用。若自己另打了 `#other`,则视为“把这段转给别的会话”,quote 仍按原样作为上下文渲染。text / mixed 两条入站路径一致。
+- `keepalive`: ping 的 assistant 回复只要不是纯 "pong" 即视为 real activity —— 从 chat 里放行(un-swallow)整轮续跑内容,并重锚 `lastRealMs` / 重置 round 预算。据此“回复是 pong 还是其他内容”刷新真实输出时钟。
+
 ### Changed
+- `peers`: `keepaliveStamps` 判据从「紧跟 ping 的 assistant 回复一律算 keepalive」收窄为「仅纯 pong 算 keepalive」,配合 stall 恢复识别续跑;签名改收 `pingSigs: string[]`(同时匹配普通 ping 与 resume ping 的注入 user 行)。
 - `peers`: `/peers` 输出重排 —— 摘要文本剥掉 markdown 活跃字符(反引号/星号/竖线,来自 transcript 的原文会被 WeCom 渲染成代码块而撕裂排版),同值字段(项目目录 / CLI)上提到标题行,条目之间空行分隔。
 - `mirror`: 移除 `broadcastTo` 转发管道 —— `base#tag` 与 `base` 剥出来是同一个 WeCom chatid,节点自己的推送本就落在这个会话里,再广播一次纯属重复。
 
 ### Fixed
+- `mirror`: **`/clear` 轮换的会话认领必须可归属到本 pane**,否则拒绝认领。轮换后的 transcript 只有「首条 user 行是 `/clear`」这一个特征,每个 chat 的 `/clear` 都长这样;同一 project dir 下两个 chat 先后 `/clear` 时,先起的 watcher 会把后者刚轮换出来的会话抢走 —— 两个 chat 就此永久串线(还会写盘固化):A 的消息注进自己的 pane,产出却镜像到 B 的会话里。现在目录扫描只在「候选唯一 且 窗口内本目录没有别的 chat 也在 `/clear`」时才认领,否则退让给下一条注入的文本指纹(`armSilentForkRebind`,pane 级确定)来定位。`/clear` 的登记发生在 inject **之前**,以便更早武装的兄弟 watcher 能看见重叠。
 - `mirror`: `injectText` 成功后清除 `muteUntilInject` / `justSpawned`。graph 拉起的节点由 `newSession` 置静音、再由 `injectText` 注入,而清除静音只写在 WeCom dispatch 路径上 —— 结果 `onItem` 永远在静音分支早退,节点既不推气泡也不 `recordTurnStart`,在 chat 列表和 chat 详情里完全不存在。
 
 ## [1.2.15] - 2026-08-07

@@ -150,16 +150,19 @@ export const lastContextTokens = (jsonlPath: string): number => {
  *                the caller can fall back to mtime instead of judging all idle. */
 export const keepaliveStamps = (
   jsonlPath: string,
-  pingSig: string,
+  pingSigs: string[],
 ): { lastMs: number; lastRealMs: number; stamped: boolean } => {
   const turns = tailTurns(jsonlPath, 24);
   const norm = (s: string): string => s.replace(/\s+/gu, "");
   // Streak pings after the first are a bare "ping" (the full instruction is
-  // already in context) — match that exact form too, or a streak turn would
-  // read as REAL activity and re-anchor lastRealMs / reset the round counter.
+  // already in context); a stall-recovery ping carries a different instruction.
+  // Match every injected form (`pingSigs` = normalized prefixes of each) plus the
+  // bare "ping", or a keepalive user line would read as REAL activity and re-anchor
+  // lastRealMs / reset the round counter before the model has even replied.
   const isPing = (t: Turn): boolean =>
     t.role === "user" &&
-    ((pingSig.length > 0 && norm(t.text).includes(pingSig)) || norm(t.text).toLowerCase() === "ping");
+    (norm(t.text).toLowerCase() === "ping" ||
+      pingSigs.some((sig) => sig.length > 0 && norm(t.text).includes(sig)));
   const isPong = (t: Turn): boolean => t.role === "assistant" && norm(t.text).replace(/[^a-zA-Z]/g, "").toLowerCase() === "pong";
   let lastMs = 0;
   let lastRealMs = 0;
@@ -169,8 +172,11 @@ export const keepaliveStamps = (
     const ms = t.ms ?? 0;
     if (ms > 0) stamped = true;
     if (ms > lastMs) lastMs = ms;
-    const isKeepalive = isPing(t) || isPong(t) ||
-      (t.role === "assistant" && i > 0 && isPing(turns[i - 1]!));
+    // A ping USER line and a literal "pong" reply are keepalive noise. But an
+    // assistant reply to a ping that is NOT "pong" means the model resumed real
+    // work (stall recovery) — so it counts, re-anchoring lastRealMs. (This is why
+    // the old blanket "assistant-after-ping ⇒ keepalive" clause is gone.)
+    const isKeepalive = isPing(t) || isPong(t);
     if (ms > lastRealMs && !isKeepalive) lastRealMs = ms;
   }
   return { lastMs, lastRealMs, stamped };
@@ -201,6 +207,50 @@ export const paneIsBusy = (paneText: string): boolean =>
     .filter(Boolean)
     .slice(-FOOTER_ROWS)
     .some((l) => BUSY_MARKERS.some((re) => re.test(l)));
+
+// A turn that died mid-work leaves an error/limit banner and drops back to an
+// idle prompt (no spinner). This is the ONLY footer state where keepalive should
+// nudge the model to resume instead of just warming the cache. Not-busy is part
+// of the definition: a live auto-retry spinner is the CLI already recovering, so
+// we stay out of its way. Searched over a wider window than the spinner — the
+// error text can sit a few rows above the reclaimed input box.
+const STALL_MARKERS = [
+  /API Error/i, /request (failed|timed ?out)/i, /overloaded/i, /server error/i,
+  /rate.?limit/i, /usage limit/i, /too many requests/i, /quota/i,
+  /请求过多/, /限流|超过.{0,4}限制|额度不足|额度已/, /接口.{0,4}(失败|错误|超时)/, /连接(超时|中断|失败)/, /稍后.{0,4}重试/,
+];
+const STALL_ROWS = 16;
+export const paneIsStalled = (paneText: string): boolean => {
+  if (paneIsBusy(paneText)) return false;
+  return stripAnsi(paneText)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(-STALL_ROWS)
+    .some((l) => STALL_MARKERS.some((re) => re.test(l)));
+};
+
+// Session-log side of the same signal, and the more reliable one: Claude Code
+// writes a synthetic `<model>` assistant line when a turn dies — "You've hit your
+// session limit …", "API Error: Connection closed mid-response …". If the LAST
+// assistant turn is one of those, the turn died mid-work and nothing recovered
+// it. Gated on brevity (these are always short one-liners) so a long assistant
+// message merely *discussing* an error can't false-trigger.
+const STALL_TEXT_MARKERS = [
+  /^API Error/i, /hit your (session|usage) limit/i, /session limit/i, /usage limit/i,
+  /rate.?limit/i, /overloaded/i, /too many requests/i, /mid-(response|stream)/i,
+  /连接(超时|中断|失败)/, /请求过多/, /额度(不足|已)/, /稍后.{0,4}重试/,
+];
+export const transcriptStalled = (jsonlPath: string): boolean => {
+  const turns = tailTurns(jsonlPath, 4);
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i]!;
+    if (t.role !== "assistant") continue; // judge only the newest assistant turn
+    const txt = t.text.trim();
+    return txt.length > 0 && txt.length < 240 && STALL_TEXT_MARKERS.some((re) => re.test(txt));
+  }
+  return false;
+};
 
 /** Trim a captured pane to its last `rows` non-blank lines — the TUI pads the
  *  viewport with empties that would otherwise dominate a WeCom bubble. */

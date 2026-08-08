@@ -129,6 +129,15 @@ const Mirror = z.object({
       ping: z.string().default('keepalive — reply with just "pong", take no other action'),
       // Push a one-line "KeepAlive · ~Nk" note to chat on each ping.
       notify: z.boolean().default(true),
+      // Stall recovery, gated PURELY by rule — never by the model's own judgment.
+      // When the newest transcript turn is a synthetic API-error/limit line
+      // ("API Error: Connection closed mid-response", "You've hit your session
+      // limit"), or the idle pane footer shows an error banner, a turn died
+      // mid-work — so the ping carries `resumePing` (a plain "continue") INSTEAD
+      // of `ping`. Any non-"pong" reply to a ping is treated as a real turn
+      // (un-swallowed to chat, clocks re-anchored) — so a resumed session shows.
+      resumeOnStall: z.boolean().default(true),
+      resumePing: z.string().default('continue'),
     })
     .default({}),
 });
