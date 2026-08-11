@@ -64,6 +64,25 @@
     "enabled": true,
     "mode": "all",               // all = 每次调用都发卡；danger = 只有命中下面危险名单的才发卡，其余静默放行
     "matcher": ".*",             // 全量拦截；Bash 只读命令(grep/ls/cat/...)走脚本 fast-path
+    // Claude-Code 风格放行规则(语法子集): 命中的调用跳过发卡直接放行。与 matcher
+    // 的分工: matcher 按工具名圈定审批范围, allowRules 在范围内做细粒度豁免 ——
+    // 尤其 Bash 可按命令前缀区分(matcher 只认工具名做不到)。支持:
+    //   "Read" | "mcp__server" | "mcp__server__tool"
+    //   | "Bash(git status)" 精确 | "Bash(git log *)" 前缀(空格-星)
+    //   | "Bash(npm run test:*)" 前缀(冒号-星) | "Bash(python3 .claude/skills/*)"
+    // 安全语义: 复合命令(&&/;/|)逐段校验、段首 VAR= 前缀剥掉、含 $()/反引号不命中;
+    // AskUserQuestion / ExitPlanMode / EnterPlanMode 永不可被规则放行。
+    "allowRules": [],            // 例: ["Bash(git log *)", "Bash(python3 .claude/skills/*)"]
+    // 三层语义 deny > ask > allow, 对齐 Claude Code permissions:
+    // denyRules 命中直接拒绝不发卡(Bash 复合命令任一段命中即拒);
+    // askRules 命中必发卡, 压过 allowRules / ⏱自动放行窗口 / 会话缓存 —— 给
+    // 危险前缀兜底, 窗口开着也逐条确认。
+    // 完整判定链(下面的 danger 名单 = "出厂自带的 askRules", 与 askRules 同层):
+    //   denyRules → danger → askRules → allowRules → ⏱窗口 → sessionCache → 发卡
+    // 即: 再宽的 allowRules(如 "Bash(git *)")也不会让 danger 名单失效; 要豁免
+    // 危险判定只能用 danger.allowPatterns —— 那是唯一压得过名单的开关。
+    "denyRules": [],             // 例: ["Bash(rm -rf /*)", "Bash(mkfs *)"]
+    "askRules": [],              // 例: ["Bash(rm *)", "Bash(sudo *)", "Bash(git push *)"]
     "approvers": [],             // ["user:zhangsan"] empty → defaultChat
     "hookTimeoutSec": 43210,     // hook curl --max-time (12h + 10s)
     "longPollSec": 43200,        // daemon long-poll (12h)
