@@ -22,7 +22,8 @@ import {
   getWindowMeta,
 } from "./session-cache.js";
 import { redact } from "./redact.js";
-import { dangerOf, dangerModeSkips, dangerSkips, type DangerHit } from "./danger.js";
+import { dangerOf, dangerEarlyExit, type DangerHit } from "./danger.js";
+import { evaluateAllow, ruleMatchesAny } from "../shared/allow-rules.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
@@ -1374,11 +1375,12 @@ interface ApproveResp {
 
 const decisionToHook = (d: Decision): "allow" | "deny" => (d === "deny" ? "deny" : "allow");
 
-// 危险操作永不走 fallbackOnError:"allow" — 超时/断线时降级为 ask, 交回本地 CLI
-// 由人来确认, 而不是静默放行一次 rm。
-const fallback = (cfg: Config, reason: string, danger?: unknown): ApproveResp => ({
-  decision: danger && cfg.approval.fallbackOnError === "allow" ? "ask" : cfg.approval.fallbackOnError,
-  reason: danger ? `${reason}:danger` : reason,
+// 必发卡的请求 (危险名单 / askRules 命中) 永不走 fallbackOnError:"allow" —
+// 超时/断线时降级为 ask, 交回本地 CLI 由人来确认, 而不是静默放行一次 rm。
+// 只判 danger 的话, 用户自己配的 askRules 在 daemon 挂掉时反而失效。
+const fallback = (cfg: Config, reason: string, forceSingle?: unknown): ApproveResp => ({
+  decision: forceSingle && cfg.approval.fallbackOnError === "allow" ? "ask" : cfg.approval.fallbackOnError,
+  reason: forceSingle ? `${reason}:force_single` : reason,
 });
 
 interface ApprovalDeps {
@@ -1493,6 +1495,39 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
       return;
     }
 
+    // Claude-Code 三层规则语义: deny > ask > allow (语法同源, 见 allow-rules.ts)。
+    // denyRules: 命中直接拒, 不发卡 (Bash 复合命令任一段命中即拒)。
+    const denyHit = ruleMatchesAny(cfg.approval.denyRules, toolName, toolInput);
+    if (denyHit) {
+      log.info({ toolName, sessionId, rule: denyHit }, "deny-rule reject");
+      json(res, 200, { decision: "deny", reason: `deny_rule:${denyHit}` } satisfies ApproveResp);
+      return;
+    }
+    // askRules: 命中必发卡 — 压过 allowRules、自动放行窗口与会话缓存 (对齐
+    // Claude permissions.ask 的"即使 allowlist 命中也要确认"语义)。
+    const askHit = ruleMatchesAny(cfg.approval.askRules, toolName, toolInput);
+    if (askHit) log.info({ toolName, sessionId, rule: askHit }, "ask-rule force card");
+
+    // 危险名单 (daemon/danger.ts) 语义上是「出厂自带的 askRules」—— 所以它必须和
+    // 用户写的 askRules 站在同一层, 排在 allowRules 之前。放在后面的话, 一条
+    // `Bash(git *)` 这样的宽 allow 规则就能让整份危险名单失效。
+    const danger: DangerHit | undefined = dangerOf(cfg, toolName, toolInput);
+    if (danger) log.info({ toolName, sessionId, rule: danger.rule }, "danger hit — forcing single approval");
+
+    // 必发卡 = 危险名单 或 askRules 命中。两者都要压过放行 / 窗口 / 缓存。
+    const mustCard = Boolean(danger) || Boolean(askHit);
+
+    // allowRules: matcher 拦下的工具里再挖细粒度豁免 (Bash 可按命令前缀区分)。
+    // 交互卡工具 (AskUserQuestion / ExitPlanMode / EnterPlanMode) 在引擎内部硬
+    // 保护, 规则写了也不放行 —— 见 allow-rules.ts 的 NEVER_RULE_ALLOW。
+    const verdict = evaluateAllow(cfg.approval.allowRules, toolName, toolInput);
+    if (!mustCard && verdict.allowed) {
+      const ruleHit = [...new Set(verdict.hits)].join(" + ");
+      log.info({ toolName, sessionId, rule: ruleHit }, "allow-rule skip");
+      json(res, 200, { decision: "allow", reason: `allow_rule:${ruleHit}` } satisfies ApproveResp);
+      return;
+    }
+
     // EnterPlanMode: block model-initiated plan mode. deny + reason 回传 model,
     // 让它别进 plan mode、直接干活。用户仍可在本地 Shift+Tab 手动进 plan mode
     // (那条路径不过 hook)。由 config.approval.blockAutoPlanMode 控制(默认 true)。
@@ -1561,24 +1596,18 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
     // 检查跳过 (window 需要一个 chat 才存在), 走后面的 no_approver fallback。
     const approver = resolveApprover(cfg, sessionId, getMirrorTarget);
 
-    // 危险名单: 命中者跳过 auto-window / session cache / 批量合流, 每次都单独发卡。
-    const danger: DangerHit | undefined = dangerOf(cfg, toolName, toolInput);
-    if (danger) log.info({ toolName, sessionId, rule: danger.rule }, "danger hit — forcing single approval");
-
-    // danger.skip: 命中危险名单也直接放行 (跳过 danger)。
-    if (dangerSkips(cfg, danger)) {
-      json(res, 200, { decision: "allow", reason: "danger_skip" } satisfies ApproveResp);
-      return;
-    }
-
-    // danger 模式: 名单之外的调用不打扰人, 直接放行 (卡只留给真正危险的操作)。
-    if (dangerModeSkips(cfg, danger)) {
-      json(res, 200, { decision: "allow", reason: "danger_mode_skip" } satisfies ApproveResp);
+    // danger.skip / danger 模式的早退。第三个参数是「除 danger 外还有没有别的必发卡
+    // 理由」—— askRules 是用户显式配的强制审批, 不能被 danger 的开关顺带关掉。
+    const earlyExit = dangerEarlyExit(cfg, danger, Boolean(askHit));
+    if (earlyExit) {
+      log.info({ toolName, sessionId, reason: earlyExit }, "danger switch early exit");
+      json(res, 200, { decision: "allow", reason: earlyExit } satisfies ApproveResp);
       return;
     }
 
     // Auto-approve window: while active for THIS chat, requests short-circuit to allow.
-    if (!danger && approver && isAutoWindowActive(approver)) {
+    // mustCard (危险名单 / askRules) 的请求不吃窗口 — 即使开着 ⏱ 也逐条确认。
+    if (!mustCard && approver && isAutoWindowActive(approver)) {
       const remainSec = Math.ceil(autoWindowRemainingMs(approver) / 1000);
       log.info({ toolName, sessionId, chatKey: approver, remainSec }, "auto-window allow");
       json(res, 200, {
