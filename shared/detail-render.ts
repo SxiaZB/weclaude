@@ -446,6 +446,14 @@ const TURN_CSS = `
   .tg-cut .s{opacity:.6}
   .tg-cut.switch{color:#8c959f}
   .tg-cut.switch::before,.tg-cut.switch::after{border-top-color:#d0d7de}
+  /* ── graph 归因条 ── 与断点条同一视觉语法 (贯穿细线), 换成紫色: 断点讲"上下文",
+     归因讲"谁派的", 两者可以同时出现在一张卡片上, 必须一眼分得开。 */
+  .tg-graph{display:flex;align-items:center;gap:8px;font-size:11px;color:#6639ba;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.3px}
+  .tg-graph::after{content:"";flex:1;border-top:1px dashed #8250df66}
+  .tg-graph code{background:#8250df14;border-radius:4px;padding:0 4px}
+  .tg-graph .s{color:#8250df;opacity:.85}
+  .tg-graph .f{color:#8c959f}
 `;
 
 const renderJsonSection = (input: unknown): string =>
@@ -697,6 +705,16 @@ const renderCut = (r: TurnDetailRecord): string =>
       }</div>`
     : "";
 
+// 归因条: 这一轮不是人打的字。userQuery 长得和真人消息一模一样, 没有这一条就分不出
+// 「有人在跟 #fix 说话」和「graph 第 3 轮把 #review 的回复喂了过来」。
+const renderOrigin = (r: TurnDetailRecord): string => {
+  const o = r.origin;
+  if (!o) return "";
+  const from = o.fromTag ? ` <span class="f">← ${escHtml(`#${o.fromTag}`)}</span>` : "";
+  return `<div class="tg-graph"><span class="l">🕸 graph <code>${escHtml(o.runId)}</code></span>` +
+    `<span class="s">轮 ${o.round}/${o.rounds} · 步 ${o.step}/${o.steps}</span>${from}</div>`;
+};
+
 const renderTurnPage = (r: TurnDetailRecord): string => {
   const { items, bodies, done, ageMs } = turnParts(r);
   const statusBadge = done
@@ -827,6 +845,7 @@ const renderTurnPage = (r: TurnDetailRecord): string => {
 </head><body data-closed="${done ? "1" : "0"}"><div class="wrap">
 <header><h1><span class="accent">Turn Details</span></h1>${statusBadge}</header>
 ${renderCut(r)}
+${renderOrigin(r)}
 ${turnInfo}
 <div class="meta">${metaParts.map(escHtml).join('<span class="sep">·</span>')}</div>
 ${statsCard}
@@ -880,7 +899,7 @@ export const renderTurnGroup = (r: TurnDetailRecord, now = Date.now()): TurnFrag
   </div>`;
   // staleAt 只走 JSON, 绝不进 HTML —— 它跟着 updatedAt 变, 一旦计入 sig, SSE 的
   // "内容没变就不重发" 会彻底失效 (一个 turn 的 HTML 可以是几十 KB)。
-  const body = `<section class="turn-group${r.cut ? ` cut cut-${r.cut}` : ""}" data-key="t:${escHtml(r.id)}">${renderCut(r)}${head}<div class="bubbles">${inner}</div></section>`;
+  const body = `<section class="turn-group${r.cut ? ` cut cut-${r.cut}` : ""}${r.origin ? " graph" : ""}" data-key="t:${escHtml(r.id)}">${renderCut(r)}${renderOrigin(r)}${head}<div class="bubbles">${inner}</div></section>`;
   return {
     id: r.id, html: tagSig(body), sig: hashStr(body),
     createdAt: r.createdAt, updatedAt: r.updatedAt,

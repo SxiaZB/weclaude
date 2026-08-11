@@ -10,9 +10,9 @@
 
   // at / recvAt: 服务端快照时刻与本地收到时刻。所有"现在几点"的判断都换算到
   // 服务端时钟, 否则客户端时钟偏几分钟就会把运行中的会话判成已结束。
-  var S = { base: '', target: '', tags: [], at: 0, recvAt: 0, es: null, pinned: true };
+  var S = { base: '', target: '', tags: [], graphs: [], at: 0, recvAt: 0, es: null, pinned: true };
   var $ = function (s) { return document.querySelector(s); };
-  var thread = $('#thread'), tagsEl = $('#tags'), sbEl = $('#sb'), connEl = $('#conn');
+  var thread = $('#thread'), tagsEl = $('#tags'), sbEl = $('#sb'), connEl = $('#conn'), gbarEl = $('#gbar');
 
   var srvNow = function () { return S.at ? S.at + (Date.now() - S.recvAt) : Date.now(); };
 
@@ -149,8 +149,51 @@
     if (u.tools) bits.push(u.tools + ' 工具');
     var tok = (u.output || 0) + (u.input || 0);
     if (tok) bits.push(fmtTok(tok) + ' tok');
-    if (!bits.length) return '';
-    return '<div class="tag-meta">' + bits.map(esc).join('<span class="sep">·</span>') + '</div>';
+    // 目录只取最后一段: 兄弟会话常常一个在主仓、一个在 worktree, 差别就在这一段。
+    if (t.cwd) bits.push('📁 ' + (t.cwd.replace(/\/+$/, '').split('/').filter(Boolean).pop() || t.cwd));
+    // graph 驱动的会话单独标出来 —— 它的 userQuery 长得和真人消息一样, 不标就
+    // 分不清是有人在跟它说话, 还是某个 run 在喂它。
+    var g = t.origin
+      ? '<span class="gtag" title="由 graph ' + esc(t.origin.runId) + ' 驱动">🕸 ' + esc(t.origin.runId) + '</span>'
+      : '';
+    if (!bits.length && !g) return '';
+    return '<div class="tag-meta">' +
+      bits.map(esc).join('<span class="sep">·</span>') +
+      (g && bits.length ? '<span class="sep">·</span>' : '') + g +
+      '</div>';
+  };
+
+  // ── graph 运行条 ──
+  // 只画最近活跃的那一个 run: 同一 chat 同时跑两张图是罕见情形, 而两条并排的
+  // 流水线会把顶栏挤成一团 —— 宁可只讲清楚当前这一条。
+  var labelOfTag = function (tag) {
+    var hit = S.tags.filter(function (x) { return x.tag === tag; })[0];
+    return hit ? hit.label : '•';
+  };
+  var renderGraph = function () {
+    var g = (S.graphs || [])[0];
+    if (!g) { gbarEl.hidden = true; gbarEl.innerHTML = ''; return; }
+    // 与会话行同一判定: 服务端只给"到这个时刻自动算结束", 熄灯由本地定时判。
+    var run = isRunning(g);
+    var nodes = g.pipeline.map(function (p) {
+      var on = p.step === g.step;
+      return '<span class="nd' + (on ? ' on' : '') + (on && run ? ' live' : '') +
+        '" data-tag="' + esc(p.tag) + '" title="步 ' + p.step + '/' + g.steps + ' · #' + esc(p.tag) + '">' +
+        esc(labelOfTag(p.tag)) + ' ' + esc(p.tag ? '#' + p.tag : 'default') + '</span>';
+    }).join('<span class="arw">→</span>');
+    gbarEl.hidden = false;
+    gbarEl.innerHTML =
+      '<span class="gid" title="graph run">🕸 ' + esc(g.runId) + '</span>' +
+      '<span class="pipe">' + nodes + '</span>' +
+      '<span class="prog' + (run ? '' : ' done') + '">' +
+        (run ? '⟳ ' : '✓ ') + '轮 ' + g.round + '/' + g.rounds + '</span>';
+    gbarEl.querySelectorAll('.nd').forEach(function (n) {
+      n.onclick = function () {
+        var tag = n.getAttribute('data-tag');
+        var hit = S.tags.filter(function (x) { return x.tag === tag; })[0];
+        if (hit) select(hit.target);
+      };
+    });
   };
   var renderTags = function () {
     if (!S.tags.length) {
@@ -177,10 +220,20 @@
     }));
   };
 
+  // cwd 只显示尾部两段 —— 顶栏放不下全路径, 而"哪个项目/哪个 worktree"恰好就在
+  // 尾部; 全路径留在 title 里。~ 前缀在服务端不可知, 客户端也无从展开, 原样保留。
+  var shortCwd = function (p) {
+    var seg = String(p).replace(/\/+$/, '').split('/').filter(Boolean);
+    return seg.length <= 2 ? p : '…/' + seg.slice(-2).join('/');
+  };
+
   var topbar = function () {
     var t = curTag();
     $('#tb-em').textContent = t ? t.label : '💬';
     $('#tb-h').textContent = t ? (t.tag ? '#' + t.tag : 'default') : '';
+    var cwdEl = $('#tb-cwd');
+    cwdEl.hidden = !(t && t.cwd);
+    if (t && t.cwd) { cwdEl.textContent = '📁 ' + shortCwd(t.cwd); cwdEl.title = t.cwd; }
     $('#tb-sub').textContent = S.target;
   };
 
@@ -241,10 +294,10 @@
 
   // ── 线程 ──
   var applySummary = function (d) {
-    S.base = d.base; S.tags = d.tags || [];
+    S.base = d.base; S.tags = d.tags || []; S.graphs = d.graphs || [];
     S.at = d.at || Date.now(); S.recvAt = Date.now();
     $('#side-sub').textContent = d.base || '';
-    renderTags(); topbar(); renderStatus(curTag());
+    renderTags(); topbar(); renderStatus(curTag()); renderGraph();
   };
 
   var loadThread = function (target, limit) {
@@ -351,6 +404,7 @@
     if (!S.tags.length) return;
     renderTags();
     renderStatus(curTag());
+    renderGraph();
     expireTurns();
   }, TICK_MS);
 

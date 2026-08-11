@@ -33,11 +33,11 @@ import type { MirrorStore } from "./mirror-store.js";
 import { hasMirrorAskq, runMirrorAskqFlow, hasMirrorPlan, mootMirrorPlan, runMirrorPlanFlow } from "./approval.js";
 import { runTmux as runTmuxCmd, spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl, buildChatUrl } from "./detail.js";
-import type { CtxCut, TurnUsage } from "./detail.js";
+import type { CtxCut, TurnOrigin, TurnUsage } from "./detail.js";
 import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
 import { splitMarkdown } from "../shared/md-chunk.js";
 import { randomTip } from "./tips.js";
-import { stripAnsi, compactPane, paneIsBusy, summarizeTail, lastAssistantText, lastContextTokens, keepaliveStamps, type PeerInfo } from "./peers.js";
+import { stripAnsi, compactPane, paneIsBusy, paneIsStalled, transcriptStalled, summarizeTail, lastAssistantText, lastContextTokens, keepaliveStamps, tailTurns, renderDialog, type PeerInfo } from "./peers.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
 // with a stripped PATH that often lacks nvm / homebrew, breaking spawn(claudeBin).
@@ -1537,7 +1537,7 @@ export interface MirrorBridge {
    *  the user sees the full PreToolUse → approval card → assistant mirror
    *  loop end-to-end. Skips the live-stream/replyStream machinery — the tail
    *  pushes assistant output via the standalone path. */
-  injectText: (target: string, text: string) => Promise<{ ok: boolean; reason?: string }>;
+  injectText: (target: string, text: string, origin?: TurnOrigin) => Promise<{ ok: boolean; reason?: string }>;
   /** Send Esc to the live tmux pane bound to `target` — interrupts whatever
    *  Claude is currently doing (active generation / open prompt). No-op for
    *  spawn-mode attachments (no live TTY to interrupt).
@@ -1550,6 +1550,10 @@ export interface MirrorBridge {
     target: string,
     opts?: { teardown?: boolean },
   ) => Promise<{ ok: boolean; reason?: string; torndown?: number; escOk?: boolean; escReason?: string }>;
+  /** Tear the session down: Esc the pane, kill it, detach, and drop the
+   *  persisted binding so nothing resurrects it. The chat auto-spawns a fresh
+   *  session on its next message. */
+  killPane: (target: string) => Promise<{ ok: boolean; reason?: string }>;
   /** Send a bare Enter to the live tmux pane bound to `target` — confirms a
    *  prompt / press-enter-to-continue, or submits the input box as-is. No-op
    *  for spawn-mode attachments (no live TTY). */
@@ -1588,6 +1592,10 @@ export interface MirrorBridge {
   /** Live tmux pane tail of `target` — what that agent's terminal shows right
    *  now, including in-flight tool calls the transcript hasn't recorded yet. */
   peekPane: (target: string, rows?: number) => Promise<{ ok: boolean; reason?: string; pane?: string; busy?: boolean }>;
+  /** Last `n` turns of `target`'s conversation, read from its transcript. The
+   *  default way to observe a peer; `peekPane` is the fallback for a session
+   *  whose jsonl isn't bound/written yet. */
+  peekTurns: (target: string, n?: number) => Promise<{ ok: boolean; reason?: string; dialog?: string; busy?: boolean }>;
   /** Mid-turn check for one target. False for cold/dead panes (nothing running). */
   isBusy: (target: string) => Promise<boolean>;
   /** Latest assistant message of `target` — the handoff payload between agents. */
@@ -1680,11 +1688,23 @@ interface AttachState {
   /** 待记账的上下文断点 (`/clear` 注入 / `/new` 铸盘 / 观测到 /clear 轮换)。由下一次
    *  recordTurnStart 消费一次 —— 断点属于"断点之后的第一轮", 那才是读不到上文的一轮。 */
   ctxCut?: CtxCut;
+  /** 待记账的 graph 归因, 与 ctxCut 同一套路: injectText 盖章, 下一次 recordTurnStart
+   *  消费一次。带时间戳是因为注入未必真的开出一轮 (pane 死了 / 文本被吞), 陈旧的
+   *  印章若一直留着, 会把很久以后某条真人消息误标成 graph 派的。 */
+  pendingOrigin?: { origin: TurnOrigin; at: number };
   /** Set when `/clear` was injected: the next user prompt will land in a fresh
    *  jsonl with a new sessionId. A watcher polls the project dir to migrate
    *  this attachment onto the new file. Cleared once migration completes or
    *  the watcher times out. */
   migrationWatcher?: { cancel: () => void };
+  /** Armed alongside the `/clear` migration watcher. The dir-scan can only
+   *  identify a rotation by "new transcript whose first user line is /clear",
+   *  a signature EVERY chat's /clear produces — so when it can't attribute the
+   *  file to this pane it stands down and leaves the rebind to the next
+   *  inject's text fingerprint, which is pane-certain. `baseline` is the
+   *  pre-clear file list, so the fingerprint search only considers transcripts
+   *  born from that rotation. One-shot: consumed by the next inject. */
+  clearRebind?: { baseline: Set<string> };
   /** Per-turn outbound state machine. undefined ≡ IDLE (no active turn)
    *  / STREAMING (a.liveStream is the source of truth in that phase).
    *  Set on dispatch when outboundDeferMs > 0; cleared on promote/exit. */
@@ -1753,6 +1773,11 @@ interface AttachState {
    *  (cache-read snapshot) is routed here from the swallowed turn_usage items,
    *  so the timeline shows the ping happened and proves it was a cheap read. */
   keepaliveTurnId?: string;
+  /** Accumulates the letters of the in-flight ping's assistant reply. While it
+   *  stays a prefix of "pong" the turn is swallowed (a heartbeat); the moment it
+   *  diverges — real resumed work, or a tool_use — the turn is un-swallowed to
+   *  chat and the real-idle clock re-anchors. Reset to "" when a ping fires. */
+  keepalivePongBuf?: string;
 }
 
 // Mirror outbound state machine. See plan: defer stream open by N ms; flush
@@ -2290,9 +2315,19 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return cut;
   };
 
+  // graph 归因同样一次性: 一次注入只解释它开出的那一轮。超过 ORIGIN_TTL_MS 还没被
+  // 认领 = 那次注入没能开出 turn, 印章作废 —— 宁可少标一轮, 也不能把人打的字冒认成
+  // graph 派的 (归因错了比没有更糟)。
+  const ORIGIN_TTL_MS = 5 * 60_000;
+  const consumeOrigin = (a: AttachState): TurnOrigin | undefined => {
+    const p = a.pendingOrigin;
+    a.pendingOrigin = undefined;
+    return p && Date.now() - p.at <= ORIGIN_TTL_MS ? p.origin : undefined;
+  };
+
   const startBriefTurn = async (a: AttachState, frame: WsFrameHeaders, streamId: string, isSlash = false, userQuery = ""): Promise<void> => {
     const turnId = newTurnId();
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: userQuery.trim() || undefined, cut: consumeCut(a) });
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, cwd: a.runningCwd || undefined, userQuery: userQuery.trim() || undefined, cut: consumeCut(a), origin: consumeOrigin(a) });
     // hardTimer 兜底: turn 若无终句 / turn_end 收口 (卡死/漏收), 到点仍收气泡。
     const bubble: BriefBubble = { frame, streamId, hardTimer: undefined as unknown as NodeJS.Timeout, done: false };
     const q: QueuedTurn = { turnId, bubble, isSlash };
@@ -2335,7 +2370,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const turnId = newTurnId();
     const query = a.pendingBriefQuery?.replace(/^> ?/gm, "").trim();
     a.pendingBriefQuery = undefined;
-    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: query || undefined, cut: consumeCut(a) });
+    recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: query || undefined, cut: consumeCut(a), origin: consumeOrigin(a) });
     a.briefTurnId = turnId;
     a.briefBubble = undefined;
     a.briefIsSlash = false;
@@ -2590,6 +2625,24 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     a.keepaliveQuiet = undefined;
   };
 
+  // A reply is still a heartbeat while its letters remain a prefix of "pong"
+  // (covers streamed partials "p"/"po"/"pon" and trailing punctuation). Anything
+  // else means the model ignored the ping and resumed real work.
+  const pongPrefix = (s: string): boolean =>
+    "pong".startsWith(s.replace(/[^a-zA-Z]/g, "").toLowerCase());
+
+  // Stop swallowing the in-flight ping turn: close its heartbeat detail turn,
+  // lift the quiet window, and re-anchor the clocks to "real activity now" so the
+  // resumed work resets the round budget. The caller then falls through to the
+  // normal onItem path, letting this and the rest of the turn reach chat.
+  const releaseKeepalive = (a: AttachState): void => {
+    if (a.keepaliveTurnId) { recordTurnClose(a.keepaliveTurnId); a.keepaliveTurnId = undefined; }
+    endKeepaliveQuiet(a);
+    a.keepalivePongBuf = undefined;
+    if (a.keepalive) { a.keepalive.round = 0; a.keepalive.pinging = false; a.keepalive.settledAt = 0; a.keepalive.lastRealMs = Date.now(); }
+    log.info({ target: a.target, sessionId: a.sessionId }, "keepalive: reply diverged from pong — un-swallowing resumed turn");
+  };
+
   const onItem = (a: AttachState, item: RenderItem): void => {
     // 新 spawn 的 pane 在首次 inject 落地前吞掉所有初始输出 (greeting/system)。
     if (a.muteUntilInject) return;
@@ -2600,24 +2653,32 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // cache-read) — so the detail page shows the genuine heartbeat, not a
     // synthetic summary. Closed on the terminal signal (hard or soft turn_end).
     if (a.keepaliveQuiet) {
-      const id = a.keepaliveTurnId;
-      if (id) {
-        const now = Date.now();
-        if (item.kind === "text") {
-          recordTurnItem(id, { t: "text", body: item.body, ts: now, final: item.final === true });
-        } else if (item.kind === "tool_use") {
-          for (const c of item.calls) recordTurnItem(id, { t: "tool_use", toolUseId: c.toolUseId, toolName: c.name, toolInput: c.input, ts: now });
-        } else if (item.kind === "tool_result") {
-          recordTurnItem(id, { t: "tool_result", toolUseId: item.toolUseId, body: item.full, ts: now });
-        } else if (item.kind === "turn_usage") {
-          recordTurnUsage(id, { model: item.model, messageId: item.messageId, usage: item.usage });
-        } else if (item.kind === "turn_end") {
-          recordTurnClose(id);
-          a.keepaliveTurnId = undefined;
+      // Swallow only while the reply is consistent with a bare "pong". A text
+      // whose accumulated letters leave the "pong" prefix, or ANY tool_use (a
+      // heartbeat never calls tools), means the model resumed real work → release
+      // and fall through so the turn reaches chat instead of being hidden.
+      const nextBuf = item.kind === "text" ? (a.keepalivePongBuf ?? "") + item.body : (a.keepalivePongBuf ?? "");
+      const divergent = item.kind === "tool_use" || (item.kind === "text" && !pongPrefix(nextBuf));
+      if (!divergent) {
+        if (item.kind === "text") a.keepalivePongBuf = nextBuf;
+        const id = a.keepaliveTurnId;
+        if (id) {
+          const now = Date.now();
+          if (item.kind === "text") {
+            recordTurnItem(id, { t: "text", body: item.body, ts: now, final: item.final === true });
+          } else if (item.kind === "tool_result") {
+            recordTurnItem(id, { t: "tool_result", toolUseId: item.toolUseId, body: item.full, ts: now });
+          } else if (item.kind === "turn_usage") {
+            recordTurnUsage(id, { model: item.model, messageId: item.messageId, usage: item.usage });
+          } else if (item.kind === "turn_end") {
+            recordTurnClose(id);
+            a.keepaliveTurnId = undefined;
+          }
         }
+        if (item.kind === "turn_end") { endKeepaliveQuiet(a); a.keepalivePongBuf = undefined; }
+        return;
       }
-      if (item.kind === "turn_end") endKeepaliveQuiet(a);
-      return;
+      releaseKeepalive(a); // fall through to normal handling for this item
     }
     // 任何新 item 到达 = 上一条"消息写完了"并不代表这一轮结束 → 撤销待确认的软收口。
     // 硬信号 (end_turn / turn_duration) 的后端永远不会走到这里。
@@ -2840,6 +2901,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // Detach an attachment: finalize any live stream, stop the tail, drop from indexes.
   const detach = (a: AttachState, reason: string): void => {
     if (a.migrationWatcher) { a.migrationWatcher.cancel(); a.migrationWatcher = undefined; }
+    a.clearRebind = undefined;
     if (a.outbound?.kind === "deferred") clearTimeout(a.outbound.timer);
     a.outbound = undefined;
     if (a.softEnd) { clearTimeout(a.softEnd); a.softEnd = undefined; }
@@ -3159,6 +3221,25 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     }
   };
 
+  // Every `/clear` the daemon injects, keyed by the project dir it rotates in.
+  // Two chats mirroring panes in the SAME dir (the norm — one repo, many chats)
+  // both produce an indistinguishable post-clear transcript; whichever watcher
+  // ticks first would otherwise claim whichever file landed first and the two
+  // chats stay cross-wired forever (persisted to the store). Recorded BEFORE
+  // the inject so a sibling armed earlier still sees the overlap.
+  const CLEAR_WINDOW_MS = 5 * 60_000; // == migration watcher TIMEOUT_MS
+  const clearInjects: Array<{ dir: string; target: string; at: number }> = [];
+  const noteClearInject = (a: AttachState): void => {
+    const cut = Date.now() - CLEAR_WINDOW_MS;
+    for (let i = clearInjects.length - 1; i >= 0; i--) if (clearInjects[i]!.at < cut) clearInjects.splice(i, 1);
+    clearInjects.push({ dir: dirname(a.jsonlPath), target: a.target, at: Date.now() });
+  };
+  const siblingClearedSameDir = (a: AttachState): boolean => {
+    const cut = Date.now() - CLEAR_WINDOW_MS;
+    const dir = dirname(a.jsonlPath);
+    return clearInjects.some((r) => r.at >= cut && r.dir === dir && r.target !== a.target);
+  };
+
   // Post-/clear identification: claude rotates the session IMMEDIATELY on
   // /clear (not on next user input as the original design assumed) and writes
   // the `/clear` command itself as the first non-meta user line of the brand-
@@ -3290,11 +3371,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // (predicate = first user line is /clear; replay from 0) and dead-pane resume
   // (predicate = file has real user content; tail from EOF — the fork is seeded
   // with full history). `startOffset` flows through to migrateAttachment.
+  // `exclusive` (the /clear flavor) refuses to claim on ambiguous evidence —
+  // see claimIsAttributable.
   const startMigrationWatcher = (
     a: AttachState,
     baseline: Set<string>,
     isChild: (path: string) => boolean,
     startOffset?: number,
+    exclusive?: boolean,
   ): void => {
     if (a.migrationWatcher) a.migrationWatcher.cancel(); // re-armed (e.g. /clear twice, or respawn during a pending watch)
     const projectDir = dirname(a.jsonlPath);
@@ -3329,15 +3413,27 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const ranked = candidates
         .map((n) => ({ n, mtime: (() => { try { return statSync(join(projectDir, n)).mtimeMs; } catch { return 0; } })() }))
         .sort((x, y) => y.mtime - x.mtime);
-      for (const c of ranked) {
-        const p = join(projectDir, c.n);
-        if (isChild(p)) {
-          stopped = true;
-          a.migrationWatcher = undefined;
-          const newSid = c.n.replace(/\.jsonl$/, "");
-          if (newSid !== a.sessionId) migrateAttachment(a, newSid, p, startOffset);
-          return;
-        }
+      const matches = ranked.filter((c) => isChild(join(projectDir, c.n)));
+      // A `/clear` rotation is identified only by "first user line is /clear",
+      // which every chat's /clear produces — the file carries nothing tying it
+      // to a pane. So claim only on unambiguous evidence: exactly one match,
+      // and no sibling attachment in this dir cleared inside the same window.
+      // Otherwise stand down and let the next inject's text fingerprint decide
+      // (see armSilentForkRebind + a.clearRebind) — a wrong pick here would
+      // permanently wire this chat onto another chat's pane.
+      if (exclusive && matches.length > 0 && (matches.length > 1 || siblingClearedSameDir(a))) {
+        log.warn({ target: a.target, candidates: matches.map((c) => c.n) }, "mirror migration: ambiguous /clear rotation, deferring to inject fingerprint");
+        timer = setTimeout(tick, POLL_MS);
+        return;
+      }
+      const hit = matches[0];
+      if (hit) {
+        stopped = true;
+        a.migrationWatcher = undefined;
+        a.clearRebind = undefined;
+        const newSid = hit.n.replace(/\.jsonl$/, "");
+        if (newSid !== a.sessionId) migrateAttachment(a, newSid, join(projectDir, hit.n), startOffset);
+        return;
       }
       timer = setTimeout(tick, POLL_MS);
     };
@@ -3369,11 +3465,24 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   //      not our fork. A genuine TUI fork is a brand-new, unowned session.
   // The fingerprint itself is lengthened (and its min-length raised) so short /
   // common messages can't collide onto a stranger's transcript in the first place.
+  //
+  // It doubles as the resolver for a `/clear` rotation the dir-scan watcher
+  // refused to attribute (a.clearRebind): same mechanism, but the candidate set
+  // narrows to transcripts born after the clear, which makes a short
+  // fingerprint safe enough to accept.
   const armSilentForkRebind = (a: AttachState, text: string): void => {
-    if (a.migrationWatcher) return;                 // don't race an in-flight watcher
+    const pendingClear = a.clearRebind;
+    if (pendingClear) {
+      // Hand over: the fingerprint is pane-certain, the dir-scan is not.
+      a.migrationWatcher?.cancel();
+      a.migrationWatcher = undefined;
+      a.clearRebind = undefined;                    // one-shot — this inject is the evidence
+    } else if (a.migrationWatcher) {
+      return;                                       // don't race an in-flight watcher
+    }
     if (!a.tmuxPane) return;                         // spawn-mode: no pane to fork under
     const stripped = text.replace(/\s+/gu, "");
-    if (stripped.length < 16) return;               // too short to fingerprint safely
+    if (stripped.length < (pendingClear ? 4 : 16)) return; // too short to fingerprint safely
     const fp = stripped.slice(0, 120);              // long contiguous run → collision-resistant
     const dir = dirname(a.jsonlPath);
     const boundPath = a.jsonlPath;
@@ -3403,6 +3512,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       const boundName = boundPath.slice(dir.length + 1);
       const ranked = names
         .filter((n) => n !== boundName)
+        // Post-/clear: only transcripts that didn't exist before the rotation
+        // can be ours, which is what licenses the shorter fingerprint above.
+        .filter((n) => !pendingClear || !pendingClear.baseline.has(n))
         .map((n) => ({ n, m: (() => { try { return statSync(join(dir, n)).mtimeMs; } catch { return 0; } })() }))
         .sort((x, y) => y.m - x.m);
       for (const c of ranked) {
@@ -3485,6 +3597,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // the AI sets a new path but the user hasn't /new'd yet.
   const expandedDefaultCwd = expandHome(cfg.wrc.cwd);
 
+  // Long absolute paths wrap in the WeCom bubble — show only the trailing
+  // three segments, which is enough to identify the project.
+  const shortCwd = (p: string): string => p.split("/").filter(Boolean).slice(-3).join("/");
+
   const renderProjectInfo = (target: string): string => {
     const a = byTarget.get(target);
     const rec = a ? undefined : deps.store.get(target);
@@ -3493,9 +3609,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // in this chat, so read it from the shared base slot rather than the
     // caller's own (now-empty) attachment record.
     const pending = chatCwdFallback(target).pending;
-    const lines = [`📂 当前项目: \`${running}\``];
+    const lines = [`📂 cwd: \`${shortCwd(running)}\``];
     if (pending && pending !== running) {
-      lines.push(`下次切换: \`${pending}\` (使用 /new 或 /clear 生效)`);
+      lines.push(`下次切换: \`${shortCwd(pending)}\` (使用 /new 或 /clear 生效)`);
     }
     // Session-boundary footer — `/new` and `/clear` are the only two callers,
     // so the tip lands exactly once per fresh context, never mid-conversation.
@@ -3503,8 +3619,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return lines.join("\n");
   };
 
-  const pushProjectInfo = (target: string): void => {
-    const md = renderProjectInfo(target);
+  // `header` folds the caller's ack ("created") into this same bubble — /new
+  // must land as exactly ONE WeCom message, not card + separate reply.
+  const pushProjectInfo = (target: string, header?: string): void => {
+    const info = renderProjectInfo(target);
+    const md = header ? `${header}\n\n${info}` : info;
     const a = byTarget.get(target);
     if (a) {
       sendStandalone(a, md);
@@ -3635,7 +3754,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         if (baseRec?.pendingCwd) deps.store.set(base, { ...baseRec, pendingCwd: undefined });
       }
     }
-    if (!opts?.silent) pushProjectInfo(target);
+    if (!opts?.silent) pushProjectInfo(target, "created");
     return { ok: true, sessionId: r.sessionId, cwd: r.cwd };
   };
 
@@ -3787,6 +3906,20 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return { ok: true, pane: compactPane(raw, rows), busy: paneIsBusy(raw) };
   };
 
+  // Reading a peer's conversation is a transcript job, not a terminal job: the
+  // jsonl holds whole role-tagged messages, while a pane capture is ANSI-laden
+  // and clipped at the viewport edge. Only `busy` still comes from the pane.
+  const peekTurns = async (
+    target: string,
+    n = 6,
+  ): Promise<{ ok: boolean; reason?: string; dialog?: string; busy?: boolean }> => {
+    const jsonl = jsonlOf(target);
+    const busy = await isBusy(target);
+    if (!jsonl || !existsSync(jsonl)) return { ok: false, reason: "no transcript bound for target", busy };
+    const dialog = renderDialog(tailTurns(jsonl, n));
+    return dialog ? { ok: true, dialog, busy } : { ok: false, reason: "transcript has no turns yet", busy };
+  };
+
   // ── Prompt-cache keepalive ──────────────────────────────────────────
   // Anthropic's prompt cache expires ~5min after the last request. A pane that
   // goes idle (agent parked on a peer, background task running) lets the whole
@@ -3796,8 +3929,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // anchored to the last REAL (non-ping) activity, NOT to our own pings — so a
   // dead session is never kept warm forever, and once real work is older than
   // `maxIdleSec` we stop and let the cache die.
-  const fmtTokens = (n: number): string =>
-    n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
   // After `/stop`, ignore pane-busy as a resume signal for this long — long
   // enough for an in-flight ping (interrupted by the same /stop's Esc) to settle,
   // so it can't self-resume the pause. A genuine new turn after this window does.
@@ -3808,21 +3939,24 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // bump mtime without being a model turn, which would fake a long-dead session
   // back to "just active" and pin it in an endless ping loop. lastRealMs stays
   // anchored on genuine work, so the tick's realIdle guard can finally let it die.
-  const initKeepalive = (jsonlPath: string, mtime: number, pingSig: string): AttachState["keepalive"] => {
+  const initKeepalive = (jsonlPath: string, mtime: number, pingSigs: string[]): AttachState["keepalive"] => {
     let lastMs = 0;
     let lastRealMs = 0;
-    try { const s = keepaliveStamps(jsonlPath, pingSig); lastMs = s.lastMs; lastRealMs = s.lastRealMs; } catch { /* unreadable tail */ }
+    try { const s = keepaliveStamps(jsonlPath, pingSigs); lastMs = s.lastMs; lastRealMs = s.lastRealMs; } catch { /* unreadable tail */ }
     return { lastMs, lastRealMs, seenMtime: mtime, pinging: false, pingMtime: 0, round: 0, settledAt: 0 };
   };
 
-  const fireKeepalive = async (a: AttachState): Promise<void> => {
+  const fireKeepalive = async (a: AttachState, stalled: boolean): Promise<void> => {
     const kc = cfg.wrc.mirror.keepalive;
-    // Only the streak's FIRST ping carries the full instruction; consecutive
-    // pings shrink to a bare "ping" — the instruction is already in context,
-    // and the smaller delta means a smaller cache-write and less pane clutter.
-    // keepaliveStamps matches both forms, so the bare one never reads as real
-    // activity. (round is incremented below, after the inject lands.)
-    const text = (a.keepalive?.round ?? 0) > 0 ? "ping" : kc.ping;
+    // Stalled (error/limit banner + idle pane): send the full resume instruction
+    // every time — inviting the model to finish genuinely-unfinished work, or to
+    // reply "pong" if it was legitimately parked. Otherwise the plain warmer:
+    // only the streak's FIRST ping carries the full instruction; consecutive
+    // pings shrink to a bare "ping" (already in context — smaller cache-write,
+    // less pane clutter). keepaliveStamps matches every form, so none reads as
+    // real activity. (round is incremented below, after the inject lands.)
+    const text = stalled ? kc.resumePing : (a.keepalive?.round ?? 0) > 0 ? "ping" : kc.ping;
+    a.keepalivePongBuf = ""; // fresh reply accumulator for the swallow/release gate
     // Suppress the pane→WeCom echo of the ping user line, then swallow the whole
     // ping turn (reply included). The 60s fail-safe clears the quiet window if
     // the turn somehow never emits turn_end, so a later real turn is never muted;
@@ -3844,10 +3978,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       return;
     }
     const tokens = lastContextTokens(a.jsonlPath);
-    const size = tokens > 0 ? `~${fmtTokens(tokens)} tokens` : "未知";
-    const totalRounds = Math.max(1, kc.rounds);
     const round = a.keepalive ? (a.keepalive.round += 1) : 1;
-    log.info({ target: a.target, tokens, round, totalRounds }, "keepalive: ping injected");
+    log.info({ target: a.target, tokens, round, totalRounds: Math.max(1, kc.rounds) }, "keepalive: ping injected");
     // Open a chat-detail turn for the real heartbeat exchange: userQuery is the
     // actual ping we injected; the assistant reply (expected: just "pong"), any
     // tool calls, and usage are grafted on from the swallowed items in onItem;
@@ -3855,8 +3987,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const turnId = newTurnId();
     a.keepaliveTurnId = turnId;
     recordTurnStart({ id: turnId, target: a.target, sessionId: a.sessionId, userQuery: text });
-    if (kc.notify && (round === 1 || round === 3 || round === 6))
-      sendRaw(a, withLinkedTag(a, `KeepAlive ${round}/${totalRounds} · ${size}`, undefined, turnId));
   };
 
   let keepaliveTicking = false;
@@ -3867,7 +3997,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     try {
       const idleTriggerMs = Math.max(30, kc.ttlSec - kc.marginSec) * 1000;
       const ttlMs = kc.ttlSec * 1000;
-      const pingSig = normAssistant(kc.ping).slice(0, 40);
+      const pingSigs = [normAssistant(kc.ping).slice(0, 40), normAssistant(kc.resumePing).slice(0, 40)].filter((s) => s.length > 0);
       const now = Date.now();
       for (const a of byTarget.values()) {
         if (!a.tmuxPane) continue;                            // spawn-mode: no live pane to warm
@@ -3877,14 +4007,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         let mtime = 0;
         try { mtime = statSync(a.jsonlPath).mtimeMs; } catch { continue; }
         if (!mtime) continue;
-        const k = (a.keepalive ??= initKeepalive(a.jsonlPath, mtime, pingSig))!;
+        const k = (a.keepalive ??= initKeepalive(a.jsonlPath, mtime, pingSigs))!;
         // File mtime is only a cheap "did anything change → re-read the tail" gate.
         // The clocks themselves come from message turns, so metadata churn (which
         // bumps mtime but is not a turn) can never move them. `grewSinceLast` now
         // means a NEW message turn appeared — not that the file grew.
         const prevRealMs = k.lastRealMs;
         if (mtime > k.seenMtime + 1000) {
-          const s = keepaliveStamps(a.jsonlPath, pingSig);
+          const s = keepaliveStamps(a.jsonlPath, pingSigs);
           if (s.stamped) { k.lastMs = s.lastMs; k.lastRealMs = s.lastRealMs; }
           else { k.lastMs = mtime; k.lastRealMs = mtime; } // backend without timestamps → fall back to mtime
         }
@@ -3893,7 +4023,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // keepalive ping+pong advances lastMs but NOT lastRealMs, so the heartbeat
         // no longer reads as activity to itself (which was pinning round at 1/N).
         const grewSinceLast = k.lastRealMs > prevRealMs + 1000;
-        const busy = paneIsBusy(await capturePaneTail(a.tmuxPane, 12));
+        const paneTail = await capturePaneTail(a.tmuxPane, 16);
+        const busy = paneIsBusy(paneTail);
 
         if (k.pinging) {
           // Waiting for our own ping to land and settle: until a NEWER message turn
@@ -3921,9 +4052,14 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         if (idleSinceTouch < idleTriggerMs) continue;          // cache still comfortably warm
         if (idleSinceTouch >= ttlMs) continue;                 // cache already cold — a ping would cold-rewrite for nothing
         if (k.round >= kc.rounds) continue;                    // budget spent — let it go cold
+        // Stall recovery, decided by RULE only (no model self-judgment): the last
+        // transcript turn is a synthetic API-error/limit line, or the idle pane
+        // still shows an error banner ⇒ a turn died mid-work. Send the resume
+        // instruction instead of the plain warmer.
+        const stalled = kc.resumeOnStall && (transcriptStalled(a.jsonlPath) || paneIsStalled(paneTail));
         k.pinging = true;
         k.pingMtime = k.lastMs;                                // settles when a newer turn (the ping's own) appears
-        await fireKeepalive(a);
+        await fireKeepalive(a, stalled);
       }
     } catch (e) {
       log.warn({ err: (e as Error).message }, "keepalive tick failed");
@@ -3937,6 +4073,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     attach,
     peers,
     peekPane,
+    peekTurns,
     isBusy,
     lastText,
     status: () => {
@@ -4073,7 +4210,7 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // 队列内单条失败已在 sendStandalone 里 warn 过, 这里吞掉, 不阻塞发卡。
       }
     },
-    injectText: async (target, text) => {
+    injectText: async (target, text, origin) => {
       // Lazy restore, same as dispatch: a peer session that hasn't been talked
       // to in this process lifetime (or any session after a reload) has an empty
       // in-memory slot but a perfectly good persisted binding. Without this, an
@@ -4085,6 +4222,9 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // recentInjects dedupe (otherwise the user sees their own demo prompt
       // echoed back as a quoted bubble).
       rememberInject(text);
+      // 印章要早于 inject 落地 —— tail 是独立轮询的, 它可能在 inject 的 promise
+      // resolve 之前就看到 user 行并开出 turn, 那时归因必须已经在位。
+      if (origin) a.pendingOrigin = { origin, at: Date.now() };
       const sid = a.sessionId;
       const paneAlive = a.tmuxPane ? await tmuxPaneAlive(a.tmuxPane) : false;
       if (!paneAlive) {
@@ -4164,6 +4304,29 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // so keep the old strict contract.
       if (!opts?.teardown && !escOk) return { ok: false, reason: escReason };
       return { ok: true, torndown, escOk, escReason: escReason || undefined };
+    },
+    killPane: async (target) => {
+      // paneOf (not byTarget.get) so a binding surviving only in the persisted
+      // store — e.g. after a reload that couldn't re-attach — is still killable.
+      const a = byTarget.get(target);
+      const pane = a?.tmuxPane || paneOf(target);
+      if (!a && !pane) return { ok: false, reason: "no session bound to target" };
+      if (pane && (await tmuxPaneAlive(pane))) {
+        // Esc first, like /stop: a mid-generation CLI gets a beat to unwind and
+        // flush its transcript before the TTY is yanked out from under it.
+        await tmuxRun(["send-keys", "-t", pane, "Escape"]);
+        await sleepMs(250);
+        const r = await tmuxRun(["kill-pane", "-t", pane]);
+        if (r.code !== 0) return { ok: false, reason: `kill-pane failed: ${r.stdout.slice(-200) || r.code}` };
+      }
+      if (a) detach(a, "/kill");
+      // Drop the persisted record too — keeping it would let the next inbound
+      // resurrect this very session via the dead-pane `--resume` self-heal,
+      // which is the opposite of what /kill means. The chat then auto-spawns a
+      // fresh session on its next message.
+      deps.store.drop(target);
+      log.info({ target, sessionId: a?.sessionId, pane }, "mirror /kill — pane killed, binding dropped");
+      return { ok: true };
     },
     submitPane: async (target) => {
       const a = byTarget.get(target);
@@ -4330,6 +4493,10 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       // immediately — capturing baseline post-inject would already include it,
       // and the watcher would never see a "new" candidate (the bug this fixes).
       const preClearBaseline = armMigration ? listJsonls(dirname(a.jsonlPath)) : undefined;
+      // Registered here, not after the inject: the inject's paste verification
+      // can take ~10s, and a sibling chat's watcher armed earlier must already
+      // see this clear as an overlap by the time it evaluates a candidate.
+      if (armMigration) noteClearInject(a);
       // 记下断点, 由下一轮 (第一轮读不到上文的轮次) 领走。/clear 自己不建 turn,
       // 否则这次清空在 chat 详情里毫无痕迹, 前后两轮看着还是连续的。
       if (armMigration) a.ctxCut = "clear";
@@ -4511,7 +4678,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
         // feedback (the skip-stream path otherwise leaves WeCom silent).
         if (armMigration) {
           sendStandalone(a, `cleared\n\n${renderProjectInfo(a.target)}`);
-          startMigrationWatcher(a, preClearBaseline!, jsonlIsPostClearChild, 0);
+          a.clearRebind = { baseline: preClearBaseline! };
+          startMigrationWatcher(a, preClearBaseline!, jsonlIsPostClearChild, 0, true);
         }
         // Don't await the stream's lifetime — it stays open until next inbound
         // or hard timeout. Releasing the inject queue here lets the next

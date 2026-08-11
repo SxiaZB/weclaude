@@ -89,11 +89,39 @@ body { overflow: hidden; overscroll-behavior: none }
 }
 .topbar .em { font-size: 18px }
 .topbar .h { font-size: 15px; font-weight: 600; font-family: ui-monospace, Menlo, monospace }
+.topbar .cwd {
+  flex: none; font-size: 11px; color: #57606a; font-family: ui-monospace, Menlo, monospace;
+  background: #f6f8fa; border: 1px solid #eaeef2; border-radius: 5px; padding: 1px 6px;
+  max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .topbar .sub {
   font-size: 11px; color: #8c959f; font-family: ui-monospace, Menlo, monospace;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .topbar .back { display: none; font-size: 18px; color: #656d76; cursor: pointer; padding: 0 4px }
+
+/* ── graph 运行条 ───────────────────────────────────────────────────
+   一条线的流水线不值得画成节点图 —— steps 结构上不可能分叉, 画出来的永远是
+   一条直线。这里只把它压成一行: 步骤序列 + 当前停在哪一步 + 轮次进度。 */
+.gbar {
+  flex: none; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 7px 20px; background: #fbf9ff; border-bottom: 1px solid #8250df33;
+  font-size: 11.5px; color: #6639ba; font-family: ui-monospace, Menlo, monospace;
+}
+.gbar .gid { background: #8250df14; border-radius: 5px; padding: 1px 6px }
+.gbar .pipe { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; min-width: 0 }
+.gbar .nd {
+  display: flex; align-items: center; gap: 3px; padding: 1px 7px; border-radius: 10px;
+  background: #fff; border: 1px solid #d8cdf0; color: #57606a; cursor: pointer;
+}
+.gbar .nd:hover { border-color: #8250df }
+.gbar .nd.on { background: #8250df; border-color: #8250df; color: #fff; font-weight: 700 }
+.gbar .nd.on.live { animation: pulse 1.4s infinite }
+.gbar .arw { color: #b3a3d6 }
+.gbar .prog { margin-left: auto; font-variant-numeric: tabular-nums }
+.gbar .done { color: #8c959f }
+/* 侧栏里标出"这个会话是 graph 在驱动的" —— 否则它看着就是某个 tag 在自说自话。 */
+.tag-meta .gtag { color: #6639ba }
 
 .thread {
   flex: 1; min-height: 0; overflow-y: auto; overflow-anchor: none;
@@ -136,6 +164,8 @@ body { overflow: hidden; overscroll-behavior: none }
 .turn-group.cut-clear, .turn-group.cut-new {
   border-color: #d4a72c66; box-shadow: 0 1px 2px #1f23280a, 0 0 0 3px #d4a72c14;
 }
+/* graph 派的一轮: 卡片本身也着色, 滚动时不必读归因条就知道这不是人发的。 */
+.turn-group.graph { border-color: #8250df44 }
 
 /* ── 页脚总账 ───────────────────────────────────────────────────── */
 .statusbar {

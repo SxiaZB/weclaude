@@ -385,15 +385,15 @@ server.registerTool(
 server.registerTool(
   "peek_peer",
   {
-    title: "See what a sibling agent is doing right now",
+    title: "Read a sibling agent's conversation",
     description:
-      "Observe another agent in this chat WITHOUT interrupting it: returns the live tail of its terminal (tmux pane — shows in-flight tool calls and prompts that its transcript hasn't recorded yet), whether it is currently mid-turn (`busy`), and its most recent complete reply (`lastText`). Use this to answer '查看 #fix 的进展' or to decide whether a peer needs a nudge. Read-only and safe to poll.",
+      "Observe another agent in this chat WITHOUT interrupting it: returns `dialog` — the last N turns of its actual conversation, read from its session transcript, `▸` for what was asked and `◂` for what it answered — plus whether it is currently mid-turn (`busy`) and its most recent complete reply (`lastText`). This is the readable record of what that agent and whoever drives it have been saying; use it to answer '查看 #fix 的进展', '他们聊到哪了', or to decide whether a peer needs a nudge. If the peer has no readable transcript yet, `pane` falls back to its raw terminal tail. Read-only and safe to poll.",
     inputSchema: {
       tag: z.string().describe("The peer's tag WITHOUT '#', e.g. 'fix'. Empty string = the chat's default (untagged) session."),
-      rows: z.number().optional().describe("How many non-blank terminal lines to return (8-120, default 24)."),
+      turns: z.number().optional().describe("How many recent conversation turns to return (1-40, default 6)."),
     },
   },
-  async ({ tag, rows }) => unwrap("peek_peer", await daemonPost("/peers/peek", { tag, ...(rows ? { rows } : {}) })),
+  async ({ tag, turns }) => unwrap("peek_peer", await daemonPost("/peers/peek", { tag, ...(turns ? { turns } : {}) })),
 );
 
 server.registerTool(

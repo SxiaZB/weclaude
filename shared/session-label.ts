@@ -56,36 +56,38 @@ export const baseOfKey = (target: string): string => {
 /** Compose a session key from a base principal and a tag ("" → default session). */
 export const keyOf = (base: string, tag: string): string => (tag ? `${base}#${tag}` : base);
 
+// 出站气泡的头 (`🦊 #fix …` / 未打 tag 的 `🧙 …`) 是可被「引用」的路由信息:
+// 群里要跟某个 `#tag` 会话说话,引用它的气泡比手打 tag 快得多。这里做反向解析。
+// 头部 emoji 取自固定表 —— 用户消息以这些 emoji 开头且后接 `#tag` 的概率可忽略。
+// 分片序号 (`2/5`) 也属于头,一并吃掉 —— 留在 body 里会污染"引用内容是否已在
+// 目标 context 里"的比对。
+// 头有两种形态,都要认:裸 `🦊 #fix …`,以及 mirror 的 chat-detail 链接形态
+// `[🦊 #fix](https://…) …`(无 tag 时是 `[🧙](url)`)。链接里的 URL 若留在 body
+// 里,既污染比对又会被当成用户内容贴进 prompt。
+// 分片序号 (`2/5`) 与折叠气泡的 `← View chat details` 提示同理,一并算作头。
+const HEAD_EMOJI = [...ANIMALS, "🧙", "❔"];
+const EMO = `(?:${HEAD_EMOJI.join("|")})`;
+const TAG_PART = `(?:\\s+#([\\p{L}\\p{N}_-]{1,32}))?`;
+const HEADER_RE = new RegExp(
+  `^(?:\\[${EMO}${TAG_PART}\\]\\([^)]*\\)|${EMO}${TAG_PART})` +
+    `(?:\\s+\\d+/\\d+)?(?:\\s*←\\s*View chat details)?(?![\\p{L}\\p{N}_-])\\s*`,
+  "u",
+);
+
+/** 反解一条出站气泡的 `emoji #tag` 头,返回 tag 与剥头后的正文。
+ *  `fromBot=false` 表示这不是 wezard 发的,body 原样返回。 */
+export const parseTagHeader = (text: string): { fromBot: boolean; tag: string; body: string } => {
+  const t = text.trim();
+  const m = HEADER_RE.exec(t);
+  return m
+    ? { fromBot: true, tag: m[1] ?? m[2] ?? "", body: t.slice(m[0].length) }
+    : { fromBot: false, tag: "", body: t };
+};
+
 /** Trailing-space emoji badge for card titles; "" for untagged targets. */
 export const tagBadge = (target: string | undefined): string => {
   const tag = tagOfKey(target);
   return tag ? `${labelFor(tag)} ` : "🧙 ";
-};
-
-/** Every `#tag`-looking token in a quoted message, in order of appearance.
- *
- *  Feeds "引用继承 tag": quoting a message from a session and just typing should
- *  be the same as typing `#tag` yourself. Two shapes have to be recognized:
- *    • wezard's own replies — withTagHeader writes ``🦊 `#tag` `` as the first
- *      line, and WeCom's quote bubble sometimes keeps the backticks and
- *      sometimes strips them (it re-renders markdown unpredictably), so both
- *      sides of `#` allow a backtick.
- *    • the user's own earlier `#tag question` — plain space-delimited.
- *
- *  Deliberately looser than inbound's TAG_RE, and deliberately returns ALL
- *  candidates rather than just the first: the caller is expected to keep only
- *  tags whose session actually exists. Without that filter this would happily
- *  read `#include <stdio.h>` out of a quoted code block and spawn a session
- *  called "include"; with it, a stray `#word` is simply ignored. */
-const QUOTE_TAG_RE = /(?:^|\s|`)#([\p{L}\p{N}_-]{1,32})(?=`|\s|$)/gu;
-
-export const tagsInQuote = (quoted: string): string[] => {
-  const out: string[] = [];
-  for (const m of quoted.matchAll(QUOTE_TAG_RE)) {
-    const t = m[1];
-    if (t && !out.includes(t)) out.push(t);
-  }
-  return out;
 };
 
 /** Prefix markdown content with the `emoji \`#tag\`` header; identity when untagged.

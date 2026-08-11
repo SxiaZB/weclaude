@@ -4,11 +4,28 @@
 
 ## [Unreleased]
 
+### Added
+- `inbound`: `/kill` —— 结束会话并移除 pane。先 Esc(给 CLI 一拍收尾 transcript 的时间)再 `kill-pane`,随后 detach 并**丢掉持久化绑定**:留着的话下一条消息会走死 pane 的 `--resume` 自愈把它原地复活,与 `/kill` 语义相反。之后该聊天的下一条消息自动新开会话。与 `/stop` 一样按 `#tag` 路由(`/kill #docs` 只干掉那个兄弟会话)。
+- `chat details`: turn 记录带上运行时 `cwd`(取自 pane 的 `runningCwd`,而非全局 `wrc.cwd`),详情页两处呈现:顶栏 `📁 …/尾两段`(hover 出全路径)、侧栏会话行末尾 `📁 <目录名>`。同一 chat 的兄弟会话可以各跑各的目录(主仓 / worktree),不标出来光看 `#tag` 分不清谁在哪。
+- `keepalive`: stall 恢复,**纯规则判定、不让 model 自判**。transcript 末轮是 synthetic API-error/limit 行(`API Error: Connection closed mid-response` / `You've hit your session limit`),或空闲 pane footer 出现错误横幅 —— 判定某轮因限流/接口失败中途夭折,ping 改发 `resumePing`(直接“继续未完成的工作”)。新增 config `keepalive.resumeOnStall`(默认开)/ `keepalive.resumePing`;`transcriptStalled` / `paneIsStalled` 两个规则信号。
+- `inbound`: **引用即路由** —— 直接「引用」某个 `#tag` 会话的气泡来回复,等价于手打该 tag,消息投递到那个会话;且 quote 内容**不再进 prompt**(被引用的那条本就在目标会话自己的上下文里,重复贴入纯属污染)。识别依据是出站气泡的 `emoji #tag` 头(`parseTagHeader`,裸头与 chat-detail 链接头 `[🦊 #fix](url)` 两种形态都认,分片序号 / `← View chat details` 一并算作头),用户自己发的行首 `#tag` 消息同样可被引用。引用之外自己打的 `#tag` 优先级更高。配套规则:引用内容若**已在目标会话 context 尾部**(先比对最近一条出站气泡,miss 再归一化匹配目标 transcript 末 12 轮)则只保留这层路由绑定、正文丢弃;不在(跨会话转发 / 引同事的消息 / 目标已 `/clear`)才照旧渲染成引用块。text / image / mixed 三条入站路径统一走 `composeInbound`,图片消息因此也能被引用路由到 `#tag` 会话。
+- `keepalive`: ping 的 assistant 回复只要不是纯 "pong" 即视为 real activity —— 从 chat 里放行(un-swallow)整轮续跑内容,并重锚 `lastRealMs` / 重置 round 预算。据此“回复是 pong 还是其他内容”刷新真实输出时钟。
+
+- `chat details`: **graph 归因**。graph 注入的每一轮在 turn 记录上落一枚 `origin`(`runId` / 轮次 / 步序 / `fromTag`),随 `details.jsonl` 持久化 —— graph run 本身是内存态,一次 reload 就没了,归因必须自己过夜,否则重启后历史 turn 说不清是谁派的。三处呈现:turn 卡片顶部的紫色归因条(与上下文断点条并列,两者可同时出现)、侧栏会话行的 `🕸 runId` 徽标(区分「有人在跟 #fix 说话」和「graph 在喂它」)、以及主区顶部的运行条 `🕸 id · 🦊#fix → 🐢#review · ⟳ 轮 3/5`,当前步高亮、可点击跳转。**不画节点图**:`steps` 结构上不可能分叉,拓扑永远是一条线,画出来是纯装饰;真正有信息量的时间维度已经由 thread 承载。运行条的流水线从这些 `origin` 反推(`graphSummaries`),不依赖内存 run,svr 侧同样成立。
+
 ### Changed
+- `peers`: **peer 之间的对话改从 transcript 读,不再抓 tmux pane**。`peek_peer` 返回 `dialog` —— 目标会话最近 N 轮的真实对话(`▸` 问 / `◂` 答),来自它自己的 jsonl:整条消息(pane 会被视口截断)、无 ANSI / TUI 噪声、天然带 role。pane 只保留两个它独有的职责:`busy` 判定,以及 transcript 尚未可读(没绑定 / 刚 `/clear`)时的兜底 `pane` 字段。入参 `rows` → `turns`(1-40,默认 6)。新增 `renderDialog`(纯函数)/ `peekTurns`(bridge)。
+- `peers`: **agent↔agent 的问询与回复下发到 chat**。`send_peer` 注入成功后推一条 `<发起方> → <目标>` 气泡带原文,`wait_peer` 等到目标真正空闲后推一条 `<目标> → <发起方>` 带回复(超时不推 —— 半截的回答不是答案)。此前这些流量只发生在两个没人盯着的 pane 里。
+- `graph`: 步骤气泡带上流量本身 —— `▸` 本步注入的 prompt、`◂` 该节点的回复,而非只有 `2/6 ✅`。
+- `peers`: `keepaliveStamps` 判据从「紧跟 ping 的 assistant 回复一律算 keepalive」收窄为「仅纯 pong 算 keepalive」,配合 stall 恢复识别续跑;签名改收 `pingSigs: string[]`(同时匹配普通 ping 与 resume ping 的注入 user 行)。
 - `peers`: `/peers` 输出重排 —— 摘要文本剥掉 markdown 活跃字符(反引号/星号/竖线,来自 transcript 的原文会被 WeCom 渲染成代码块而撕裂排版),同值字段(项目目录 / CLI)上提到标题行,条目之间空行分隔。
 - `mirror`: 移除 `broadcastTo` 转发管道 —— `base#tag` 与 `base` 剥出来是同一个 WeCom chatid,节点自己的推送本就落在这个会话里,再广播一次纯属重复。
 
+### Removed
+- `keepalive`: 移除 KeepAlive 心跳通知(`keepalive.notify` 配置项及第 1/3/6 轮的 `KeepAlive n/N · ~Nk` 气泡)。保活是纯后台省钱动作,群里不需要看见;完整 ping/pong 仍留痕在 chat detail 时间线。
+
 ### Fixed
+- `mirror`: **`/clear` 轮换的会话认领必须可归属到本 pane**,否则拒绝认领。轮换后的 transcript 只有「首条 user 行是 `/clear`」这一个特征,每个 chat 的 `/clear` 都长这样;同一 project dir 下两个 chat 先后 `/clear` 时,先起的 watcher 会把后者刚轮换出来的会话抢走 —— 两个 chat 就此永久串线(还会写盘固化):A 的消息注进自己的 pane,产出却镜像到 B 的会话里。现在目录扫描只在「候选唯一 且 窗口内本目录没有别的 chat 也在 `/clear`」时才认领,否则退让给下一条注入的文本指纹(`armSilentForkRebind`,pane 级确定)来定位。`/clear` 的登记发生在 inject **之前**,以便更早武装的兄弟 watcher 能看见重叠。
 - `mirror`: `injectText` 成功后清除 `muteUntilInject` / `justSpawned`。graph 拉起的节点由 `newSession` 置静音、再由 `injectText` 注入,而清除静音只写在 WeCom dispatch 路径上 —— 结果 `onItem` 永远在静音分支早退,节点既不推气泡也不 `recordTurnStart`,在 chat 列表和 chat 详情里完全不存在。
 
 ## [1.2.15] - 2026-08-07

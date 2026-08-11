@@ -34,7 +34,7 @@ import {
   addSchedule,
   removeSchedulesByTopic,
 } from "./topics.js";
-import { baseOfKey, keyOf } from "../shared/session-label.js";
+import { baseOfKey, keyOf, withTagHeader } from "../shared/session-label.js";
 import {
   startGraph,
   stopRun,
@@ -425,19 +425,41 @@ const main = async (): Promise<void> => {
       json(res, 200, { ok: true, self, base: baseOfKey(self), peers });
     });
 
+    // Push a plain markdown bubble into a chat. `base` may carry a `#tag` — a
+    // tagged key strips down to the same WeCom chatid as its base.
+    const notifyChat = (base: string, markdown: string): void => {
+      const chatId = baseOfKey(base).replace(/^(user|chat|group):/, "");
+      void ws.client
+        .sendMessage(chatId, { msgtype: "markdown", markdown: { content: markdown } })
+        .catch((e: unknown) => log.warn({ err: (e as Error).message }, "chat notify failed"));
+    };
+    // Agent↔agent traffic is invisible to the human otherwise: it happens inside
+    // two panes nobody is watching. Relay each leg as its own bubble, headed
+    // `<from> → <to>` so the direction reads at a glance in the chat timeline.
+    const RELAY_MAX = 1200;
+    const relayPeer = (from: string, to: string, body: string): void => {
+      const text = body.trim();
+      if (!text) return;
+      const head = `${withTagHeader(from, "→")} ${withTagHeader(to, "")}`.trim();
+      notifyChat(from, `${head}\n${text.length > RELAY_MAX ? `${text.slice(0, RELAY_MAX)}…` : text}`);
+    };
+
     http.register("POST /peers/peek", async (req, res) => {
       const { self, body } = await readPeerBody(req);
       if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
       const target = peerTarget(self, body.tag ?? "");
-      const rows = Math.min(Math.max(Number((body as { rows?: number }).rows ?? 24) || 24, 8), 120);
-      const peek = await m.peekPane(target, rows);
-      // The pane may be gone (closed window) while the transcript survives —
-      // still answer with the last reply so the caller learns something.
+      const turns = Math.min(Math.max(Number((body as { turns?: number }).turns ?? 6) || 6, 1), 40);
+      // Transcript first — it is the conversation. Only when the peer has no
+      // readable jsonl (never attached, or `/clear`ed a moment ago) do we fall
+      // back to scraping its terminal.
+      const peek = await m.peekTurns(target, turns);
+      const pane = peek.ok ? undefined : await m.peekPane(target, 24);
       json(res, 200, {
         ok: true,
         target,
-        pane: peek.pane ?? "",
-        paneError: peek.ok ? undefined : peek.reason,
+        dialog: peek.dialog ?? "",
+        pane: pane?.pane ?? "",
+        error: peek.ok ? undefined : (pane?.reason ?? peek.reason),
         busy: peek.busy ?? false,
         lastText: m.lastText(target),
       });
@@ -453,6 +475,7 @@ const main = async (): Promise<void> => {
       // from — Claude Code queues it and the caller deadlocks waiting for itself.
       if (target === self) { json(res, 400, { ok: false, reason: "refusing to inject into the calling session itself" }); return; }
       const r = await m.injectText(target, text);
+      if (r.ok) relayPeer(self, target, text);
       json(res, r.ok ? 200 : 502, { ...r, target });
     });
 
@@ -463,7 +486,10 @@ const main = async (): Promise<void> => {
       if (target === self) { json(res, 400, { ok: false, reason: "refusing to wait on the calling session itself" }); return; }
       const timeoutMs = Math.min(Math.max(Number((body as { timeoutSec?: number }).timeoutSec ?? 900) || 900, 10), 7200) * 1000;
       const r = await waitForIdle(target, m.isBusy, timeoutMs, () => false);
-      json(res, 200, { ok: true, target, idle: r.idle, reason: r.reason, lastText: m.lastText(target) });
+      const lastText = m.lastText(target);
+      // Only a finished turn is a real answer; a timeout's tail is half-written.
+      if (r.idle) relayPeer(target, self, lastText);
+      json(res, 200, { ok: true, target, idle: r.idle, reason: r.reason, lastText });
     });
 
     // POST /handoff — 交接一个 pane 的会话给一个全新会话,原地完成。先让目标
@@ -624,15 +650,10 @@ const main = async (): Promise<void> => {
           const r = await m.newSession(target, node.tag, node.cli, { model: node.model, cwd: node.cwd, silent: true });
           return { ok: r.ok, reason: r.reason };
         },
-        send: (target, text) => m.injectText(target, text),
+        send: (target, text, origin) => m.injectText(target, text, origin),
         isBusy: m.isBusy,
         lastText: async (target) => m.lastText(target),
-        notify: (base, markdown) => {
-          const chatId = base.replace(/^(user|chat|group):/, "");
-          void ws.client
-            .sendMessage(chatId, { msgtype: "markdown", markdown: { content: markdown } })
-            .catch((e: unknown) => graphLog.warn({ err: (e as Error).message }, "graph notify failed"));
-        },
+        notify: notifyChat,
         log: graphLog,
       });
       json(res, 200, { ok: true, runId: run.runId, base: run.base, nodes: spec.nodes.length, steps: spec.steps.length, rounds: spec.rounds ?? 1 });

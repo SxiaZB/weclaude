@@ -76,6 +76,24 @@ export interface TurnUsage {
 //            这些路径上下文通常是延续的, 所以只中性地标"换过会话", 不宣称已清空。
 export type CtxCut = "clear" | "new" | "switch";
 
+// Graph 归因 —— 这一轮不是人打的字, 是 loop graph 某一轮的某一步注入的。
+// 必须落在 turn 记录里, 而不是只挂在 graph.ts 的内存 run 上: run 是 in-memory 的,
+// 一次 reload 就没了, 而 details 走 append-only JSONL —— 归因得跟着记录过夜, 否则
+// 重启后历史 turn 永远说不清自己是谁派的, 看着就是某个 tag 在自说自话。
+// pipeline 的全貌不存在这里: 同一 runId 的所有 turn 各自带着 (round, step, tag),
+// 合起来就能把步骤序列反推出来 (见 chat-view.graphSummaries), 不必逐轮冗余整张 spec。
+export interface TurnOrigin {
+  runId: string;
+  /** 1-based, 与 rounds 一起构成 "轮 3/5"。 */
+  round: number;
+  rounds: number;
+  /** 1-based step index within one round. */
+  step: number;
+  steps: number;
+  /** 上一步的 tag —— 它的回复正是本步 `{{last}}` 的内容; 整个 run 的第一步没有。 */
+  fromTag?: string;
+}
+
 export interface TurnDetailRecord {
   kind: "turn";
   id: string;
@@ -84,8 +102,10 @@ export interface TurnDetailRecord {
   closed: boolean;
   target?: string;
   sessionId?: string;
+  cwd?: string;        // 本轮运行时该 pane 的实际工作目录 (可能与 cfg.wrc.cwd 不同)
   userQuery?: string;  // 触发本轮的用户输入原文 (mirror 侧 dispatch 的 text)
   cut?: CtxCut;        // 本轮之前的上下文断点; undefined = 与上一轮同一上下文
+  origin?: TurnOrigin; // 本轮由 graph 注入; undefined = 人 (或 peer) 直接发起
   items: TurnItem[];
   model?: string;      // 首个见到的 model 名
   modelAlt?: number;   // 与 model 不同的后续行数, 用于渲染 "+N"
