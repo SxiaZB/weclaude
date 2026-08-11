@@ -255,6 +255,16 @@ const Approval = z.object({
   // 用于给危险前缀 (如 "Bash(rm *)", "Bash(git push *)") 兜底 — 即使 ⏱ 窗口开着
   // 也逐条确认, 语义对齐 Claude Code 的 permissions.ask。
   askRules: z.array(z.string()).default([]),
+  // `.claude/**` 写守卫 (见 shared/claude-config-path.ts): 这类改动会触发 Claude Code
+  // 自己的原生确认框, 而那个框**不经过 PreToolUse hook** —— 规则一放行就是"不发卡 +
+  // pane 无限期阻塞"的静默死锁。开启后: 命中的调用必发卡 (压过 allowRules / ⏱窗口 /
+  // 会话缓存), 用户点「允许」后 daemon 去 pane 上把那个框按掉 (只按一次性 Yes);
+  // 按不掉则 Esc 取消并把原因注入会话, 让模型改走实体路径。
+  // 仅对有活 tmux pane 的镜像会话生效 —— 本地会话用户自己按掉即可。
+  claudeConfigGuard: z.boolean().default(true),
+  // 批准后等原生确认框出现的最长时间 (ms)。CC 在 hook 返回后才渲染它, 轮询步进 200ms。
+  // 太短会误判成 no_modal (框随后才出现, 于是没人按, 退回死锁), 4s 覆盖实测抖动。
+  claudeConfigModalWaitMs: z.number().int().nonnegative().default(4000),
 });
 
 // sync.targets[].kind 的合法值。claude-internal / custom 等旧值自动 collapse

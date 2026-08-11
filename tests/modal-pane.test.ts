@@ -1,6 +1,6 @@
 // 单元测试: shared/modal-pane.ts — 运行: npx tsx tests/modal-pane.test.ts
 import assert from "node:assert";
-import { isModalPane } from "../shared/modal-pane.js";
+import { isModalPane, parseModalOptions, pickModalAnswer } from "../shared/modal-pane.js";
 
 let passed = 0;
 let failed = 0;
@@ -112,6 +112,70 @@ t("命中: 高亮项不是第一个 (> 变体 + 非首行选中)", () => {
 
 t("footer 大小写不敏感", () => {
   assert.equal(isModalPane(" ❯ 1. Yes\n\n ESC TO CANCEL").modal, true);
+});
+
+// ── 选项解析 + 代按挑选 ────────────────────────────────────────────────
+// 代按的前提是"只按用户已经在企微卡片上批准过的那一次调用的一次性同意"。
+// 这组用例守的就是这条边界: 挑不出裸 Yes、或框根本不是权限确认 → 一律放弃。
+t("parseModalOptions: 抽出编辑确认框的三个选项", () => {
+  const opts = parseModalOptions(EDIT_SETTINGS_CONFIRM);
+  assert.deepEqual(opts.map((o) => o.index), [1, 2, 3]);
+  assert.equal(opts[0]!.label, "Yes");
+  assert.equal(opts[0]!.selected, true);
+  assert.equal(opts[1]!.label, "Yes, and allow Claude to edit its own settings for this session");
+  assert.equal(opts[1]!.selected, false);
+});
+
+t("parseModalOptions: 屏上残留旧确认时只取最后一组", () => {
+  const pane = `
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+ ⎿  done
+
+ Do you want to make this edit to SKILL.md?
+ ❯ 1. Yes
+   2. Yes, and allow Claude to edit its own settings for this session
+   3. No
+
+ Esc to cancel`;
+  const opts = parseModalOptions(pane);
+  assert.equal(opts.length, 3);
+  assert.equal(opts[2]!.label, "No");
+});
+
+t("pickModalAnswer: 只挑一次性 Yes, 不挑放宽后续权限的选项", () => {
+  const v = isModalPane(EDIT_SETTINGS_CONFIRM);
+  const pick = pickModalAnswer(parseModalOptions(EDIT_SETTINGS_CONFIRM), v.title);
+  assert.equal(pick?.index, 1);
+  assert.equal(pick?.label, "Yes");
+});
+
+t("pickModalAnswer: 没有裸 Yes → 放弃 (plan review 的 'Yes, and …' 全家桶)", () => {
+  const pane = `
+ Would you like to proceed?
+ ❯ 1. Yes, and auto-accept edits
+   2. Yes, and manually approve edits
+   3. No, keep planning
+
+ Esc to cancel`;
+  assert.equal(pickModalAnswer(parseModalOptions(pane), isModalPane(pane).title), undefined);
+});
+
+t("pickModalAnswer: 非权限确认框 (如 /model 选择器) 一律不按", () => {
+  const pane = `
+ Select a model
+ ❯ 1. Yes
+   2. Opus 5
+
+ Esc to cancel`;
+  const v = isModalPane(pane);
+  assert.equal(v.modal, true);          // 是 modal
+  assert.equal(pickModalAnswer(parseModalOptions(pane), v.title), undefined); // 但不代按
+});
+
+t("pickModalAnswer: 标题缺失 → 放弃", () => {
+  assert.equal(pickModalAnswer([{ index: 1, label: "Yes", selected: true }], undefined), undefined);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
