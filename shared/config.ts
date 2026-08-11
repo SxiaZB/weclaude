@@ -242,6 +242,19 @@ const Approval = z.object({
   // 不过 hook)。默认 true。设 false 恢复原行为(允许模型自动进 plan mode)。
   blockAutoPlanMode: z.boolean().default(true),
   danger: Danger.default({}),
+  // Claude-Code 风格的放行规则 (语法子集见 shared/allow-rules.ts): 命中的调用
+  // 跳过发卡直接 allow。例:
+  //   "Bash(git log *)"  "Bash(python3 .claude/skills/*)"  "mcp__server__tool"
+  // matcher 决定哪些工具进入审批, allowRules 在其中再挖细粒度豁免 (对 Bash 可
+  // 按命令前缀区分, matcher 只认工具名做不到)。默认空 = 不豁免。
+  allowRules: z.array(z.string()).default([]),
+  // 同语法的拒绝规则: 命中直接 deny (不发卡, reason 回传给 model)。
+  // Bash 复合命令任一段命中即拒。优先级最高: deny > ask > allow。
+  denyRules: z.array(z.string()).default([]),
+  // 同语法的强制审批规则: 命中必发卡, 压过 allowRules / 自动放行窗口 / 会话缓存。
+  // 用于给危险前缀 (如 "Bash(rm *)", "Bash(git push *)") 兜底 — 即使 ⏱ 窗口开着
+  // 也逐条确认, 语义对齐 Claude Code 的 permissions.ask。
+  askRules: z.array(z.string()).default([]),
 });
 
 // sync.targets[].kind 的合法值。claude-internal / custom 等旧值自动 collapse
