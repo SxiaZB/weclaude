@@ -17,13 +17,18 @@ export interface PendingMeta {
    *  sessions bound to the same chat, not just the clicked one. */
   chatKey?: string;
   transcriptTail?: string;
-  /** 命中危险名单的规则名 (daemon/danger.ts)。非空 = 这张卡必须被人单独点,
-   *  永远不参与 allow_window 的批量放行。 */
+  /** 命中危险名单的规则名 (daemon/danger.ts)。仅用于卡片渲染 (⚠️ 标题 + 去掉
+   *  「全过」按钮); 「必须单独点」这一属性由 forceSingle 表达。 */
   danger?: string;
   /** 卡片已经真的发到 WeCom 上了 (flushBatch 成功)。只有这种 pending 在 reload
    *  drain 时值得让 hook 续接 —— 卡还挂在聊天里, 重启后同 reqId 重新挂起即可复用。
    *  没发出去的卡续接就是让 hook 空等一个永远不会有人点的东西。 */
   cardSent?: boolean;
+  /** 这张卡必须被人单独点: 不参与 allow_window 的批量放行 (resolvePendingsByChat
+   *  sweep), 也不与其它请求合流成批量卡。来源有三 —— 危险名单 / askRules /
+   *  `.claude/**` 写守卫 (approval.ts 的 mustCard)。三者语义相同, 用一个字段
+   *  统一表达: 只挂 danger 的话, askRules 与守卫的卡会被别的卡的「⏱全过」顺手扫掉。 */
+  forceSingle?: boolean;
 }
 
 interface Pending {
@@ -168,9 +173,10 @@ export const resolvePendingsByChat = (
   for (const [reqId, p] of store.entries()) {
     if (reqId === excludeReqId) continue;
     if (p.meta.kind !== "approval") continue;
-    // 危险卡不在 sweep 覆盖范围: 用户点的是「N 分钟全过」, 那是对常规操作的
-    // 授权, 不能顺手把一条 rm -rf 也放行了。
-    if (p.meta.danger) continue;
+    // 必发卡不在 sweep 覆盖范围: 用户点的是「N 分钟全过」, 那是对常规操作的
+    // 授权, 不能顺手把一条 rm -rf / 一条 askRules 命中 / 一次 `.claude/**` 写
+    // 也放行了 —— 那三类的全部意义就是"每次都要单独看一眼"。
+    if (p.meta.forceSingle) continue;
     if (!p.meta.chatKey || baseOfKey(p.meta.chatKey) !== base) continue;
     hits.push({ reqId, meta: p.meta });
   }
