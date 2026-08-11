@@ -25,6 +25,9 @@
 - `keepalive`: 移除 KeepAlive 心跳通知(`keepalive.notify` 配置项及第 1/3/6 轮的 `KeepAlive n/N · ~Nk` 气泡)。保活是纯后台省钱动作,群里不需要看见;完整 ping/pong 仍留痕在 chat detail 时间线。
 
 ### Fixed
+- `mirror`: **tmux 调用全部收敛到一条 exec 路径并加硬超时**(`TMUX_TIMEOUT_MS`,默认 10s,`WEZARD_TMUX_TIMEOUT_MS` 可调,0 关闭)。此前 daemon 里有三份手写的 `spawn("tmux", …)`(`spawn-tmux.runTmux`、`mirror-bridge` 模块级 `tmuxRun`、`startMirror` 内又一个同名局部 `tmuxRun` 遮蔽了它),全部无超时:tmux server 一旦卡住,调用方永久 pending 且零日志 —— 一条入站消息建了 pane,随后 `tmuxPaneAlive` 再也不返回,该会话的 inject 队列被僵尸 job 锁住,那个聊天从此彻底静默,只能重启 daemon。现在三处合一,超时用 `SIGKILL`(卡在 wedged server 上的 tmux client 不理 `SIGTERM`)并以普通失败态 resolve,所有现存 `if (!r.ok)` 分支照旧生效;超时必留痕,由 daemon 启动时注入的 reporter 打 `warn`。`load-buffer -` 这类 stdin 变体一并走同一路径。
+- `mirror`: **inject job 加 watchdog**(`INJECT_JOB_TIMEOUT_MS`)。job 链上每个 `await` 原本都是无界的,超时后队列不再释放;现在到点释放队列、告知用户,并 bump `injectGen` 让僵尸 job 醒来后不再往 pane 里贴。job 起手先打一行 `inject job start`,下次卡住能定位到具体步骤。
+- `mirror`: **`/stop` 改为先收口、后 Esc**。旧实现先探 pane、探不到就早退 —— 而 tmux 本身就是卡住的那一环时,用户手上留着一个关不掉的 `…` 气泡和一条谁也过不去的 inject 队列。现在先做与 tmux 无关的部分(bump `injectGen`、清 inject 队列、收掉所有挂起气泡/stream),再尽力 Esc;Esc 失败只报告不致命,并带上收了几个气泡。只想按 Esc 的调用方(不传 `opts`)行为不变。
 - `mirror`: **`/clear` 轮换的会话认领必须可归属到本 pane**,否则拒绝认领。轮换后的 transcript 只有「首条 user 行是 `/clear`」这一个特征,每个 chat 的 `/clear` 都长这样;同一 project dir 下两个 chat 先后 `/clear` 时,先起的 watcher 会把后者刚轮换出来的会话抢走 —— 两个 chat 就此永久串线(还会写盘固化):A 的消息注进自己的 pane,产出却镜像到 B 的会话里。现在目录扫描只在「候选唯一 且 窗口内本目录没有别的 chat 也在 `/clear`」时才认领,否则退让给下一条注入的文本指纹(`armSilentForkRebind`,pane 级确定)来定位。`/clear` 的登记发生在 inject **之前**,以便更早武装的兄弟 watcher 能看见重叠。
 - `mirror`: `injectText` 成功后清除 `muteUntilInject` / `justSpawned`。graph 拉起的节点由 `newSession` 置静音、再由 `injectText` 注入,而清除静音只写在 WeCom dispatch 路径上 —— 结果 `onItem` 永远在静音分支早退,节点既不推气泡也不 `recordTurnStart`,在 chat 列表和 chat 详情里完全不存在。
 

@@ -654,8 +654,18 @@ export const installInboundRouter = (
     // currently doing. Mirror-mode only; bails cleanly when no attachment.
     if (isStopCommand(text)) {
       if ("interruptPane" in bridge) {
-        const r = await bridge.interruptPane(who);
-        if (!r.ok) await replyText(frame, msg, who, `[wezard] /stop failed: ${r.reason ?? "unknown"}`);
+        // teardown: /stop is the user's "shut this up" button, so it must also
+        // close hanging bubbles and free the inject queue — not just press Esc.
+        // Stay silent on a clean stop (the pane going quiet IS the receipt);
+        // only speak up when a half actually failed — a live pane that refuses
+        // Esc is a very different situation from a chat merely stuck on a bubble.
+        const r = await bridge.interruptPane(who, { teardown: true });
+        if (!r.ok) {
+          await replyText(frame, msg, who, `[wezard] /stop failed: ${r.reason ?? "unknown"}`);
+        } else if (!r.escOk) {
+          const torndown = r.torndown ? ` · 已收口 ${r.torndown} 个挂起气泡` : "";
+          await replyText(frame, msg, who, `⚠️ Esc 未送达（${r.escReason ?? "unknown"}）${torndown} · 保活已暂停`);
+        }
       }
       return { stop: true };
     }
