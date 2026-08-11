@@ -25,6 +25,7 @@
 - `keepalive`: 移除 KeepAlive 心跳通知(`keepalive.notify` 配置项及第 1/3/6 轮的 `KeepAlive n/N · ~Nk` 气泡)。保活是纯后台省钱动作,群里不需要看见;完整 ping/pong 仍留痕在 chat detail 时间线。
 
 ### Fixed
+- `mirror`: **拒绝往 modal 状态的 CLI picker 里注入**。权限确认框 / `/model` 选择器 / plan review 这类 modal 会把粘贴进去的文本吃掉,并把随后的 Enter 读成「确认当前高亮项」—— 一条 WeCom 消息就此丢失,同时替用户点掉了一个他没看到的确认框。最典型的触发场景:编辑 `.claude/**` 下任何文件都会让 Claude Code 立起它自己的「allow Claude to edit its own settings」确认,而那个框**不过 PreToolUse hook**,daemon 完全不知情,pane 就一直阻塞在那里。现在注入前先 `capture-pane -p` 看一屏,判定为 modal 就带标题原因返回失败(消息不丢,用户可去 tmux 处理或 `/stop` 后重发)。判定放在**按后端分流之前** —— 每个 CLI 后端都有自己的原生确认框,放到分流之后只保护得住 claude 一家;图片注入路径同样先过这道判定。判据刻意保守:必须同时出现「编号选项行」与「`Esc to cancel` footer」两个信号才算 modal(误判会挡住正常消息,比漏判一个冷门布局更糟);capture 只取当前屏、不进 scrollback(用户答完的旧确认会永远留在 scrollback 里,带上它会把镜像永久堵死)。逃生开关 `WEZARD_MODAL_GUARD=0`。
 - `mirror`: **`/clear` 轮换的会话认领必须可归属到本 pane**,否则拒绝认领。轮换后的 transcript 只有「首条 user 行是 `/clear`」这一个特征,每个 chat 的 `/clear` 都长这样;同一 project dir 下两个 chat 先后 `/clear` 时,先起的 watcher 会把后者刚轮换出来的会话抢走 —— 两个 chat 就此永久串线(还会写盘固化):A 的消息注进自己的 pane,产出却镜像到 B 的会话里。现在目录扫描只在「候选唯一 且 窗口内本目录没有别的 chat 也在 `/clear`」时才认领,否则退让给下一条注入的文本指纹(`armSilentForkRebind`,pane 级确定)来定位。`/clear` 的登记发生在 inject **之前**,以便更早武装的兄弟 watcher 能看见重叠。
 - `mirror`: `injectText` 成功后清除 `muteUntilInject` / `justSpawned`。graph 拉起的节点由 `newSession` 置静音、再由 `injectText` 注入,而清除静音只写在 WeCom dispatch 路径上 —— 结果 `onItem` 永远在静音分支早退,节点既不推气泡也不 `recordTurnStart`,在 chat 列表和 chat 详情里完全不存在。
 

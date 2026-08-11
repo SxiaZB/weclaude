@@ -28,9 +28,10 @@ import {
   projectDirsFor,
   type NormalizedTranscriptLine,
 } from "../shared/cli-backends.js";
+import { isModalPane, type ModalPaneVerdict } from "../shared/modal-pane.js";
 import type { MirrorStore } from "./mirror-store.js";
 import { hasMirrorAskq, runMirrorAskqFlow, hasMirrorPlan, mootMirrorPlan, runMirrorPlanFlow } from "./approval.js";
-import { spawnTmuxClaude } from "./spawn-tmux.js";
+import { runTmux as runTmuxCmd, spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl, buildChatUrl } from "./detail.js";
 import type { CtxCut, TurnOrigin, TurnUsage } from "./detail.js";
 import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
@@ -1121,6 +1122,28 @@ const extractPaneAssistantTail = (pane: string): string => {
   return text.length >= 12 ? text : "";
 };
 
+// Is the pane sitting on a modal picker that would eat an injection?
+//
+// Deliberately NOT capturePaneTail: that one passes `-S -N`, which reaches
+// into the scrollback. A confirm the user already answered lives in the
+// scrollback forever, so a scrollback-inclusive capture would keep matching it
+// long after the pane went back to accepting input — wedging the mirror shut
+// permanently. Bare `-p` captures only what is currently on screen.
+//
+// Trailing blank rows are trimmed first so the 15-row window lands on the
+// bottom-most *content* (a picker's footer is its last line); 15 rows spans
+// "title → options → footer" on every confirm layout we've seen.
+const MODAL_SCAN_ROWS = 15;
+// `screen` = 实际参与判定的那一屏文本, 一并返回给调用方做选项解析 —— 再 capture
+// 一次会拿到"下一瞬间"的屏幕, 与 verdict 不同源(框可能已被本地按掉), 按键就按错了。
+const detectModalPicker = async (target: string): Promise<ModalPaneVerdict & { screen: string }> => {
+  const r = await tmuxRun(["capture-pane", "-t", target, "-p"]);
+  if (!r.ok) return { modal: false, screen: "" };
+  const lines = r.stdout.replace(/\s+$/u, "").split("\n");
+  const screen = lines.slice(-MODAL_SCAN_ROWS).join("\n");
+  return { ...isModalPane(screen), screen };
+};
+
 // Two fingerprints, derived from different ends of `text`:
 //   headFp — first 8 non-ws chars; used for "did paste land" against a wide
 //     window because long pastes wrap and the head sits near the top of the
@@ -1145,6 +1168,25 @@ const fingerprints = (text: string): { headFp: string; tailFp: string } => {
 //   4. on stuck-after-Enter, retry Enter once with extra settle.
 const injectViaTmux = async (target: string, text: string, images: string[], log: Logger, freshSpawn: boolean, backendName: CliBackendName): Promise<{ ok: boolean; reason?: string; uncertain?: boolean }> => {
   log.info({ target, len: text.length, images: images.length, freshSpawn, backendName }, "mirror inject (tmux)");
+
+  // Never type into a modal picker (see detectModalPicker). Checked before the
+  // image pump too — a C-v into a picker is just as destructive as a paste.
+  // 必须在按后端分流之前: 每个后端都有自己的原生确认框, 往任何一个里打字都会
+  // 替用户点掉框并吞掉这条消息。放到 codebuddy 早退之后就等于只保护了 claude。
+  // Escape hatch: WEZARD_MODAL_GUARD=0, in case a future TUI layout trips it.
+  if (process.env.WEZARD_MODAL_GUARD !== "0") {
+    const modal = await detectModalPicker(target);
+    if (modal.modal) {
+      log.warn({ target, title: modal.title, backendName }, "mirror inject: modal picker on pane, refusing to inject");
+      const what = modal.title ? `「${modal.title}」` : "原生确认框";
+      return {
+        ok: false,
+        reason: `目标会话停在 CLI ${what} 等待确认,消息未送达。`
+          + `(强行注入会替你点掉确认框并吞掉这条消息)`
+          + `请到 tmux 里处理该确认框,或发 /stop 取消当前操作后重发。`,
+      };
+    }
+  }
 
   // 图片注入策略按后端分流：
   //   claude / claude-internal —— 走 macOS 剪贴板 + Ctrl+V，TUI 收到 \x16 后
@@ -1422,6 +1464,14 @@ export interface AttachResult {
   jsonlPath?: string;
   target?: string;
 }
+
+/** 代按原生确认框的结果。answered 之外的一切都要求调用方走兜底(取消 + 告知)。 */
+export type NativeModalAnswer =
+  | { status: "answered"; title?: string; index: number; label: string }
+  | { status: "no_modal" }
+  | { status: "no_pane"; reason: string }
+  | { status: "unparsable"; title?: string; screen: string }
+  | { status: "still_modal"; title?: string; index: number; label: string };
 
 export interface MirrorBridge {
   dispatch: (args: MirrorDispatchArgs) => Promise<void>;
