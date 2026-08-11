@@ -14,7 +14,14 @@ import type { Config } from "../shared/config.js";
 const SCENE = 0;
 const PLUG_VERSION = "0.0.1";
 const HEARTBEAT_MS = 30_000;
-const MAX_RECONNECT = 10;
+// -1 = SDK 原生无限重连 (指数退避封顶 reconnectMaxDelay 30s)。给有限次数是陷阱:
+// Mac 睡眠唤醒 / 切网时 DNS 会短暂 ENOTFOUND, 10 次重连累计只撑约 2 分钟就耗尽,
+// 此后 SDK 抛 WSReconnectExhaustedError 便彻底躺平 —— 进程活着、HTTP 端口通, 但对
+// WeCom 完全失聪, 发不出卡也收不到点击。实测踩到过一次: 笔记本合盖过夜, 次日 DNS 早已
+// 恢复, 但 daemon 已耗尽重连额度躺平, 一条等审批的 hook 就这么挂了 9 小时。
+// 两个边界不受此值影响: 认证失败走独立的 MAX_AUTH_FAIL 计数器仍 fail-fast; 被服务端
+// 踢下线 (别处建了新连接) SDK 置 isManualClose 后本就不重连, 不会两个 daemon 互抢。
+const MAX_RECONNECT = -1;
 const MAX_AUTH_FAIL = 5;
 
 const sdkLogger = (log: Logger): SdkLogger => ({
