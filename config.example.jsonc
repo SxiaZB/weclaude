@@ -89,6 +89,13 @@
     // 则 Esc 取消并把原因注入会话(模型会改走实体路径)。仅镜像会话(有活 pane)生效。
     "claudeConfigGuard": true,
     "claudeConfigModalWaitMs": 4000,  // 批准后等那个框出现的最长时间(轮询步进 200ms)
+    // 审批卡引用区(命令/参数体)的最大字符数。企微对 quote_text 无长度限制, 但手机端
+    // 实测只渲染前 2~3 行 —— 超出部分靠引用区点击进详情页, 或右上角「⋯」菜单的
+    // 「📄 展开完整命令」按需在群里发全文。发送失败会自动缩到 600 重试一次。
+    "cardQuoteMaxChars": 1200,
+    // 长命令是否在发卡前**无条件**先推一条完整命令的文本消息。0 = 关闭(默认,
+    // 靠上面两条按需路径)。设正数恢复旧行为, 值为前置消息总字数上限。
+    "fullCommandPreludeChars": 0,
     "approvers": [],             // ["user:zhangsan"] empty → defaultChat
     "hookTimeoutSec": 43210,     // hook curl --max-time (12h + 10s)
     "longPollSec": 43200,        // daemon long-poll (12h)
