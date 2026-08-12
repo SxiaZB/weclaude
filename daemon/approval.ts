@@ -548,6 +548,9 @@ const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCar
   button_list: [
     { text: "❌", style: 4, key: encodeBatchKey(batch.batchId, "deny") },
     { text: fmtWindow(batch.windowMinutes), style: 3, key: encodeBatchKey(batch.batchId, "allow_window") },
+    // 批量卡同样给「总是」: 合流的成员是同一个工具的 N 次调用, 逐个点「总是」与
+    // 点一次的结果相同(每位成员各自走一遍规则生成, 已被现有规则覆盖的不重复加)。
+    { text: "✅总是", style: 4, key: encodeBatchKey(batch.batchId, "allow_always") },
     { text: `✅ ×${batch.members.length}`, style: 4, key: encodeBatchKey(batch.batchId, "allow") },
   ],
 });
@@ -2019,7 +2022,19 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
             + `本次已放行。如确要长期免审，请在 config.jsonc 的 \`approval.danger.allowPatterns\` 里加豁免正则。`,
         );
       }
-      const gen = askHit || danger ? [] : alwaysAllowRulesFor(toolName, toolInput, cfg.approval.allowRules);
+      // `.claude/**` 守卫生效的调用同理, 但理由更硬: 规则存了不只是"永远被压过"——
+      // 万一日后关掉守卫, 这条 allow 就会把静默死锁原样放回来(不发卡 + pane 阻塞)。
+      // 所以这里只做一次性放行, 并说清为什么「总是」在这个场景不成立。
+      if (!askHit && !danger && guardActive) {
+        await notify(
+          approver,
+          `⚠️ \`.claude/**\` 写操作不支持「总是」：这类改动会触发 CLI 原生确认框，`
+            + `而那个框只有在你点过卡之后才能被代按 —— 免审就等于回到静默死锁。本次已放行。`,
+        );
+      }
+      const gen = askHit || danger || guardActive
+        ? []
+        : alwaysAllowRulesFor(toolName, toolInput, cfg.approval.allowRules);
       const added = gen.filter((r) => !cfg.approval.allowRules.includes(r));
       if (added.length > 0) {
         cfg.approval.allowRules.push(...added); // 先热生效; 文件写失败也不回滚内存
@@ -2032,7 +2047,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         }
         log.info({ toolName, added, persisted: Boolean(sourcePath) }, "allow_always rules saved");
         await notify(approver, `📌 已保存永久放行规则：${added.map((r) => `\`${r}\``).join("、")}`);
-      } else if (!askHit && !danger && gen.length === 0) {
+      } else if (!askHit && !danger && !guardActive && gen.length === 0) {
         // 提炼不出可靠字面规则 —— 本次一次性放行并告知。文案必须指对排查方向:
         // 成因有四种, 笼统说"引号/结构有问题"会把用户带偏 (例如真凶是 fd 重定向
         // 的 `&` 被当成后台执行符时, 用户会去查引号)。
