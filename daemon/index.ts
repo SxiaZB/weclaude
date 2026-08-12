@@ -125,10 +125,31 @@ const main = async (): Promise<void> => {
       ? (sid: string, expect?: { toolName: string; toolInput: unknown }): Promise<void> =>
           (bridge as MirrorBridge).flushBeforeCard(sid, expect)
       : undefined;
+  // `.claude/**` 写守卫要用的四个 pane 原语。cancel/tell 复用现成的 target 级方法
+  // (先 sessionId → target 再调), 只有 hasPane / answerNativeModal 是 pane 级新增。
+  // headless 模式没有 live pane 可按 → 留 undefined, 守卫自动不介入。
+  const nativeModal =
+    cfg.wrc.mode === "mirror"
+      ? (() => {
+          const b = bridge as MirrorBridge;
+          return {
+            hasPane: (sid: string): boolean => b.hasLivePane(sid),
+            answer: (sid: string, opts: { waitMs: number }) => b.answerNativeModal(sid, opts),
+            cancel: async (sid: string): Promise<{ ok: boolean; reason?: string }> => {
+              const t = b.targetForSession(sid);
+              return t ? await b.interruptPane(t) : { ok: false, reason: "no mirror target for session" };
+            },
+            tell: async (sid: string, text: string): Promise<{ ok: boolean; reason?: string }> => {
+              const t = b.targetForSession(sid);
+              return t ? await b.injectText(t, text) : { ok: false, reason: "no mirror target for session" };
+            },
+          };
+        })()
+      : undefined;
   const http = startHttp({ cfg, ws, log, sourcePath });
   http.register(
     "POST /approve",
-    makeApproveHandler({ cfg, log: log.child({ mod: "approval" }), client: ws.client, sourcePath, getMirrorTarget, flushBeforeCard }),
+    makeApproveHandler({ cfg, log: log.child({ mod: "approval" }), client: ws.client, sourcePath, getMirrorTarget, flushBeforeCard, nativeModal }),
   );
   http.register("POST /message", makeMessageHandler(ws.client, log.child({ mod: "outbound" })));
   http.register("POST /card", makeCardHandler(ws.client, log.child({ mod: "outbound" })));

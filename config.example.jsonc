@@ -83,6 +83,12 @@
     // 危险判定只能用 danger.allowPatterns —— 那是唯一压得过名单的开关。
     "denyRules": [],             // 例: ["Bash(rm -rf /*)", "Bash(mkfs *)"]
     "askRules": [],              // 例: ["Bash(rm *)", "Bash(sudo *)", "Bash(git push *)"]
+    // `.claude/**` 写守卫: 改动 Claude 自己的配置面(settings/hooks/skills/…)会触发
+    // CC 原生确认框, 那个框**不过 hook** —— 规则放行 = 不发卡 + pane 静默阻塞。
+    // 开启后这类调用必发卡; 点「允许」后 daemon 去 pane 上代按一次性 Yes, 按不掉
+    // 则 Esc 取消并把原因注入会话(模型会改走实体路径)。仅镜像会话(有活 pane)生效。
+    "claudeConfigGuard": true,
+    "claudeConfigModalWaitMs": 4000,  // 批准后等那个框出现的最长时间(轮询步进 200ms)
     "approvers": [],             // ["user:zhangsan"] empty → defaultChat
     "hookTimeoutSec": 43210,     // hook curl --max-time (12h + 10s)
     "longPollSec": 43200,        // daemon long-poll (12h)

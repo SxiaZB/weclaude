@@ -45,3 +45,72 @@ export const isModalPane = (pane: string): ModalPaneVerdict => {
   if (!pane || !MODAL_OPTION_ROW.test(pane) || !MODAL_FOOTER.test(pane)) return { modal: false };
   return { modal: true, title: pane.match(MODAL_TITLE)?.[1] };
 };
+
+// ── 选项解析 + 代按 ────────────────────────────────────────────────────
+// 只服务一个场景: 用户刚在企微卡片上显式批准了某次调用, 而 Claude Code 在 hook
+// 返回后又立起它自己的原生确认框(见文件头 `.claude/**` 那段)。此时把答案按进
+// pane 是"完成用户已经作出的决定", 不是替他做决定。
+//
+// 因此这里刻意只认**权限确认框**、只挑**一次性 Yes**:
+//   • 标题必须长得像 "Do you want to …" —— /model 选择器、plan review 之类同样
+//     是 modal, 但按下去的语义完全不同, 一律不碰;
+//   • "Yes, and don't ask again …" / "Yes, and allow …" 这类会放宽后续权限的
+//     选项永不选中 —— 用户要的就是"每次都点", 代按不能顺手把门拆了。
+// 解析不出可信选项 → 返回 undefined, 调用方走取消+告知的兜底路径。
+
+/** 编号选项行: "❯ 1. Yes" / "  2. No, and tell Claude…"。 */
+const OPTION_ROW = /^\s*(?:[❯>]\s*)?(\d+)\.\s+(\S.*?)\s*$/u;
+
+/** 权限确认框的标题形状。plan review("Would you like to proceed?")也在此列 —— 但它
+ *  的选项文案不是裸 "Yes", pickModalAnswer 会自然放弃, 不需要在标题上再排除。 */
+const PERMISSION_TITLE = /^(?:Do|Would|Should) you /iu;
+
+export interface ModalOption {
+  index: number;
+  label: string;
+  /** 当前高亮项(`❯` 打头) —— 仅供日志/展示, 代按不依赖它。 */
+  selected: boolean;
+}
+
+/**
+ * 抽出**最后一组**连续编号选项(从 1 开始)。
+ * 为什么取最后一组: 当前屏上可能同时留着一个已答完的旧确认(它的选项行还在),
+ * 取全部会把两个框的选项混成一锅 —— 按错框就是替用户批准了别的东西。
+ */
+export const parseModalOptions = (pane: string): ModalOption[] => {
+  const groups: ModalOption[][] = [];
+  let cur: ModalOption[] = [];
+  for (const line of (pane ?? "").split("\n")) {
+    const m = OPTION_ROW.exec(line);
+    if (!m) {
+      // 选项行之间允许空行(部分布局会插一行), 非空的非选项行才断组。
+      if (line.trim() === "") continue;
+      if (cur.length > 0) { groups.push(cur); cur = []; }
+      continue;
+    }
+    const index = Number(m[1]);
+    const opt: ModalOption = { index, label: m[2]!, selected: /^\s*[❯>]/u.test(line) };
+    // 编号回到 1 = 新的一组开始。
+    if (index === 1 && cur.length > 0) { groups.push(cur); cur = []; }
+    cur.push(opt);
+  }
+  if (cur.length > 0) groups.push(cur);
+  const last = groups.filter((g) => g[0]?.index === 1).pop();
+  return last ?? [];
+};
+
+export interface ModalAnswer {
+  index: number;
+  label: string;
+}
+
+/**
+ * 从选项里挑出"一次性同意"。挑不出返回 undefined(宁可不按)。
+ * `title` 缺失或不像权限确认 → 直接放弃, 避免按到 /model 之类的选择器上。
+ */
+export const pickModalAnswer = (options: ModalOption[], title?: string): ModalAnswer | undefined => {
+  if (!title || !PERMISSION_TITLE.test(title)) return undefined;
+  const plainYes = options.find((o) => /^yes\s*$/iu.test(o.label));
+  if (!plainYes) return undefined;
+  return { index: plainYes.index, label: plainYes.label };
+};

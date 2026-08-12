@@ -28,7 +28,7 @@ import {
   projectDirsFor,
   type NormalizedTranscriptLine,
 } from "../shared/cli-backends.js";
-import { isModalPane, type ModalPaneVerdict } from "../shared/modal-pane.js";
+import { isModalPane, parseModalOptions, pickModalAnswer, type ModalPaneVerdict } from "../shared/modal-pane.js";
 import type { MirrorStore } from "./mirror-store.js";
 import { hasMirrorAskq, runMirrorAskqFlow, hasMirrorPlan, mootMirrorPlan, runMirrorPlanFlow } from "./approval.js";
 import { runTmux as runTmuxCmd, spawnTmuxClaude } from "./spawn-tmux.js";
@@ -1563,6 +1563,19 @@ export interface MirrorBridge {
    *  the terminal" escape hatch. Fails with an attach hint when no tmux
    *  client is attached anywhere. */
   revealPane: (target: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** Does this Claude sessionId have a live tmux pane we could answer a native
+   *  confirm on? Sync (map lookup only) — the aliveness probe happens in
+   *  `answerNativeModal`. Approval uses it to decide whether the `.claude/**`
+   *  guard can promise "card → we press the confirm for you". */
+  hasLivePane: (sessionId: string) => boolean;
+  /** Answer the native (non-hookable) permission confirm Claude Code raises
+   *  after the hook returned allow — see shared/modal-pane.ts for why this is
+   *  scoped to a just-approved call only. Polls up to `waitMs` for the confirm
+   *  to appear, then presses the parsed one-shot "Yes". */
+  answerNativeModal: (
+    sessionId: string,
+    opts: { waitMs: number },
+  ) => Promise<NativeModalAnswer>;
   /** Cwd lifecycle for the chat-bound project path. `getCwd` returns
    *  `{ runningCwd, pendingCwd, defaultCwd }` so /pwd can render all three
    *  truthfully. `setPendingCwd` writes the user-requested next cwd into the
@@ -4351,6 +4364,50 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
       if (r.code !== 0) return { ok: false, reason: `switch-client failed: ${r.stdout.slice(-200) || r.code}` };
       log.info({ target, pane, client: best }, "mirror /reveal — tmux client switched");
       return { ok: true };
+    },
+    hasLivePane: (sessionId) => Boolean(bySessionId.get(sessionId)?.tmuxPane),
+    answerNativeModal: async (sessionId, opts) => {
+      const a = bySessionId.get(sessionId);
+      if (!a?.tmuxPane) return { status: "no_pane", reason: "no live tmux pane for session" };
+      if (!(await tmuxPaneAlive(a.tmuxPane))) return { status: "no_pane", reason: "tmux pane no longer alive" };
+      const pane = a.tmuxPane;
+      const lg = log.child({ sessionId, pane, sub: "native-modal" });
+
+      // CC 在 hook 返回**之后**才渲染这个框, 所以进来时它通常还没出现 —— 轮询等它。
+      const POLL_MS = 200;
+      const deadline = Date.now() + Math.max(0, opts.waitMs);
+      let v = await detectModalPicker(pane);
+      while (!v.modal && Date.now() < deadline) {
+        await sleepMs(POLL_MS);
+        v = await detectModalPicker(pane);
+      }
+      // 没等到: 这次 CC 没弹框(会话内已授权过 / 命中盲点判断失误)。无事可做。
+      if (!v.modal) return { status: "no_modal" };
+
+      const pick = pickModalAnswer(parseModalOptions(v.screen), v.title);
+      if (!pick) {
+        lg.warn({ title: v.title }, "native modal: no trustworthy one-shot option, not pressing");
+        return { status: "unparsable", title: v.title, screen: v.screen };
+      }
+
+      // 数字键在 CC 的 picker 里即选即确认。按完等一拍回读: 框还在且**标题没变**才
+      // 补一个 Enter(个别布局要显式确认); 标题变了说明弹的已是另一个框 —— 绝不盲按,
+      // 交给兜底路径, 免得替用户确认了他没看过的东西。
+      const SETTLE_MS = 400;
+      await tmuxRun(["send-keys", "-t", pane, String(pick.index)]);
+      await sleepMs(SETTLE_MS);
+      let after = await detectModalPicker(pane);
+      if (after.modal && after.title === v.title) {
+        await tmuxRun(["send-keys", "-t", pane, "Enter"]);
+        await sleepMs(SETTLE_MS);
+        after = await detectModalPicker(pane);
+      }
+      if (after.modal) {
+        lg.warn({ title: after.title, pressed: pick.index }, "native modal: still on pane after answer");
+        return { status: "still_modal", title: after.title, index: pick.index, label: pick.label };
+      }
+      lg.info({ title: v.title, pressed: `${pick.index}. ${pick.label}` }, "native modal answered");
+      return { status: "answered", title: v.title, index: pick.index, label: pick.label };
     },
     getCwd,
     setPendingCwd,
