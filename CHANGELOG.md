@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.2.16] - 2026-08-12
+
 ### Changed
 - `approval`: **审批卡信息架构重排** —— 解决的是「看不出这张卡要批的是什么」。旧布局把 `🔐 授权 · <工具名> · <目录>/` 放在一级标题(26 字里有 8 个花在固定的锁图标与「授权」二字上),真正决定要不要点的**命令主体**却挤在描述行里被截断;并行跑多个会话时,几张卡长得一模一样,分不清是谁在请求。新布局按「谁在问 > 想干什么 > 具体命令 > 上下文」重排:一级标题放 Claude 自己写的 `tool_input.description`(它回答"想干什么",是 26 字里最值钱的内容;没有 description 的 `Read`/`Write`/`Edit` 回落「工具 · 目录/」,因为路径在下面引用区里已经有了);**命令主体搬进 `quote_area`**、无标题、整块可点进详情页;`horizontal_content` 放「上文」(最近一条用户消息)与**为什么要人来点这一下**(危险卡显示命中的名单规则,普通卡显示「审核」行 —— 即这条命令是**哪一段**没被 `allowRules` 覆盖,能算出规则时直接显示「点总是会生成什么」;没配任何规则时这行不显示,免得变成每张卡都有的噪声)。
 - `approval`: **卡片标题带会话名** —— 一个 chat 里并行跑多个会话时,`⏱`/`✅` 点下去到底作用在谁身上是靠猜的。会话名按可靠度降级取:`#tag`(企微侧显式命名,人起的名最准)→ Claude Code 自己的会话名(`~/.claude{,-internal}/sessions/<pid>.json` 注册表的 `name`,即 CC 会话列表显示的那个;只覆盖活着的进程,而发卡时会话必然活着 —— hook 正是它触发的)→ transcript 首条用户消息首句 → sessionId 尾八位。发卡时算好写进 pending,已决卡重渲染直接复用(点击事件回调里拿不到 `transcript_path`,现算不出来)。
@@ -201,7 +203,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.15...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.16...HEAD
+[1.2.16]: https://github.com/guxi11/wezard/compare/v1.2.15...v1.2.16
 [1.2.15]: https://github.com/guxi11/wezard/compare/v1.2.14...v1.2.15
 [1.2.14]: https://github.com/guxi11/wezard/compare/v1.2.13...v1.2.14
 [1.2.13]: https://github.com/guxi11/wezard/compare/v1.2.12...v1.2.13
