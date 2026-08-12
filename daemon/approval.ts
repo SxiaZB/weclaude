@@ -23,7 +23,8 @@ import {
 } from "./session-cache.js";
 import { redact } from "./redact.js";
 import { dangerOf, dangerEarlyExit, type DangerHit } from "./danger.js";
-import { evaluateAllow, ruleMatchesAny } from "../shared/allow-rules.js";
+import { appendUnique } from "../shared/config-writer.js";
+import { evaluateAllow, ruleMatchesAny, alwaysAllowRulesFor, splitSegments, NEVER_RULE_ALLOW } from "../shared/allow-rules.js";
 import { recordApproval, recordApprovalDecision, buildDetailUrl } from "./detail.js";
 import type { Handler } from "./http.js";
 import { json, readBody } from "./http.js";
@@ -229,6 +230,9 @@ const approveButtons = (a: CardArgs): TemplateCard["button_list"] =>
     : [
         { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
         { text: fmtWindow(a.windowMinutes), style: 3, key: encodeKey(a.reqId, "allow_window") },
+        // 「总是」= 由本次调用生成一条 allowRules 并落盘, 对齐 Claude Code 原生
+        // 弹窗的 Always allow。危险卡上没有这个入口 (与「⏱全过」同理)。
+        { text: "✅总是", style: 4, key: encodeKey(a.reqId, "allow_always") },
         { text: "✅", style: 4, key: encodeKey(a.reqId, "allow") },
       ];
 
@@ -260,6 +264,7 @@ const verbOf = (d: Decision, windowMinutes: number): string => {
     case "deny": return "已拒绝";
     case "allow_window": return `${fmtWindow(windowMinutes)}会话内全过`;
     case "allow_session": return "本会话通过";
+    case "allow_always": return "已通过·规则已保存";
     default: return "已通过";
   }
 };
@@ -473,7 +478,7 @@ const decodeBatchKey = (key: string): { batchId: string; decision: Decision } | 
   if (!key.startsWith(BATCH_PREFIX)) return undefined;
   const [batchId, d] = key.slice(BATCH_PREFIX.length).split("|");
   if (!batchId || !d) return undefined;
-  if (d !== "allow" && d !== "allow_session" && d !== "allow_window" && d !== "deny") return undefined;
+  if (d !== "allow" && d !== "allow_session" && d !== "allow_window" && d !== "allow_always" && d !== "deny") return undefined;
   return { batchId, decision: d };
 };
 const decodeBatchNoopKey = (key: string): string | undefined =>
@@ -490,7 +495,7 @@ const decodeKey = (
   }
   const [reqId, d] = key.split("|");
   if (!reqId || !d) return {};
-  if (d !== "allow" && d !== "allow_session" && d !== "allow_window" && d !== "deny") return {};
+  if (d !== "allow" && d !== "allow_session" && d !== "allow_window" && d !== "allow_always" && d !== "deny") return {};
   return { reqId, decision: d };
 };
 
@@ -1387,6 +1392,8 @@ interface ApprovalDeps {
   cfg: Config;
   log: Logger;
   client: WSClient;
+  /** config.jsonc 的绝对路径 — 「✅ 总是」写回 allowRules 用。缺省时只热生效不落盘。 */
+  sourcePath?: string;
   /** Optional: resolve a Claude sessionId to its bound WeCom mirror target (e.g. "chat:xxx").
    *  When set and the request's session has a mirror, the approval card is routed there
    *  instead of cfg.approval.approvers[0] / cfg.defaultChat — keeps the conversation and
@@ -1408,9 +1415,19 @@ const resolveApprover = (
   return mirror || pickApprover(cfg);
 };
 
-export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBeforeCard }: ApprovalDeps): Handler => {
+export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarget, flushBeforeCard }: ApprovalDeps): Handler => {
   const detailUrlFor = (id: string, approver?: string): string =>
     buildDetailUrl(cfg.daemon.detailPublicBase, cfg.daemon.host, cfg.daemon.port, id, approver ? targetChatId(approver) : undefined);
+
+  // 「总是」的回执/说明走独立 markdown 消息: 卡片本身已被 updateTemplateCard 收成
+  // 终态, 没有位置再讲"为什么这条规则没存下来"。
+  const notify = async (approver: string, content: string): Promise<void> => {
+    try {
+      await client.sendMessage(targetChatId(approver), { msgtype: "markdown", markdown: { content: withTagHeader(approver, content) } });
+    } catch (e) {
+      log.warn({ err: (e as Error).message }, "notify send failed");
+    }
+  };
 
   // Flush 一个 batch: 单成员 → 普通卡 (与未启用聚合一致); 多成员 → 批量卡。
   // 发送失败时调用 failPending 让每位成员的 handler 走 fallbackOnError 路径,
@@ -1736,6 +1753,58 @@ export const makeApproveHandler = ({ cfg, log, client, getMirrorTarget, flushBef
     if (!danger && decision === "allow_session" && cfg.approval.sessionCacheMinutes > 0) {
       cachePut(ck, decision, cfg.approval.sessionCacheMinutes * 60_000);
     }
+    // 「✅ 总是」: 由本次调用生成规则, 热生效 + 写回 config.jsonc (对齐 Claude Code
+    // 原生弹窗的 Always allow)。规则生成必须用**未脱敏**的原始 toolInput —— display
+    // 可能被 sensitiveArgRedact 改写过, 拿它生成的前缀匹配不上真实命令。
+    if (decision === "allow_always") {
+      // 命中 askRules 的调用: allow 规则永远被 ask 压过, 存了也是死规则。提示真实
+      // 的生效路径, 而不是静默写入一条永不生效的配置。
+      if (askHit) {
+        await notify(
+          approver,
+          `⚠️ 该命令命中强制审批规则 \`${askHit}\`（askRules 优先于放行规则），「总是」不会生效，本次已放行。如确要永久放行，需从 config.jsonc 的 askRules 移除该规则。`,
+        );
+      }
+      // 危险名单同理 (与 askRules 同层, allow 压不过它)。危险卡上本就没有「总是」
+      // 按钮, 这里是防御性兜底 —— 决策也可能来自 sweep / 旧卡。
+      if (!askHit && danger) {
+        await notify(
+          approver,
+          `⚠️ 该操作命中危险名单「${danger.rule}」，不支持「总是」：这类操作每次都要单独确认。`
+            + `本次已放行。如确要长期免审，请在 config.jsonc 的 \`approval.danger.allowPatterns\` 里加豁免正则。`,
+        );
+      }
+      const gen = askHit || danger ? [] : alwaysAllowRulesFor(toolName, toolInput, cfg.approval.allowRules);
+      const added = gen.filter((r) => !cfg.approval.allowRules.includes(r));
+      if (added.length > 0) {
+        cfg.approval.allowRules.push(...added); // 先热生效; 文件写失败也不回滚内存
+        if (sourcePath) {
+          try {
+            for (const r of added) appendUnique(sourcePath, ["approval", "allowRules"], r);
+          } catch (e) {
+            log.warn({ err: (e as Error).message }, "allow_always persist failed (in-memory only)");
+          }
+        }
+        log.info({ toolName, added, persisted: Boolean(sourcePath) }, "allow_always rules saved");
+        await notify(approver, `📌 已保存永久放行规则：${added.map((r) => `\`${r}\``).join("、")}`);
+      } else if (!askHit && !danger && gen.length === 0) {
+        // 提炼不出可靠字面规则 —— 本次一次性放行并告知。文案必须指对排查方向:
+        // 成因有四种, 笼统说"引号/结构有问题"会把用户带偏 (例如真凶是 fd 重定向
+        // 的 `&` 被当成后台执行符时, 用户会去查引号)。
+        const cmdStr = typeof (toolInput as Record<string, unknown> | null)?.command === "string"
+          ? ((toolInput as Record<string, unknown>).command as string)
+          : "";
+        const why = NEVER_RULE_ALLOW.has(toolName)
+          ? `\`${toolName}\` 是交互工具，永不支持免审（引擎内部硬保护）`
+          : /[`]|\$\(/.test(cmdStr)
+            ? "该命令含动态构造（$() / 反引号），字面规则无法可靠描述其行为"
+            : splitSegments(cmdStr) === undefined
+              ? "该命令含未闭合引号或后台执行符 `&`，无法安全分段"
+              : "该命令的结构提炼不出可靠前缀（异形段首、或解释器头部拿不到子命令）";
+        await notify(approver, `📌 ${why}，本次已一次性放行（未保存规则）。`);
+      }
+    }
+
     if (!danger && decision === "allow_window" && cfg.approval.windowMinutes > 0) {
       setAutoWindow(approver, cfg.approval.windowMinutes * 60_000, {
         toolName,

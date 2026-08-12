@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { baseOfKey } from "../shared/session-label.js";
 
-export type Decision = "allow" | "allow_session" | "allow_window" | "deny";
+export type Decision = "allow" | "allow_session" | "allow_window" | "allow_always" | "deny";
 
 export interface PendingMeta {
   kind: "approval" | "generic";
