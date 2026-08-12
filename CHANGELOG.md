@@ -26,6 +26,7 @@
 - `keepalive`: 移除 KeepAlive 心跳通知(`keepalive.notify` 配置项及第 1/3/6 轮的 `KeepAlive n/N · ~Nk` 气泡)。保活是纯后台省钱动作,群里不需要看见;完整 ping/pong 仍留痕在 chat detail 时间线。
 
 ### Fixed
+- `sessions`: **`/sessions` 扫描的子进程加硬超时**(`SCAN_CMD_TIMEOUT_MS`,15s)。`session-scan.ts` 的 `runCmd` 是上一轮 tmux 超时收敛漏掉的第四条 exec 路径 —— 它跑 `lsof` 和 `tmux`,两者都能无限期挂住:`lsof` 卡在僵死的网络挂载上、tmux server wedged。挂住的后果比丢一次扫描严重得多:`/sessions` 永远不回答,调用方的 `await` 也永远不返回。现在到点 `SIGKILL` 并退化成「没有输出」,与其它失败路径同一处理。
 - `mirror`: **tmux 调用全部收敛到一条 exec 路径并加硬超时**(`TMUX_TIMEOUT_MS`,默认 10s,`WEZARD_TMUX_TIMEOUT_MS` 可调,0 关闭)。此前 daemon 里有三份手写的 `spawn("tmux", …)`(`spawn-tmux.runTmux`、`mirror-bridge` 模块级 `tmuxRun`、`startMirror` 内又一个同名局部 `tmuxRun` 遮蔽了它),全部无超时:tmux server 一旦卡住,调用方永久 pending 且零日志 —— 一条入站消息建了 pane,随后 `tmuxPaneAlive` 再也不返回,该会话的 inject 队列被僵尸 job 锁住,那个聊天从此彻底静默,只能重启 daemon。现在三处合一,超时用 `SIGKILL`(卡在 wedged server 上的 tmux client 不理 `SIGTERM`)并以普通失败态 resolve,所有现存 `if (!r.ok)` 分支照旧生效;超时必留痕,由 daemon 启动时注入的 reporter 打 `warn`。`load-buffer -` 这类 stdin 变体一并走同一路径。
 - `mirror`: **inject job 加 watchdog**(`INJECT_JOB_TIMEOUT_MS`)。job 链上每个 `await` 原本都是无界的,超时后队列不再释放;现在到点释放队列、告知用户,并 bump `injectGen` 让僵尸 job 醒来后不再往 pane 里贴。job 起手先打一行 `inject job start`,下次卡住能定位到具体步骤。
 - `mirror`: **`/stop` 改为先收口、后 Esc**。旧实现先探 pane、探不到就早退 —— 而 tmux 本身就是卡住的那一环时,用户手上留着一个关不掉的 `…` 气泡和一条谁也过不去的 inject 队列。现在先做与 tmux 无关的部分(bump `injectGen`、清 inject 队列、收掉所有挂起气泡/stream),再尽力 Esc;Esc 失败只报告不致命,并带上收了几个气泡。只想按 Esc 的调用方(不传 `opts`)行为不变。
