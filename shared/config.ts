@@ -255,6 +255,16 @@ const Approval = z.object({
   // 用于给危险前缀 (如 "Bash(rm *)", "Bash(git push *)") 兜底 — 即使 ⏱ 窗口开着
   // 也逐条确认, 语义对齐 Claude Code 的 permissions.ask。
   askRules: z.array(z.string()).default([]),
+  // 审批卡 quote_area 里命令/参数体的最大字符数。WeCom 未公开该字段上限, 发送
+  // 失败会自动缩到 600 重试一次 (见 approval.ts), 所以可以放心调大。
+  // 注意手机端客户端只渲染 quote 区前 2~3 行 (实测), 看全命令靠「展开完整命令」。
+  cardQuoteMaxChars: z.number().int().positive().default(1200),
+  // Bash 命令超过 ~200 字 (卡片手机端可见极限) 时, 发卡前**无条件**先推一条含完整
+  // 命令的 markdown 消息。默认 0 = 关闭 —— 长命令由卡片自己承载: 引用区可点进详情
+  // 页, 右上角「⋯」菜单有「📄 展开完整命令」按需在群里发全文。设成正数可恢复旧
+  // 行为 (客户端不渲染 action_menu、或就是要全文无条件落在群里时用)。
+  // 此值为前置消息的总字数上限 (超出截断并注明; 按 1800 字/条分块发送)。
+  fullCommandPreludeChars: z.number().int().nonnegative().default(0),
 });
 
 // sync.targets[].kind 的合法值。claude-internal / custom 等旧值自动 collapse

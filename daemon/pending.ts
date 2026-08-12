@@ -2,6 +2,7 @@
 // Used for both PreToolUse approvals and any other "send card → wait click" flows.
 import { randomUUID } from "node:crypto";
 import { baseOfKey } from "../shared/session-label.js";
+import type { DenyReason } from "../shared/allow-rules.js";
 
 export type Decision = "allow" | "allow_session" | "allow_window" | "deny";
 
@@ -20,6 +21,11 @@ export interface PendingMeta {
   /** 命中危险名单的规则名 (daemon/danger.ts)。非空 = 这张卡必须被人单独点,
    *  永远不参与 allow_window 的批量放行。 */
   danger?: string;
+  /** 未命中 allowRules 的原因 — 卡片「审核」行的数据源, resolved 卡重渲染复用。 */
+  denyReason?: DenyReason;
+  /** 卡片标题上的会话名 (#tag / transcript 首条用户消息 / 短 id), 发卡时算好,
+   *  resolved 卡重渲染直接复用 — 事件回调里没有 transcript_path 可现算。 */
+  sessionName?: string;
   /** 卡片已经真的发到 WeCom 上了 (flushBatch 成功)。只有这种 pending 在 reload
    *  drain 时值得让 hook 续接 —— 卡还挂在聊天里, 重启后同 reqId 重新挂起即可复用。
    *  没发出去的卡续接就是让 hook 空等一个永远不会有人点的东西。 */
