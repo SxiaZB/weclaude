@@ -1636,7 +1636,9 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
 
     // Session cache
     const ck = cacheKey(sessionId, toolName, toolInput);
-    const cached = danger ? undefined : cacheGet(ck);
+    // mustCard(危险名单 / askRules)一律不吃缓存 —— 缓存的语义是「这个调用批过一次
+    // 就不再问」, 与「每次都要单独确认」直接冲突。
+    const cached = mustCard ? undefined : cacheGet(ck);
     if (cached) {
       log.info({ ck, cached }, "cache hit");
       json(res, 200, {
@@ -1648,12 +1650,12 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
 
     if (!approver) {
       log.warn("no approver configured");
-      json(res, 200, fallback(cfg, "no_approver", danger) satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "no_approver", mustCard) satisfies ApproveResp);
       return;
     }
     if (!client.isConnected) {
       log.warn("ws not connected");
-      json(res, 200, fallback(cfg, "ws_disconnected", danger) satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "ws_disconnected", mustCard) satisfies ApproveResp);
       return;
     }
 
@@ -1682,6 +1684,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         chatKey: approver,
         transcriptTail,
         danger: danger?.rule,
+        forceSingle: mustCard,
         cardSent: Boolean(resumeId), // 续接的前提就是卡已经在群里
       },
       timeoutMs: longPollMs,
@@ -1704,7 +1707,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     const member: BatchMember = { reqId, toolInput: display, originalToolInput: toolInput, toolInputStr, cwd, transcriptTail };
     const bk = batchKeyOf(sessionId, toolName);
     // 危险请求既不 join 也不被 join — 一次危险操作 = 一张卡 = 一次点击。
-    const existing = danger ? undefined : activeBatches.get(bk);
+    const existing = mustCard ? undefined : activeBatches.get(bk);
     if (resumeId) {
       // no-op: 直接进下面的长轮询, 等旧卡上的点击。
     } else if (existing && !existing.flushed) {
@@ -1722,10 +1725,10 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         flushed: false,
         flushTimer: undefined as unknown as NodeJS.Timeout, // set below
       };
-      const coalesceMs = danger ? 0 : cfg.approval.batchCoalesceMs;
+      const coalesceMs = mustCard ? 0 : cfg.approval.batchCoalesceMs;
       const fire = (): void => void flushBatch(batch);
       batch.flushTimer = coalesceMs > 0 ? setTimeout(fire, coalesceMs) : setImmediate(fire) as unknown as NodeJS.Timeout;
-      if (!danger) activeBatches.set(bk, batch);
+      if (!mustCard) activeBatches.set(bk, batch);
       batchById.set(batch.batchId, batch);
       evictBatches();
       log.info({ batchId: batch.batchId, reqId, coalesceMs }, "batch opened");
@@ -1744,13 +1747,13 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         return;
       }
       log.warn({ err: (e as Error).message, reqId }, "approval timed out");
-      json(res, 200, fallback(cfg, "approver_timeout", danger) satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "approver_timeout", mustCard) satisfies ApproveResp);
       return;
     }
 
     // 危险决策一律不留痕: 不写 session cache、不开自动窗口 (卡上本就没这两个
     // 按钮, 这里是防御性兜底 —— 决策也可能来自 sweep / 旧卡)。
-    if (!danger && decision === "allow_session" && cfg.approval.sessionCacheMinutes > 0) {
+    if (!mustCard && decision === "allow_session" && cfg.approval.sessionCacheMinutes > 0) {
       cachePut(ck, decision, cfg.approval.sessionCacheMinutes * 60_000);
     }
     // 「✅ 总是」: 由本次调用生成规则, 热生效 + 写回 config.jsonc (对齐 Claude Code
@@ -1805,7 +1808,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
       }
     }
 
-    if (!danger && decision === "allow_window" && cfg.approval.windowMinutes > 0) {
+    if (!mustCard && decision === "allow_window" && cfg.approval.windowMinutes > 0) {
       setAutoWindow(approver, cfg.approval.windowMinutes * 60_000, {
         toolName,
         toolInput: display,
