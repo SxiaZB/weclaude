@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.2.17] - 2026-08-17
+
 ### Fixed
 - `approval`: 「✅总是」补两处遗漏。① **批量卡上也给这个按钮** —— 合流的成员是同一个工具的 N 次调用,单卡有「总是」而批量卡没有,只能先等它拆开或逐个点,机制在最需要的场景(一串同类调用)恰好用不上;逐位成员各自走一遍规则生成,已被现有规则覆盖的不重复加,结果与逐个点「总是」一致。② **`.claude/**` 守卫生效时不生成规则**,并说明原因。此前这种卡上点「总是」会存下一条**永远被守卫压过**的死规则,更糟的是万一日后关掉守卫,这条 allow 就把静默死锁原样放回来(不发卡 + pane 无限期阻塞);现在只做一次性放行,并回执讲清「那个原生确认框只有在你点过卡之后才能被代按,免审就等于回到死锁」。同理,「提炼不出可靠字面规则」的兜底提示也不再在守卫卡上误报。
 - `ws`: WS 握手加 15s 超时,防止睡眠唤醒后 TCP 通但 upgrade 不返回导致重连链悬挂、对企微永久失聪(补 #7 之外的第二条失聪路径)。
@@ -207,7 +209,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.16...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.17...HEAD
+[1.2.17]: https://github.com/guxi11/wezard/compare/v1.2.16...v1.2.17
 [1.2.16]: https://github.com/guxi11/wezard/compare/v1.2.15...v1.2.16
 [1.2.15]: https://github.com/guxi11/wezard/compare/v1.2.14...v1.2.15
 [1.2.14]: https://github.com/guxi11/wezard/compare/v1.2.13...v1.2.14
