@@ -23,6 +23,16 @@ const HEARTBEAT_MS = 30_000;
 // 踢下线 (别处建了新连接) SDK 置 isManualClose 后本就不重连, 不会两个 daemon 互抢。
 const MAX_RECONNECT = -1;
 const MAX_AUTH_FAIL = 5;
+// SDK 的 connect() 只挂 open/message/close/error 四个回调, 不设握手超时。睡眠唤醒后
+// 那条 socket 常是黑洞: TCP 连得上但 upgrade 响应永不返回, 四个回调一个都不触发,
+// scheduleReconnect() 再无机会被调用 —— 心跳定时器要认证成功才启动, 也兜不住。
+// 于是重连链停在 "Connecting to WebSocket..." 一行上永久静默: 进程活着、HTTP 端口通、
+// hook 照常判权限, 但对 WeCom 失聪。2026-08-12 就这么挂了 3 小时, 期间一张审批卡发不出去。
+// 注意这跟上面 MAX_RECONNECT 修的不是同一件事: 那个防的是"重连次数耗尽后躺平",
+// 这个是第 1 次重连就悬挂, 无限重连救不了单次握手卡死。
+// ws 库拿 handshakeTimeout 当 req 的 idle timeout, 超时走 abortHandshake ->
+// emitErrorAndClose -> emit 'close' -> SDK close 回调 -> scheduleReconnect, 链路续上。
+const HANDSHAKE_TIMEOUT_MS = 15_000;
 
 const sdkLogger = (log: Logger): SdkLogger => ({
   debug: (msg, ...a) => log.debug({ a }, String(msg)),
@@ -50,6 +60,7 @@ export const startWs = (cfg: Config, log: Logger): DaemonWs => {
     heartbeatInterval: HEARTBEAT_MS,
     maxReconnectAttempts: MAX_RECONNECT,
     maxAuthFailureAttempts: MAX_AUTH_FAIL,
+    wsOptions: { handshakeTimeout: HANDSHAKE_TIMEOUT_MS },
     scene: SCENE,
     plug_version: PLUG_VERSION,
   });
