@@ -327,7 +327,7 @@ const approveButtons = (a: CardArgs): TemplateCard["button_list"] =>
       ]
     : [
         { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
-        { text: fmtWindow(a.windowMinutes), style: 3, key: encodeKey(a.reqId, "allow_window") },
+        { text: windowLabel(a.windowMinutes), style: 1, key: encodeKey(a.reqId, "allow_window") },
         // 「总是」= 由本次调用生成一条 allowRules 并落盘, 对齐 Claude Code 原生
         // 弹窗的 Always allow。危险卡上没有这个入口 (与「⏱全过」同理)。
         { text: "✅总是", style: 4, key: encodeKey(a.reqId, "allow_always") },
@@ -375,6 +375,10 @@ const buildCard = (a: CardArgs): TemplateCard => {
 
 const fmtWindow = (min: number): string =>
   min % 60 === 0 ? `${min / 60}h` : `${min}min`;
+
+// 按钮上的时间窗文案: 裸「10h」看不出是放行, 补 ⏱ + 「自动过」点明语义。
+// (style 也从 3 改成 1 — 企微 3 渲染成红色, 与「放行」相悖。)
+const windowLabel = (min: number): string => `⏱${fmtWindow(min)}自动过`;
 
 const verbOf = (d: Decision, windowMinutes: number): string => {
   switch (d) {
@@ -547,7 +551,7 @@ const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCar
   task_id: batch.batchId,
   button_list: [
     { text: "❌", style: 4, key: encodeBatchKey(batch.batchId, "deny") },
-    { text: fmtWindow(batch.windowMinutes), style: 3, key: encodeBatchKey(batch.batchId, "allow_window") },
+    { text: windowLabel(batch.windowMinutes), style: 1, key: encodeBatchKey(batch.batchId, "allow_window") },
     // 批量卡同样给「总是」: 合流的成员是同一个工具的 N 次调用, 逐个点「总是」与
     // 点一次的结果相同(每位成员各自走一遍规则生成, 已被现有规则覆盖的不重复加)。
     { text: "✅总是", style: 4, key: encodeBatchKey(batch.batchId, "allow_always") },
