@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.2.19] - 2026-08-19
+
+### Fixed
+- `approval`: `.claude/**` 守卫退出 `mustCard` 语义——守卫要的不是「强制发卡」而是「allow 之后有人去按 CC 原生框」,⏱ 自动过窗口恢复生效。排掉 `.claude/worktrees/**`(整棵检出代码树,非配置面）但 worktree 自己的 `.claude/` 仍拦截。错误出口保持 `ask` 降级;收尾按 sessionId 串 promise 链防并发代按;必发卡按钮面改由 `forceSingle` 决定。
+
 ## [1.2.18] - 2026-08-19
 
 ### Fixed
@@ -217,7 +222,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.18...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.19...HEAD
+[1.2.19]: https://github.com/guxi11/wezard/compare/v1.2.18...v1.2.19
 [1.2.18]: https://github.com/guxi11/wezard/compare/v1.2.17...v1.2.18
 [1.2.17]: https://github.com/guxi11/wezard/compare/v1.2.16...v1.2.17
 [1.2.16]: https://github.com/guxi11/wezard/compare/v1.2.15...v1.2.16
