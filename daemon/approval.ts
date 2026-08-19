@@ -70,6 +70,10 @@ interface CardArgs {
   detailUrl?: string;  // 空则不渲染 jump_list
   /** 命中危险名单的规则名。非空 → 卡片去掉「全过」按钮, 必须单次确认。 */
   danger?: string;
+  /** 必发卡 (approval.ts 的 mustCard: 危险名单 / askRules / `.claude/**` 守卫)。
+   *  按钮面必须与判决面一致 —— handler 侧 `!mustCard` 会把「⏱全过 / ✅总是」
+   *  的效果全部丢掉, 卡上还画着它们就是给了两颗按不动的按钮。 */
+  forceSingle?: boolean;
   /** 会话名 (#tag / CC 会话名 / 首条用户消息 / 短 id) — 发卡时算好, resolved 卡复用。 */
   sessionName?: string;
   /** 未命中 allowRules 的具体原因 — 渲染到「审核」行。 */
@@ -317,10 +321,12 @@ const quoteArea = (text: string, url?: string): TemplateCard["quote_area"] =>
     ? { type: 1, url, quote_text: text }
     : { type: 0, quote_text: text }) as TemplateCard["quote_area"];
 
-// 危险卡: 只有 ❌ / ✅ — 不给「N 分钟全过」「✅总是」的入口, 否则一次点击就把
-// 后续所有危险操作也放行了, 名单等于失效。
+// 必发卡 (危险名单 / askRules / `.claude/**` 守卫): 只有 ❌ / ✅ — 不给「N 分钟
+// 全过」「✅总是」的入口, 否则一次点击就把后续所有这类操作也放行了, 名单等于失效。
+// 判据是 forceSingle 而非 danger: 另两个来源的卡同样吃 handler 侧的 `!mustCard`
+// 短路, 只按 danger 收按钮的话它们会画出点了没反应、也不 sweep 同批的死按钮。
 const approveButtons = (a: CardArgs): TemplateCard["button_list"] =>
-  a.danger
+  a.danger || a.forceSingle
     ? [
         { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
         { text: "✅ 确认执行", style: 4, key: encodeKey(a.reqId, "allow") },
@@ -489,6 +495,9 @@ interface ActiveBatch {
   /** 危险名单规则名。危险请求永远是单成员批次 (不注册进 activeBatches,
    *  没人能 join), 只为复用 flushBatch 的发卡/失败路径。 */
   danger?: string;
+  /** 必发卡批次 (同 CardArgs.forceSingle)。这种批次永远只有一位成员 —— 不注册进
+   *  activeBatches, 没人能 join —— 但发的是单卡, 按钮面要跟着收。 */
+  forceSingle?: boolean;
   /** 会话名 (同 CardArgs.sessionName) — 批次内成员同 session, 开批时算一次。 */
   sessionName?: string;
   /** 未命中 allowRules 的原因 (同 CardArgs.denyReason)。 */
@@ -1509,9 +1518,14 @@ interface ApproveResp {
 
 const decisionToHook = (d: Decision): "allow" | "deny" => (d === "deny" ? "deny" : "allow");
 
-// 必发卡的请求 (危险名单 / askRules / `.claude/**` 守卫) 永不走 fallbackOnError:
-// "allow" — 超时/断线时降级为 ask, 交回本地 CLI 由人来确认, 而不是静默放行一次
-// rm。只判 danger 的话, 用户自己配的 askRules 在 daemon 挂掉时反而失效。
+// 必发卡的请求 (危险名单 / askRules) 永不走 fallbackOnError: "allow" — 超时/断线时
+// 降级为 ask, 交回本地 CLI 由人来确认, 而不是静默放行一次 rm。只判 danger 的话,
+// 用户自己配的 askRules 在 daemon 挂掉时反而失效。
+//
+// `.claude/**` 守卫虽然不进 mustCard, 但在**错误面**也要走同一条降级: 正常出口靠
+// settleGuard 事后按框, 而这三条 (no_approver / ws_disconnected / approver_timeout)
+// 要么没有 approver 可按、要么 pane 早已在等框 —— 静默 allow 就是把死锁原样放回来。
+// 所以调用点传的是 `mustCard || guardActive`, 见 handler 里那三处。
 const fallback = (cfg: Config, reason: string, forceSingle?: unknown): ApproveResp => ({
   decision: forceSingle && cfg.approval.fallbackOnError === "allow" ? "ask" : cfg.approval.fallbackOnError,
   reason: forceSingle ? `${reason}:force_single` : reason,
@@ -1604,7 +1618,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
   // 按不掉时不干等: Esc 取消掉这次调用, 再把原因作为一条用户消息注入 pane。模型
   // 收到的就是明确的"这条路走不通 + 该怎么绕", 而不是静默卡住 —— 等价于预拦截
   // deny + reason, 只是走镜像通道传达。
-  const settleClaudeConfigModal = async (
+  const settleOne = async (
     sessionId: string,
     approver: string,
     hit: ClaudeConfigHit,
@@ -1639,6 +1653,22 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     );
   };
 
+  // 同一 pane 上的收尾必须串行。守卫退出 mustCard 之后, 一轮里 N 个 `.claude/**` 写
+  // 会一起走窗口/缓存/规则的快路径、同刻返回 —— 以前每张卡等人点, 天然串成一列。
+  // 并发进 answer() 的话两个协程会看见同一个框都按下去, 第二下落到下一个框或输入框上。
+  // 按 sessionId 串一条 promise 链: 每次收尾等前一次跑完, 失败也不断链。
+  const settleChains = new Map<string, Promise<void>>();
+  const settleClaudeConfigModal = (sessionId: string, approver: string, hit: ClaudeConfigHit): Promise<void> => {
+    const next = (settleChains.get(sessionId) ?? Promise.resolve())
+      .then(() => settleOne(sessionId, approver, hit));
+    // 链尾自清: 只有还是自己时才删, 避免把后来者的链一起抹掉。
+    const tail = next.catch(() => {}).finally(() => {
+      if (settleChains.get(sessionId) === tail) settleChains.delete(sessionId);
+    });
+    settleChains.set(sessionId, tail);
+    return next;
+  };
+
   // Flush 一个 batch: 单成员 → 普通卡 (与未启用聚合一致); 多成员 → 批量卡。
   // 发送失败时调用 failPending 让每位成员的 handler 走 fallbackOnError 路径,
   // 与单卡路径上 sendMessage 抛错时的语义一致。
@@ -1666,6 +1696,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
             transcriptTail: m.transcriptTail,
             windowMinutes: batch.windowMinutes,
             danger: batch.danger,
+            forceSingle: batch.forceSingle,
             sessionName: batch.sessionName,
             denyReason: batch.denyReason,
             detailUrl: detailUrlFor(m.reqId, batch.approver),
@@ -1759,9 +1790,24 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     if (guardHit) {
       log.info(
         { toolName, sessionId, path: guardHit.path, why: guardHit.why, guardActive },
-        guardActive ? "claude-config guard force card" : "claude-config write detected (no live pane, passing through)",
+        guardActive ? "claude-config guard armed" : "claude-config write detected (no live pane, passing through)",
       );
     }
+    const approver = resolveApprover(cfg, sessionId, getMirrorTarget);
+    // 守卫的收尾 = 把 CC 那个不过 hook 的原生确认框按掉。它挂在**每一条 allow 出口**
+    // 上, 而不是靠"强制发卡 + 人工点"来触发 —— 死锁的成因是没人按框, 不是没人点卡。
+    //
+    // 这条区别是有代价的历史: 守卫曾经进 mustCard, 于是 ⏱窗口/缓存/合流/sweep 全被
+    // 它短路, 卡上那颗「⏱10h自动过」点了等于一次性放行, 窗口从来没开过。现在窗口
+    // 照常生效, 框照样有人按。
+    //
+    // 必须在 json(res) 之后调用: CC 要等 hook 进程退出才会把框渲染出来。
+    const settleGuard = (): void => {
+      if (!guardActive || !guardHit || !approver) return;
+      void settleClaudeConfigModal(sessionId, approver, guardHit).catch((e) => {
+        log.warn({ err: (e as Error).message, sessionId }, "settleClaudeConfigModal failed");
+      });
+    };
     // 危险名单 (daemon/danger.ts): 内置的 rm / 强推 / DROP / 敏感路径等。语义上
     // 是「出厂自带的 askRules」—— 所以它必须和用户写的 askRules 站在同一层, 排在
     // allowRules 之前。放在后面的话, 一条 `Bash(git *)` 这样的宽 allow 规则 (尤其
@@ -1769,8 +1815,9 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     const danger: DangerHit | undefined = dangerOf(cfg, toolName, toolInput);
     if (danger) log.info({ toolName, sessionId, rule: danger.rule }, "danger hit — forcing single approval");
 
-    // 必发卡 = 危险名单 或 askRules 命中 或 守卫生效。三者都要压过放行/窗口/缓存。
-    const mustCard = Boolean(danger) || Boolean(askHit) || guardActive;
+    // 必发卡 = 危险名单 或 askRules 命中。这两者的语义是「每次都要人单独看一眼」,
+    // 所以压过放行/窗口/缓存。守卫不在其列 —— 见上面 settleGuard 的注释。
+    const mustCard = Boolean(danger) || Boolean(askHit);
 
     // allowRules: matcher 拦下的工具里再挖细粒度豁免 (Bash 可按命令前缀区分)。
     // 交互卡工具 (AskUserQuestion 等) 在引擎内部硬保护, 规则写了也不放行。
@@ -1781,6 +1828,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
       const ruleHit = [...new Set(verdict.hits)].join(" + ");
       log.info({ toolName, sessionId, rule: ruleHit }, "allow-rule skip");
       json(res, 200, { decision: "allow", reason: `allow_rule:${ruleHit}` } satisfies ApproveResp);
+      settleGuard();
       return;
     }
     const denyReason = verdict.allowed ? undefined : verdict.reason;
@@ -1848,23 +1896,19 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
       return;
     }
 
-    // Approver 提前解析: auto-window 现在按 chat 维度生效, isAutoWindowActive
-    // 检查要拿到 chatKey (= approver principal) 才能查。approver 缺失时 window
-    // 检查跳过 (window 需要一个 chat 才存在), 走后面的 no_approver fallback。
-    const approver = resolveApprover(cfg, sessionId, getMirrorTarget);
-
     // danger.skip / danger 模式的早退。第三个参数是「除 danger 外还有没有别的必发卡
-    // 理由」—— askRules 与 `.claude/**` 守卫不能被 danger 的开关顺带关掉, 判定与
-    // 理由见 dangerEarlyExit 的注释 (守卫被绕过会让 pane 死锁)。
-    const earlyExit = dangerEarlyExit(cfg, danger, Boolean(askHit) || guardActive);
+    // 理由」—— askRules 不能被 danger 的开关顺带关掉。守卫不在其列: 它要的是事后按框,
+    // 早退照样能给 (settleGuard), 拿它挡早退等于把 danger 的开关废掉。
+    const earlyExit = dangerEarlyExit(cfg, danger, Boolean(askHit));
     if (earlyExit) {
       log.info({ toolName, sessionId, reason: earlyExit }, "danger switch early exit");
       json(res, 200, { decision: "allow", reason: earlyExit } satisfies ApproveResp);
+      settleGuard();
       return;
     }
 
     // Auto-approve window: while active for THIS chat, requests short-circuit to allow.
-    // mustCard (危险名单 / askRules / `.claude/**` 守卫) 的请求不吃窗口 — 即使开着 ⏱ 也逐条确认。
+    // mustCard (危险名单 / askRules) 的请求不吃窗口 — 即使开着 ⏱ 也逐条确认。
     if (!mustCard && approver && isAutoWindowActive(approver)) {
       const remainSec = Math.ceil(autoWindowRemainingMs(approver) / 1000);
       log.info({ toolName, sessionId, chatKey: approver, remainSec }, "auto-window allow");
@@ -1872,12 +1916,13 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         decision: "allow",
         reason: `auto_window:${remainSec}s`,
       } satisfies ApproveResp);
+      settleGuard();
       return;
     }
 
     // Session cache (mustCard 的请求同样不吃缓存)
     const ck = cacheKey(sessionId, toolName, toolInput);
-    // mustCard(危险名单 / askRules / 守卫)一律不吃缓存 —— 缓存的语义是「这个调用批过一次
+    // mustCard(危险名单 / askRules)一律不吃缓存 —— 缓存的语义是「这个调用批过一次
     // 就不再问」, 与「每次都要单独确认」直接冲突。
     const cached = mustCard ? undefined : cacheGet(ck);
     if (cached) {
@@ -1886,17 +1931,18 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         decision: decisionToHook(cached),
         reason: `cached:${cached}`,
       } satisfies ApproveResp);
+      if (decisionToHook(cached) === "allow") settleGuard();
       return;
     }
 
     if (!approver) {
       log.warn("no approver configured");
-      json(res, 200, fallback(cfg, "no_approver", mustCard) satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "no_approver", mustCard || guardActive) satisfies ApproveResp);
       return;
     }
     if (!client.isConnected) {
       log.warn("ws not connected");
-      json(res, 200, fallback(cfg, "ws_disconnected", mustCard) satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "ws_disconnected", mustCard || guardActive) satisfies ApproveResp);
       return;
     }
 
@@ -1968,6 +2014,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         approver,
         windowMinutes: cfg.approval.windowMinutes,
         danger: danger?.rule,
+        forceSingle: mustCard,
         sessionName,
         denyReason,
         members: [member],
@@ -1996,7 +2043,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         return;
       }
       log.warn({ err: (e as Error).message, reqId }, "approval timed out");
-      json(res, 200, fallback(cfg, "approver_timeout", mustCard) satisfies ApproveResp);
+      json(res, 200, fallback(cfg, "approver_timeout", mustCard || guardActive) satisfies ApproveResp);
       return;
     }
 
@@ -2026,17 +2073,9 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
             + `本次已放行。如确要长期免审，请在 config.jsonc 的 \`approval.danger.allowPatterns\` 里加豁免正则。`,
         );
       }
-      // `.claude/**` 守卫生效的调用同理, 但理由更硬: 规则存了不只是"永远被压过"——
-      // 万一日后关掉守卫, 这条 allow 就会把静默死锁原样放回来(不发卡 + pane 阻塞)。
-      // 所以这里只做一次性放行, 并说清为什么「总是」在这个场景不成立。
-      if (!askHit && !danger && guardActive) {
-        await notify(
-          approver,
-          `⚠️ \`.claude/**\` 写操作不支持「总是」：这类改动会触发 CLI 原生确认框，`
-            + `而那个框只有在你点过卡之后才能被代按 —— 免审就等于回到静默死锁。本次已放行。`,
-        );
-      }
-      const gen = askHit || danger || guardActive
+      // `.claude/**` 守卫命中的调用现在可以正常存规则: 守卫不再靠"强制发卡"兜底,
+      // settleGuard 挂在每条 allow 出口上 —— 规则放行的那一次同样会去按原生框。
+      const gen = askHit || danger
         ? []
         : alwaysAllowRulesFor(toolName, toolInput, cfg.approval.allowRules);
       const added = gen.filter((r) => !cfg.approval.allowRules.includes(r));
@@ -2051,7 +2090,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
         }
         log.info({ toolName, added, persisted: Boolean(sourcePath) }, "allow_always rules saved");
         await notify(approver, `📌 已保存永久放行规则：${added.map((r) => `\`${r}\``).join("、")}`);
-      } else if (!askHit && !danger && !guardActive && gen.length === 0) {
+      } else if (!askHit && !danger && gen.length === 0) {
         // 提炼不出可靠字面规则 —— 本次一次性放行并告知。文案必须指对排查方向:
         // 成因有四种, 笼统说"引号/结构有问题"会把用户带偏 (例如真凶是 fd 重定向
         // 的 `&` 被当成后台执行符时, 用户会去查引号)。
@@ -2109,11 +2148,7 @@ export const makeApproveHandler = ({ cfg, log, client, sourcePath, getMirrorTarg
     // 放行 `.claude/**` 写操作后, CC 会在 hook 退出后立起自己的原生确认框 —— 必须
     // 等响应发出去才能去按 (框此刻还不存在)。fire-and-forget: 这条 HTTP 请求已经
     // 结束, 失败也只能靠告知, 不能再改判决。
-    if (guardActive && guardHit && decisionToHook(decision) === "allow") {
-      void settleClaudeConfigModal(sessionId, approver, guardHit).catch((e) => {
-        log.warn({ err: (e as Error).message, sessionId }, "settleClaudeConfigModal failed");
-      });
-    }
+    if (decisionToHook(decision) === "allow") settleGuard();
   };
 };
 

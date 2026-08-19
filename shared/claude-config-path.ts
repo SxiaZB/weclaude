@@ -61,11 +61,22 @@ const recordAssignments = (toks: string[], vars: Map<string, string>): void => {
 const expandVars = (tok: string, vars: Map<string, string>): string =>
   vars.size === 0 ? tok : tok.replace(VAR_REF_RE, (whole, braced, bare) => vars.get(braced ?? bare) ?? whole);
 
-/** 路径里是否有 `.claude` 这一段 —— `~/.claude/x`、`a/.claude`、裸 `.claude` 都算。 */
+// `.claude/` 下**不是配置面**的子树: agent worktree 是一整棵检出的代码树, 只是恰好
+// 寄居在这里 —— 写它跟写 settings.json / hooks / skills 没有任何关系, CC 不立框。
+// 2026-08-19 实测: 34 次 `.claude/worktrees/**` 写入, 原生框 0 次出现, 卡张张照发。
+// 不排掉的话守卫的收尾还会去 pane 上空等一个不存在的框, 甚至误按别的框。
+const NON_CONFIG_SUBTREES = new Set(["worktrees"]);
+
+/** 路径里是否有**配置面**的 `.claude` 段 —— `~/.claude/x`、`a/.claude`、裸 `.claude` 都算,
+ *  `NON_CONFIG_SUBTREES` 下的那一段不算。必须逐段看而不是只看第一个 `.claude`:
+ *  worktree 里检出的那棵树**自己也带 `.claude/`** (settings.json / skills), 写它照样立框。
+ *  例: `lisct/.claude/worktrees/agent-x/.claude/settings.json` —— 第一个 `.claude` 被
+ *  worktrees 排掉, 第二个才是真配置面。只看第一个就会漏判成非配置 → pane 静默死锁。 */
 export const isClaudeConfigPath = (raw: string): boolean => {
   const p = unquote(raw.trim());
   if (!p) return false;
-  return p.split("/").some((seg) => seg === ".claude");
+  const segs = p.split("/");
+  return segs.some((seg, i) => seg === ".claude" && !NON_CONFIG_SUBTREES.has(segs[i + 1] ?? ""));
 };
 
 // 段内所有「写重定向」的目标: `>f` `>>f` `2>f` `&>f` `>|f`, 以及 `>` 单独成 token
