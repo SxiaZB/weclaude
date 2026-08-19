@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.2.18] - 2026-08-19
+
+### Fixed
+- `approval`: 时间窗按钮不再是红色(企微 `style:3` 渲染成红色,与「放行」语义相悖),改 `style:1`(蓝)+ 文案 `⏱10h自动过` 点明语义;单条卡与批量卡同步。
+
 ### Changed
 - `keepalive`: **每轮心跳都发完整指令**,不再从第二轮起缩成裸 `ping`。缩写省下的那点 cache-write 换来的是不确定的回复 —— 裸 `ping` 在模型看来只是一次普通提问,爱怎么答怎么答,而任何非 `pong` 的回复都会被当成真实活动:心跳被"解吞"发进企微、`lastRealMs` 重新锚定、轮次计数清零。完整指令每轮重述,回复才稳定是 `pong`。`keepaliveStamps` 仍认裸 `ping`(旧 transcript 里还留着)。
 
@@ -212,7 +217,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.17...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.18...HEAD
+[1.2.18]: https://github.com/guxi11/wezard/compare/v1.2.17...v1.2.18
 [1.2.17]: https://github.com/guxi11/wezard/compare/v1.2.16...v1.2.17
 [1.2.16]: https://github.com/guxi11/wezard/compare/v1.2.15...v1.2.16
 [1.2.15]: https://github.com/guxi11/wezard/compare/v1.2.14...v1.2.15
