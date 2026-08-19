@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Changed
+- `keepalive`: **每轮心跳都发完整指令**,不再从第二轮起缩成裸 `ping`。缩写省下的那点 cache-write 换来的是不确定的回复 —— 裸 `ping` 在模型看来只是一次普通提问,爱怎么答怎么答,而任何非 `pong` 的回复都会被当成真实活动:心跳被"解吞"发进企微、`lastRealMs` 重新锚定、轮次计数清零。完整指令每轮重述,回复才稳定是 `pong`。`keepaliveStamps` 仍认裸 `ping`(旧 transcript 里还留着)。
+
 ## [1.2.17] - 2026-08-17
 
 ### Fixed

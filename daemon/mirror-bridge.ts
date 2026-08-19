@@ -3949,13 +3949,16 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   const fireKeepalive = async (a: AttachState, stalled: boolean): Promise<void> => {
     const kc = cfg.wrc.mirror.keepalive;
     // Stalled (error/limit banner + idle pane): send the full resume instruction
-    // every time — inviting the model to finish genuinely-unfinished work, or to
-    // reply "pong" if it was legitimately parked. Otherwise the plain warmer:
-    // only the streak's FIRST ping carries the full instruction; consecutive
-    // pings shrink to a bare "ping" (already in context — smaller cache-write,
-    // less pane clutter). keepaliveStamps matches every form, so none reads as
-    // real activity. (round is incremented below, after the inject lands.)
-    const text = stalled ? kc.resumePing : (a.keepalive?.round ?? 0) > 0 ? "ping" : kc.ping;
+    // — inviting the model to finish genuinely-unfinished work, or to reply
+    // "pong" if it was legitimately parked. Otherwise the plain warmer, the SAME
+    // full instruction every round: a bare "ping" used to be sent from round 2 on
+    // (the instruction was already in context), but the model reads a bare "ping"
+    // as an open turn and answers it however it likes — anything other than
+    // "pong" un-swallows the heartbeat into chat and re-anchors the clocks as
+    // real activity. Restating the instruction is a few tokens of cache-write and
+    // buys a deterministic reply. keepaliveStamps matches every form, so none
+    // reads as real activity. (round is incremented below, after the inject lands.)
+    const text = stalled ? kc.resumePing : kc.ping;
     a.keepalivePongBuf = ""; // fresh reply accumulator for the swallow/release gate
     // Suppress the pane→WeCom echo of the ping user line, then swallow the whole
     // ping turn (reply included). The 60s fail-safe clears the quiet window if

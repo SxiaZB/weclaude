@@ -164,11 +164,12 @@ export const keepaliveStamps = (
 ): { lastMs: number; lastRealMs: number; stamped: boolean } => {
   const turns = tailTurns(jsonlPath, 24);
   const norm = (s: string): string => s.replace(/\s+/gu, "");
-  // Streak pings after the first are a bare "ping" (the full instruction is
-  // already in context); a stall-recovery ping carries a different instruction.
-  // Match every injected form (`pingSigs` = normalized prefixes of each) plus the
-  // bare "ping", or a keepalive user line would read as REAL activity and re-anchor
-  // lastRealMs / reset the round counter before the model has even replied.
+  // Every warmer ping now carries the full instruction; a stall-recovery ping
+  // carries a different one. Match every injected form (`pingSigs` = normalized
+  // prefixes of each) plus the bare "ping" that streak pings used to shrink to
+  // (transcripts written before that changed still hold them) — otherwise a
+  // keepalive user line reads as REAL activity and re-anchors lastRealMs /
+  // resets the round counter before the model has even replied.
   const isPing = (t: Turn): boolean =>
     t.role === "user" &&
     (norm(t.text).toLowerCase() === "ping" ||
