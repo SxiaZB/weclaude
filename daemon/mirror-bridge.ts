@@ -34,7 +34,7 @@ import { hasMirrorAskq, runMirrorAskqFlow, hasMirrorPlan, mootMirrorPlan, runMir
 import { runTmux as runTmuxCmd, spawnTmuxClaude } from "./spawn-tmux.js";
 import { recordTool, recordToolResult, recordTurnStart, recordTurnItem, recordTurnUsage, recordTurnClose, recordCloseOpenTurns, buildDetailUrl, buildChatUrl } from "./detail.js";
 import type { CtxCut, TurnOrigin, TurnUsage } from "./detail.js";
-import { labelFor, tagOfKey, baseOfKey, withTagHeader } from "../shared/session-label.js";
+import { labelFor, tagOfKey, baseOfKey, keyOf, withTagHeader } from "../shared/session-label.js";
 import { splitMarkdown } from "../shared/md-chunk.js";
 import { randomTip } from "./tips.js";
 import { stripAnsi, compactPane, paneIsBusy, paneIsStalled, transcriptStalled, summarizeTail, lastAssistantText, lastContextTokens, keepaliveStamps, tailTurns, renderDialog, type PeerInfo } from "./peers.js";
@@ -1589,6 +1589,18 @@ export interface MirrorBridge {
   /** Sibling sessions of `target`'s chat (default + every `#tag`), each with
    *  liveness / busy / last-activity so an agent can see who else is working. */
   peers: (target: string) => Promise<PeerInfo[]>;
+  /** Sessions in OTHER chats whose `#tag` is globally unique across the host,
+   *  i.e. reachable from `target` via a bare tag lookup — the discovery surface
+   *  for cross-chat handoffs. Same shape as `peers`, with `self: false`. */
+  foreignPeers: (target: string) => Promise<PeerInfo[]>;
+  /** Resolve `tag` to a target key. Empty tag → self's chat default. Non-empty
+   *  prefers self's chat; if not present locally, falls back to a GLOBALLY
+   *  UNIQUE match across all chats (the cross-chat handoff path). Refuses on
+   *  0 or ≥2 foreign matches so callers must pick unambiguous tag names. */
+  resolvePeerTag: (
+    self: string,
+    tag: string,
+  ) => { ok: true; target: string; foreign: boolean } | { ok: false; reason: string; candidates?: string[] };
   /** Live tmux pane tail of `target` — what that agent's terminal shows right
    *  now, including in-flight tool calls the transcript hasn't recorded yet. */
   peekPane: (target: string, rows?: number) => Promise<{ ok: boolean; reason?: string; pane?: string; busy?: boolean }>;
@@ -3837,10 +3849,85 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   // untagged default plus every `#tag`. Live attachments are the truth; the
   // persisted store fills in cold bindings so a peer nobody has talked to since
   // the last reload is still discoverable (and revivable) rather than invisible.
+  const allTargets = (): string[] => {
+    const keys = new Set([...byTarget.keys(), ...Object.keys(deps.store.all())]);
+    return Array.from(keys).sort();
+  };
   const chatTargets = (target: string): string[] => {
     const base = basePrincipalOf(target);
-    const keys = new Set([...byTarget.keys(), ...Object.keys(deps.store.all())]);
-    return Array.from(keys).filter((k) => basePrincipalOf(k) === base).sort();
+    return allTargets().filter((k) => basePrincipalOf(k) === base);
+  };
+
+  // 跨 chat 的 peer 寻址:tag = "" 永远是本 chat 的 default(自身语义不变);
+  // 非空 tag 优先在本 chat 里查(平级 `#tag` 同名时不产生歧义);本 chat 没有
+  // 时再全局兜底 —— 全 host 上只有一个 session 挂着这个 tag 才认。0 命中或
+  // ≥2 命中都拒绝,让用户显式把目标 peer 的 tag 起成全局唯一的名字。
+  const resolvePeerTag = (
+    self: string,
+    tag: string,
+  ): { ok: true; target: string; foreign: boolean } | { ok: false; reason: string; candidates?: string[] } => {
+    const t = (tag ?? "").trim().replace(/^#/, "");
+    const local = keyOf(basePrincipalOf(self), t);
+    if (!t) return { ok: true, target: local, foreign: false };
+    const all = allTargets();
+    if (all.includes(local)) return { ok: true, target: local, foreign: false };
+    const foreignMatches = all.filter((k) => tagOfKey(k) === t && basePrincipalOf(k) !== basePrincipalOf(self));
+    if (foreignMatches.length === 1) return { ok: true, target: foreignMatches[0]!, foreign: true };
+    if (foreignMatches.length === 0) {
+      return { ok: false, reason: `no peer with tag '#${t}' — create one in the target chat first (/new #${t})` };
+    }
+    return {
+      ok: false,
+      reason: `tag '#${t}' is not globally unique — it exists in ${foreignMatches.length} chats; rename them so exactly one holds this tag`,
+      candidates: foreignMatches,
+    };
+  };
+
+  // list_peers 的跨 chat 补充:除了本 chat 的兄弟 sessions,再列出其他 chat 里
+  // **全局唯一** tag 的 session —— 那些才是当前调用方能直接 send_peer 命中的
+  // 外部 peer。带 base 前缀让人一眼看出属于哪个群。
+  const foreignPeers = async (self: string): Promise<PeerInfo[]> => {
+    const selfBase = basePrincipalOf(self);
+    const all = allTargets();
+    const byTag = new Map<string, string[]>();
+    for (const k of all) {
+      const tg = tagOfKey(k);
+      if (!tg) continue;
+      if (basePrincipalOf(k) === selfBase) continue;
+      const arr = byTag.get(tg) ?? [];
+      arr.push(k);
+      byTag.set(tg, arr);
+    }
+    const uniqueForeigns: string[] = [];
+    for (const [, arr] of byTag) if (arr.length === 1) uniqueForeigns.push(arr[0]!);
+    return Promise.all(
+      uniqueForeigns.map(async (t): Promise<PeerInfo> => {
+        const a = byTarget.get(t);
+        const rec = deps.store.get(t);
+        const jsonlPath = jsonlOf(t);
+        const pane = paneOf(t);
+        const paneAlive = pane ? await tmuxPaneAlive(pane) : false;
+        const tag = tagOfTarget(t);
+        let lastActivity = 0;
+        try { if (jsonlPath) lastActivity = statSync(jsonlPath).mtimeMs; } catch { /* not written yet */ }
+        return {
+          target: t,
+          tag,
+          label: tag ? labelFor(tag) : "🧙",
+          sessionId: a?.sessionId || rec?.sessionId || "",
+          jsonlPath,
+          cwd: a?.runningCwd || rec?.cwd || expandedDefaultCwd,
+          cli: jsonlPath ? backendForPath(jsonlPath).name : (activeBackends()[0]?.name ?? "claude"),
+          tmuxPane: pane,
+          attached: !!a,
+          paneAlive,
+          busy: paneAlive ? paneIsBusy(await capturePaneTail(pane, 12)) : false,
+          lastActivity,
+          summary: jsonlPath ? summarizeTail(jsonlPath) : "(未绑定会话)",
+          self: false,
+        };
+      }),
+    );
   };
 
   const paneOf = (target: string): string =>
@@ -4075,6 +4162,8 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
   return {
     attach,
     peers,
+    foreignPeers,
+    resolvePeerTag,
     peekPane,
     peekTurns,
     isBusy,

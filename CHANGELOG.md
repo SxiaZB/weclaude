@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Added
+- `peers`: **跨 chat 的 peer 寻址**。`send_peer` / `peek_peer` / `wait_peer` / `handoff` 的 `tag` 参数在本 chat 找不到目标时,会在全 host 的 sessions 里回退搜同名 tag —— 只当命中数**正好为 1** 时才认(0/多命中都拒绝、把原因回给调用方),把「跨 chat 交接」收敛成「让目标群里的 peer 起一个全局唯一的 tag」这一个约束,不引入 alias 表、不改授权模型。相应地 `list_peers` 新增 `foreignPeers`(其他 chat 里全局唯一 tag 的 session 列表),给 agent 发现可跨群命中的 peer。跨 chat 的 relay 气泡两侧 chat 都会推,免得被叫的那侧看不到「另一个群的 agent 找上门了」这件事。典型用法:daily 语料链的 peer 产出 corpus,直接 `send_peer("sanitizer-ingest")` 交给 sanitizer 群里的 `#sanitizer-ingest` 继续。
+
 ## [1.2.19] - 2026-08-19
 
 ### Fixed

@@ -34,7 +34,7 @@ import {
   addSchedule,
   removeSchedulesByTopic,
 } from "./topics.js";
-import { baseOfKey, keyOf, withTagHeader } from "../shared/session-label.js";
+import { baseOfKey, withTagHeader } from "../shared/session-label.js";
 import {
   startGraph,
   stopRun,
@@ -408,8 +408,17 @@ const main = async (): Promise<void> => {
     };
     // Peer addressed by tag. Empty tag = the chat's default (untagged) session,
     // which is a legitimate collaboration target ("report back to the main one").
-    const peerTarget = (self: string, tag: string): string =>
-      keyOf(baseOfKey(self), (tag ?? "").trim().replace(/^#/, ""));
+    // 非空 tag 若本 chat 里没有,会在全 host 的 sessions 里找**全局唯一**同 tag
+    // 的 session —— 那就是跨 chat 交接的落点。0/多命中都会失败,让用户把跨 chat
+    // 目标的 tag 起得唯一(比如 `#sanitizer-ingest` 而不是 `#fix`)。
+    const resolvePeer = (
+      self: string,
+      tag: string,
+    ): { ok: true; target: string; foreign: boolean } | { ok: false; status: number; reason: string; candidates?: string[] } => {
+      const r = m.resolvePeerTag(self, tag);
+      if (r.ok) return r;
+      return { ok: false, status: 404, reason: r.reason, candidates: r.candidates };
+    };
 
     interface PeerBody { target?: string; sessionId?: string; tmuxPane?: string; tag?: string }
     const readPeerBody = async (req: import("node:http").IncomingMessage): Promise<{ self: string; body: PeerBody }> => {
@@ -421,8 +430,8 @@ const main = async (): Promise<void> => {
     http.register("POST /peers/list", async (req, res) => {
       const { self } = await readPeerBody(req);
       if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session (pass target/sessionId/tmuxPane)" }); return; }
-      const peers = await m.peers(self);
-      json(res, 200, { ok: true, self, base: baseOfKey(self), peers });
+      const [peers, foreignPeers] = await Promise.all([m.peers(self), m.foreignPeers(self)]);
+      json(res, 200, { ok: true, self, base: baseOfKey(self), peers, foreignPeers });
     });
 
     // Push a plain markdown bubble into a chat. `base` may carry a `#tag` — a
@@ -436,18 +445,26 @@ const main = async (): Promise<void> => {
     // Agent↔agent traffic is invisible to the human otherwise: it happens inside
     // two panes nobody is watching. Relay each leg as its own bubble, headed
     // `<from> → <to>` so the direction reads at a glance in the chat timeline.
+    // 跨 chat 时两端都要看得见 —— from 的群显示 "我发出去了",to 的群显示
+    // "另一个群的 agent 找上门了",否则 to 侧的人以为消息是凭空冒出来的。
     const RELAY_MAX = 1200;
     const relayPeer = (from: string, to: string, body: string): void => {
       const text = body.trim();
       if (!text) return;
       const head = `${withTagHeader(from, "→")} ${withTagHeader(to, "")}`.trim();
-      notifyChat(from, `${head}\n${text.length > RELAY_MAX ? `${text.slice(0, RELAY_MAX)}…` : text}`);
+      const clipped = text.length > RELAY_MAX ? `${text.slice(0, RELAY_MAX)}…` : text;
+      const bubble = `${head}\n${clipped}`;
+      notifyChat(from, bubble);
+      if (baseOfKey(from) !== baseOfKey(to)) notifyChat(to, bubble);
     };
+
 
     http.register("POST /peers/peek", async (req, res) => {
       const { self, body } = await readPeerBody(req);
       if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
-      const target = peerTarget(self, body.tag ?? "");
+      const r = resolvePeer(self, body.tag ?? "");
+      if (!r.ok) { json(res, r.status, { ok: false, reason: r.reason, candidates: r.candidates }); return; }
+      const { target, foreign } = r;
       const turns = Math.min(Math.max(Number((body as { turns?: number }).turns ?? 6) || 6, 1), 40);
       // Transcript first — it is the conversation. Only when the peer has no
       // readable jsonl (never attached, or `/clear`ed a moment ago) do we fall
@@ -457,6 +474,7 @@ const main = async (): Promise<void> => {
       json(res, 200, {
         ok: true,
         target,
+        foreign,
         dialog: peek.dialog ?? "",
         pane: pane?.pane ?? "",
         error: peek.ok ? undefined : (pane?.reason ?? peek.reason),
@@ -470,26 +488,30 @@ const main = async (): Promise<void> => {
       if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
       const text = ((body as { text?: string }).text ?? "").toString();
       if (!text.trim()) { json(res, 400, { ok: false, reason: "text required" }); return; }
-      const target = peerTarget(self, body.tag ?? "");
+      const r = resolvePeer(self, body.tag ?? "");
+      if (!r.ok) { json(res, r.status, { ok: false, reason: r.reason, candidates: r.candidates }); return; }
+      const { target, foreign } = r;
       // Injecting into your own pane would type into the box you're generating
       // from — Claude Code queues it and the caller deadlocks waiting for itself.
       if (target === self) { json(res, 400, { ok: false, reason: "refusing to inject into the calling session itself" }); return; }
-      const r = await m.injectText(target, text);
-      if (r.ok) relayPeer(self, target, text);
-      json(res, r.ok ? 200 : 502, { ...r, target });
+      const inj = await m.injectText(target, text);
+      if (inj.ok) relayPeer(self, target, text);
+      json(res, inj.ok ? 200 : 502, { ...inj, target, foreign });
     });
 
     http.register("POST /peers/wait", async (req, res) => {
       const { self, body } = await readPeerBody(req);
       if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
-      const target = peerTarget(self, body.tag ?? "");
+      const r = resolvePeer(self, body.tag ?? "");
+      if (!r.ok) { json(res, r.status, { ok: false, reason: r.reason, candidates: r.candidates }); return; }
+      const { target, foreign } = r;
       if (target === self) { json(res, 400, { ok: false, reason: "refusing to wait on the calling session itself" }); return; }
       const timeoutMs = Math.min(Math.max(Number((body as { timeoutSec?: number }).timeoutSec ?? 900) || 900, 10), 7200) * 1000;
-      const r = await waitForIdle(target, m.isBusy, timeoutMs, () => false);
+      const wr = await waitForIdle(target, m.isBusy, timeoutMs, () => false);
       const lastText = m.lastText(target);
       // Only a finished turn is a real answer; a timeout's tail is half-written.
-      if (r.idle) relayPeer(target, self, lastText);
-      json(res, 200, { ok: true, target, idle: r.idle, reason: r.reason, lastText });
+      if (wr.idle) relayPeer(target, self, lastText);
+      json(res, 200, { ok: true, target, foreign, idle: wr.idle, reason: wr.reason, lastText });
     });
 
     // POST /handoff — 交接一个 pane 的会话给一个全新会话,原地完成。先让目标
@@ -501,8 +523,15 @@ const main = async (): Promise<void> => {
       const { self, body } = await readPeerBody(req);
       if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller session" }); return; }
       const pane = ((body as { pane?: string }).pane ?? "").trim();
-      const target = pane ? m.targetForPane(pane) : peerTarget(self, body.tag ?? "");
-      if (!target) { json(res, 404, { ok: false, reason: pane ? `no mirror session bound to pane ${pane}` : "cannot resolve target session" }); return; }
+      let target: string | undefined;
+      if (pane) {
+        target = m.targetForPane(pane);
+        if (!target) { json(res, 404, { ok: false, reason: `no mirror session bound to pane ${pane}` }); return; }
+      } else {
+        const r = resolvePeer(self, body.tag ?? "");
+        if (!r.ok) { json(res, r.status, { ok: false, reason: r.reason, candidates: r.candidates }); return; }
+        target = r.target;
+      }
       // 注入到自己的 pane = 往正在生成的输入框里打字,Claude Code 会把它排队,
       // 调用方等自己等成死锁(同 /peers/send)。
       if (target === self) { json(res, 400, { ok: false, reason: "refusing to hand off the calling session itself (would deadlock)" }); return; }

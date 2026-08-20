@@ -376,7 +376,7 @@ server.registerTool(
   {
     title: "List sibling agent sessions in this chat",
     description:
-      "List the OTHER agent sessions running in the SAME WeCom chat as this one. A chat hosts one default session plus any number of `#tag` sessions (e.g. `#fix`, `#review`), each with its own tmux pane, CLI, model and working directory. Returns for each peer: its tag, emoji label, cwd, CLI, whether its pane is alive, whether it is mid-turn (`busy`), when it last did anything, and a one-line summary of its recent conversation. `self: true` marks your own session. Call this FIRST whenever the user refers to another agent or tag — '#fix 进展如何', '还有谁在跑', '让 #docs 也看看' — then use peek_peer / send_peer / wait_peer to actually collaborate.",
+      "List the OTHER agent sessions running in the SAME WeCom chat as this one. A chat hosts one default session plus any number of `#tag` sessions (e.g. `#fix`, `#review`), each with its own tmux pane, CLI, model and working directory. Returns for each peer: its tag, emoji label, cwd, CLI, whether its pane is alive, whether it is mid-turn (`busy`), when it last did anything, and a one-line summary of its recent conversation. `self: true` marks your own session. Also returns `foreignPeers`: sessions living in OTHER chats whose `#tag` is globally unique across the host — those are the ones you can reach with a plain `send_peer('theirTag')` to hand work across chats (e.g. daily pipeline → sanitizer). Call this FIRST whenever the user refers to another agent or tag — '#fix 进展如何', '还有谁在跑', '让 #docs 也看看', '把语料交给 #sanitizer 处理' — then use peek_peer / send_peer / wait_peer to actually collaborate.",
     inputSchema: {},
   },
   async () => unwrap("list_peers", await daemonPost("/peers/list", {})),
@@ -387,9 +387,9 @@ server.registerTool(
   {
     title: "Read a sibling agent's conversation",
     description:
-      "Observe another agent in this chat WITHOUT interrupting it: returns `dialog` — the last N turns of its actual conversation, read from its session transcript, `▸` for what was asked and `◂` for what it answered — plus whether it is currently mid-turn (`busy`) and its most recent complete reply (`lastText`). This is the readable record of what that agent and whoever drives it have been saying; use it to answer '查看 #fix 的进展', '他们聊到哪了', or to decide whether a peer needs a nudge. If the peer has no readable transcript yet, `pane` falls back to its raw terminal tail. Read-only and safe to poll.",
+      "Observe another agent WITHOUT interrupting it: returns `dialog` — the last N turns of its actual conversation, read from its session transcript, `▸` for what was asked and `◂` for what it answered — plus whether it is currently mid-turn (`busy`) and its most recent complete reply (`lastText`). This is the readable record of what that agent and whoever drives it have been saying; use it to answer '查看 #fix 的进展', '他们聊到哪了', or to decide whether a peer needs a nudge. If the peer has no readable transcript yet, `pane` falls back to its raw terminal tail. `foreign: true` in the reply means the tag resolved to a session in another chat. Read-only and safe to poll.",
     inputSchema: {
-      tag: z.string().describe("The peer's tag WITHOUT '#', e.g. 'fix'. Empty string = the chat's default (untagged) session."),
+      tag: z.string().describe("Peer tag WITHOUT '#'. Empty string = this chat's default (untagged) session. A non-empty tag prefers a same-chat match; if none exists, it falls back to a GLOBALLY UNIQUE match in another chat (cross-chat peek). Refuses when the tag is ambiguous — pick a unique name."),
       turns: z.number().optional().describe("How many recent conversation turns to return (1-40, default 6)."),
     },
   },
@@ -401,9 +401,9 @@ server.registerTool(
   {
     title: "Send a message into a sibling agent's session",
     description:
-      "Type a message into another agent's session in this chat, exactly as if the user had sent it there — the peer picks it up as a new turn. This is how you DRIVE a peer: unblock it, answer its question, hand it work, or tell it to keep going. Typical loop for '推动 #fix 直到结束': peek_peer → send_peer with the nudge → wait_peer until it goes idle → peek_peer again, repeat until its reply says it is done. If the peer's session doesn't exist yet, create it first (run_agent_graph declares nodes, or ask the user to `/new #tag`). Refuses to target your own session.",
+      "Type a message into another agent's session, exactly as if the user had sent it there — the peer picks it up as a new turn. This is how you DRIVE a peer: unblock it, answer its question, hand it work, or tell it to keep going. Typical loop for '推动 #fix 直到结束': peek_peer → send_peer with the nudge → wait_peer until it goes idle → peek_peer again. Cross-chat handoff (e.g. daily pipeline → sanitizer): the target agent lives in a DIFFERENT WeCom chat under a globally-unique tag like `#sanitizer-ingest`; call send_peer with that tag and the daemon routes across chats automatically — both chats see the exchange in their timelines. If the peer's session doesn't exist yet, ask the user to `/new #tag` in the target chat first. Refuses to target your own session.",
     inputSchema: {
-      tag: z.string().describe("The peer's tag WITHOUT '#', e.g. 'fix'. Empty string = the chat's default (untagged) session."),
+      tag: z.string().describe("Peer tag WITHOUT '#'. Empty string = this chat's default (untagged) session. A non-empty tag prefers a same-chat match; if none exists, it falls back to a GLOBALLY UNIQUE match in another chat (cross-chat send). Refuses when the tag is ambiguous — the user should rename so exactly one session holds that tag."),
       text: z.string().describe("Message to inject. Plain prompt text; slash commands like '/clear' also work."),
     },
   },
@@ -417,7 +417,7 @@ server.registerTool(
     description:
       "Block until the named peer stops working (its terminal no longer shows an interrupt hint), then return its latest reply. Use it after send_peer so you act on a finished answer instead of a half-written one. Returns `idle: false` with a reason if the timeout hits first — the peer is simply still working, so you can peek and wait again. Cheap: the daemon polls the pane, it does not consume tokens.",
     inputSchema: {
-      tag: z.string().describe("The peer's tag WITHOUT '#'. Empty string = the chat's default session."),
+      tag: z.string().describe("Peer tag WITHOUT '#'. Empty string = this chat's default session. Non-empty prefers same-chat, falls back to a GLOBALLY UNIQUE match in another chat."),
       timeoutSec: z.number().optional().describe("Max seconds to wait (10-7200, default 900)."),
     },
   },
@@ -504,7 +504,7 @@ server.registerTool(
       "Hand off the work in a tmux pane / peer session to a BRAND-NEW session, in place: the daemon asks that session to compress everything into a self-contained handoff brief, waits for it, then sends `/clear` into the SAME pane (resets the context window, new sessionId, same cwd) and pastes the brief in as the new session's first message. Use this when a session's context window is bloated / near its limit, or the user says '交接一下' / 'handoff' / '开个新会话接着干' / '压缩上下文重开'. Address the session by tmux `pane` id (e.g. '%5', from list_peers / list_claude_sessions) OR by peer `tag`. Refuses to hand off your OWN session (would deadlock). Returns the brief that was carried across.",
     inputSchema: {
       pane: z.string().optional().describe("Target tmux pane id, e.g. '%5'. Takes precedence over tag. Get it from list_peers / list_claude_sessions."),
-      tag: z.string().optional().describe("Peer tag WITHOUT '#', e.g. 'fix'. Empty string = the chat's default session. Ignored when pane is given."),
+      tag: z.string().optional().describe("Peer tag WITHOUT '#'. Empty string = this chat's default session. Non-empty prefers same-chat, falls back to a GLOBALLY UNIQUE match in another chat. Ignored when pane is given."),
       focus: z.string().optional().describe("Optional emphasis for the handoff brief, e.g. '重点交代还没跑通的测试'."),
       timeoutSec: z.number().optional().describe("Max seconds to wait for the summary before aborting (30-7200, default 600)."),
     },
