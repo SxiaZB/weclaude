@@ -273,6 +273,53 @@ export const compactPane = (paneText: string, rows = 24): string =>
     .slice(-rows)
     .join("\n");
 
+// ── Peer mentions ─────────────────────────────────────────────────────
+// The inbound router consumes only the FIRST `#tag` of a message — that one
+// says WHICH session receives it. Every other `#tag` flows through verbatim,
+// and that is exactly where the user points at a sibling: "让 #b 也看一眼",
+// "把 #fix 的结论拿过来". The receiving agent sees a bare token with nothing in
+// its context marking it as a live session, so it answers on #b's behalf (or
+// reads it as an issue number) instead of reaching for the peer tools.
+//
+// Annotating the mention at the boundary is what turns `#b` into "peer b". The
+// hint is only ever emitted for tags that ALREADY resolve through the same
+// lookup send_peer/peek_peer use, so it can never advertise a call that would
+// fail — an unresolvable `#123` / `#L45` passes through silently.
+export interface PeerMention {
+  /** Tag as written, without `#`. Exactly what the peer tools take. */
+  tag: string;
+  /** Resolved session key, e.g. `chat:wrxxx#b`. */
+  target: string;
+  /** Lives in a DIFFERENT chat, reached by its globally-unique tag. */
+  foreign: boolean;
+  label: string;
+  cwd: string;
+}
+
+/** Machinery, not conversation: the `<system-reminder>` wrapper is the same
+ *  marker the mirror's meta-stripper and `tailTurns` already drop, so the hint
+ *  reaches the agent's context without leaking into WeCom bubbles or peer
+ *  summaries. Empty string for no mentions — appending it stays a no-op. */
+export const renderPeerMentionHint = (mentions: readonly PeerMention[]): string => {
+  if (mentions.length === 0) return "";
+  const lines = mentions.map(
+    (m) =>
+      `- \`#${m.tag}\` ${m.label} — a live agent session${m.foreign ? " in ANOTHER chat" : " in this chat"}` +
+      ` (target \`${m.target}\`${m.cwd ? `, cwd ${m.cwd}` : ""}), reachable as tag "${m.tag}".`,
+  );
+  return [
+    "",
+    "<system-reminder>",
+    "The `#tag` token(s) in the message above name peer agent sessions, not literal text:",
+    ...lines,
+    "When the user asks you to involve, check on, or relay to one of them, use the wezard peer tools rather than",
+    "guessing or answering on its behalf: peek_peer(tag) reads its recent conversation, send_peer(tag, text) hands",
+    "it work or a nudge, wait_peer(tag) blocks until it goes idle, list_peers() shows everyone. A mention that is",
+    "merely referential (\"#b 说的那个方案\") needs no tool call — judge from what the user is asking for.",
+    "</system-reminder>",
+  ].join("\n");
+};
+
 // ── Peer model ────────────────────────────────────────────────────────
 export interface PeerInfo {
   /** Full session key, e.g. `chat:wrxxx#fix`. */

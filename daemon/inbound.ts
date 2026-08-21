@@ -7,7 +7,7 @@ import type { Logger } from "pino";
 import type { Config } from "../shared/config.js";
 import type { Bridge } from "./cc-bridge.js";
 import type { MirrorBridge } from "./mirror-bridge.js";
-import { tailTurns, type PeerInfo } from "./peers.js";
+import { tailTurns, renderPeerMentionHint, type PeerInfo, type PeerMention } from "./peers.js";
 import { expandHome, sanitizeId } from "../shared/paths.js";
 import type { CliBackendName } from "../shared/cli-backends.js";
 import { tryConsumeClaim, persistClaim, ackClaim, shouldAutoClaim, ackAutoClaim } from "./claim.js";
@@ -17,7 +17,7 @@ import { computeUsage, renderUsageReport } from "./usage.js";
 import { computeAuditReport } from "./audit.js";
 import { syncProjectConfig, renderSyncReport } from "./cfg-sync.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
-import { tagOfKey, baseOfKey, withTagHeader, parseTagHeader } from "../shared/session-label.js";
+import { tagOfKey, baseOfKey, withTagHeader, parseTagHeader, tagTokenRe, allTags, labelFor } from "../shared/session-label.js";
 
 /** 判定"引用内容是否已在目标会话上下文里"时回看的轮数 —— 引用的通常是最近几轮
  *  里的某条气泡,再往前用户多半是真想把老内容重新拎出来说事。 */
@@ -35,9 +35,9 @@ const chatPrincipal = (msg: BaseMessage): string =>
 // "#L45-foo/bar" survive. Only the FIRST tag in a message is honored — that
 // tag is stripped from the forwarded text; any additional #foo tokens flow
 // through verbatim (may be actual references in the user's prompt).
-// 右边界除空白/行尾外,零宽与 word-joiner 等不可见格式字符也算分隔 —— 输入法/复制
-// 常在 tag 后夹一个 U+2060 之类,否则 (?=\s|$) 落空,tag 被吞、消息误落默认会话。
-const TAG_RE = /(^|\s)#([\p{L}\p{N}_-]{1,32})(?=[\s\u200B-\u200D\u2060\uFEFF]|$)/u;
+// 剩下那些 #foo 里,真正指向兄弟会话的会在出站前被标注(见 peerMentions)。
+// Token 规则收在 session-label(tagTokenRe / allTags),路由与标注共用同一把尺子。
+const TAG_RE = tagTokenRe();
 const parseTag = (text: string): { tag: string; cleaned: string } => {
   const m = TAG_RE.exec(text);
   if (!m) return { tag: "", cleaned: text };
@@ -806,9 +806,26 @@ export const installInboundRouter = (
     return canonContains(tailTurns(jsonl, QUOTE_TAIL_TURNS).map((t) => t.text).join("\n"), quoted);
   };
 
+  // 路由用掉的那个 `#tag` 已被 parseTag 摘走,正文里剩下的每个 `#x` 都可能是
+  // 用户在指另一个会话。解析走 bridge 自己的 resolvePeerTag —— peer 工具用的
+  // 同一套(本 chat 优先、否则全局唯一 tag),所以标注出来的 tag 一定是
+  // peek_peer/send_peer 打得中的;解析不到的 `#123`/`#L45` 与自指静默略过。
+  const peerMentions = (who: string, text: string): PeerMention[] => {
+    if (!("resolvePeerTag" in bridge)) return [];
+    const mb = bridge as MirrorBridge;
+    return allTags(text).flatMap((tag): PeerMention[] => {
+      const r = mb.resolvePeerTag(who, tag);
+      if (!r.ok || r.target === who) return [];
+      const { runningCwd, defaultCwd } = mb.getCwd(r.target);
+      return [{ tag, target: r.target, foreign: r.foreign, label: labelFor(tag), cwd: runningCwd || defaultCwd }];
+    });
+  };
+
   const send = async (frame: WsFrame<BaseMessage>, msg: BaseMessage, who: string, text: string, images: string[] = []): Promise<void> => {
+    // 斜杠命令按行解析,尾巴上多挂一段会让它不再被识别成命令 —— 只标注普通消息。
+    const hint = text.trimStart().startsWith("/") ? "" : renderPeerMentionHint(peerMentions(who, text));
     try {
-      await bridge.dispatch({ principal: who, text, images, frame, streamId: msg.msgid });
+      await bridge.dispatch({ principal: who, text: text + hint, images, frame, streamId: msg.msgid });
     } catch (e) {
       log.error({ err: (e as Error).message }, "bridge dispatch failed");
       try { await client.replyStream(frame, msg.msgid, withTagHeader(who, `[wezard] error: ${(e as Error).message}`), true); } catch { /* ignore */ }

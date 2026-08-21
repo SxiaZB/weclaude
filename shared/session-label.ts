@@ -28,6 +28,26 @@ export const labelFor = (sessionId: string): string => {
   return ANIMALS[hash(sessionId) % ANIMALS.length] ?? "❔";
 };
 
+// ── `#tag` lexicon ──────────────────────────────────────────────────────
+// One rule for what counts as a tag token, shared by everything that reads
+// them out of user prose: the inbound router (FIRST match = which session gets
+// the message) and peer-mention annotation (the REST = references to sibling
+// sessions). Two readers of the same text must not disagree on where the tokens
+// are, or a mention the router left in the body could go unannotated.
+// Must be space-delimited or edge-of-string so genuine URLs / paths like
+// "#L45-foo/bar" survive. 右边界除空白/行尾外,零宽与 word-joiner 等不可见格式
+// 字符也算分隔 —— 输入法/复制常在 tag 后夹一个 U+2060 之类。
+const TAG_TOKEN = "(^|\\s)#([\\p{L}\\p{N}_-]{1,32})(?=[\\s\\u200B-\\u200D\\u2060\\uFEFF]|$)";
+
+/** Fresh non-global matcher — capture 2 is the tag. Own instance per caller so
+ *  nobody inherits another's `lastIndex`. */
+export const tagTokenRe = (): RegExp => new RegExp(TAG_TOKEN, "u");
+
+/** Every distinct `#tag` in `text`, in first-appearance order. */
+export const allTags = (text: string): string[] => [
+  ...new Set([...text.matchAll(new RegExp(TAG_TOKEN, "gu"))].map((m) => m[2] ?? "").filter(Boolean)),
+];
+
 // ── Target-key tagging ──────────────────────────────────────────────────
 // Daemon-internal target keys are `user:xxx[#tag]` / `chat:xxx[#tag]`. Every
 // user-visible artifact bound to a TAGGED session must carry the same visual
