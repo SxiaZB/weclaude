@@ -18,6 +18,7 @@ import { computeAuditReport } from "./audit.js";
 import { syncProjectConfig, renderSyncReport } from "./cfg-sync.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
 import { tagOfKey, baseOfKey, withTagHeader, parseTagHeader, tagTokenRe, allTags, labelFor } from "../shared/session-label.js";
+import { chatNameOf, clearChatName, listChatNames, peerAddress, setChatName } from "./chat-name.js";
 
 /** 判定"引用内容是否已在目标会话上下文里"时回看的轮数 —— 引用的通常是最近几轮
  *  里的某条气泡,再往前用户多半是真想把老内容重新拎出来说事。 */
@@ -133,6 +134,15 @@ const parseCfgSyncCommand = (text: string): { apply: boolean } | undefined => {
   const m = CFGSYNC_RE.exec(text.trim());
   return m ? { apply: Boolean(m[1]) } : undefined;
 };
+// `/name` 读, `/name x` 写, `/name -` 摘掉。名字是 chat 级的 —— 带不带 `#tag`
+// 路由过来都命名同一个聊天, 所以这里不看 tag。
+const NAME_RE_CMD = /^\/name(?:\s+(\S+))?$/i;
+const parseNameCommand = (text: string): { arg: string } | undefined => {
+  const m = NAME_RE_CMD.exec(text.trim());
+  return m ? { arg: m[1] ?? "" } : undefined;
+};
+// `/chats` — 跨聊天目录: 谁有名字、谁没有、各自跑着哪些会话。
+const isChatsCommand = (text: string): boolean => /^\/chats?$/i.test(text.trim());
 const isUsageCommand = (text: string): boolean => text.trim() === "/usage";
 const isStopCommand = (text: string): boolean => text.trim() === "/stop";
 const isKillCommand = (text: string): boolean => text.trim() === "/kill";
@@ -166,6 +176,13 @@ const renderHelp = (): string =>
     "即路由到该标签会话;不带 tag = 默认会话。tagged 会话的回复以 `emoji #tag` 前缀标注。",
     "`/clear #tag`、`/pwd #tag`、`/stop #tag` 等命令同理按 tag 路由。",
     "`#tag` 与 CLI 名可同时写:`/new codebuddy #docs` = 用 codebuddy 开 docs 会话。",
+    "",
+    "▎跨聊天",
+    "`/name <名字>` 给本聊天起名 · `/name` 查看 · `/name -` 取消",
+    "`/chats` 列出所有已知聊天及其会话",
+    "起了名字,别的聊天就能用 `名字#tag`(如 `daily#fix`)精确叫到这里的会话 ——",
+    "对 AI 说「让 daily#fix 看一眼」「在 daily 里开个 #ingest 跑这个目录」即可,",
+    "它会调 `send_peer` / `new_claude_session` 跨群寻址、跨群建会话。",
     "",
     "▎多会话协作",
     "`/peers` 列出本聊天的所有会话及忙闲状态",
@@ -253,11 +270,32 @@ const renderPeers = (peers: PeerInfo[]): string => {
       "",
     ];
   });
+  const named = peers.find((p) => p.chat)?.chat ?? "";
   return [
-    `[wezard] 本聊天的会话 · ${peers.length} 个${shared.length ? ` · ${shared.join(" · ")}` : ""}`,
+    `[wezard] 本聊天${named ? ` \`${named}\`` : ""}的会话 · ${peers.length} 个${shared.length ? ` · ${shared.join(" · ")}` : ""}`,
     "",
     ...rows,
     "> 协作：直接说「看下 #fix 的进展并推动它」，AI 会读它的终端并注入指令",
+    named ? "" : "> 起名：`/name <名字>` — 起了名字，别的聊天才能用 `名字#tag` 叫到这里的会话",
+  ].filter((l) => l !== "").join("\n");
+};
+
+// /chats — 跨聊天目录。命名的聊天可以被 `名字#tag` 精确寻址;没命名的只能靠
+// 「全局唯一 tag」碰运气,所以这里把「未命名」显式标出来当作行动号召。
+const renderChats = (
+  roster: Array<{ base: string; name: string; self: boolean; targets: string[] }>,
+): string => {
+  if (roster.length === 0) return "[wezard] 还没有任何聊天在跑会话。";
+  const rows = roster.flatMap((c) => {
+    const sessions = c.targets.map((t) => (tagOfKey(t) ? `#${tagOfKey(t)}` : "默认")).join(" · ") || "(无)";
+    const head = c.name ? `\`${c.name}\`` : `_(未命名)_ \`${c.base}\``;
+    return [`**${head}**${c.self ? " ⬅️ 本聊天" : ""} · ${c.targets.length} 个会话`, `　${sessions}`, ""];
+  });
+  return [
+    `[wezard] 已知的聊天 · ${roster.length} 个`,
+    "",
+    ...rows,
+    "> 跨聊天寻址：`名字#tag`（如 `daily#fix`）。未命名的聊天先在里面发 `/name <名字>`",
   ].join("\n");
 };
 
@@ -721,6 +759,38 @@ export const installInboundRouter = (
       await replyText(frame, msg, who, body);
       return { stop: true };
     }
+    // /name [x|-] — 给本聊天起名。名字是跨聊天寻址的唯一稳定 key(`daily#fix`),
+    // 所以它写进 config.jsonc 而不是运行时 state。改名即覆盖:一个聊天只留一个
+    // 名字,一个名字只归一个聊天 —— 两边都唯一,`daily#fix` 才是个确定的地址。
+    const nc = parseNameCommand(text);
+    if (nc) {
+      const cur = chatNameOf(cfg, who);
+      if (!nc.arg) {
+        await replyText(frame, msg, who, cur
+          ? `[wezard] 本聊天名为 \`${cur}\` — 别处可用 \`${cur}#tag\` 寻址本聊天的会话`
+          : "[wezard] 本聊天还没起名。`/name <名字>` 起一个，别的聊天才能用 `名字#tag` 叫到这里的会话。");
+        return { stop: true };
+      }
+      if (nc.arg === "-") {
+        const gone = clearChatName(cfg, sourcePath, who);
+        await replyText(frame, msg, who, gone ? `[wezard] 已取消命名 \`${gone}\`` : "[wezard] 本聊天本来就没起名。");
+        return { stop: true };
+      }
+      const r = setChatName(cfg, sourcePath, who, nc.arg);
+      await replyText(frame, msg, who, r.ok
+        ? `[wezard] ✅ 本聊天更名为 \`${r.name}\`${cur && cur !== r.name ? `（原 \`${cur}\`）` : ""} — 别处用 \`${r.name}#tag\` 即可寻址`
+        : `[wezard] /name failed: ${r.reason}`);
+      return { stop: true };
+    }
+    // /chats — 跨聊天目录:谁有名字、各自跑着哪些会话。Read-only。
+    if (isChatsCommand(text)) {
+      if (!("chatRoster" in bridge)) {
+        await replyText(frame, msg, who, `[wezard] headless 模式无会话目录。已命名的聊天：${listChatNames(cfg).map((c) => c.name).join(", ") || "(无)"}`);
+        return { stop: true };
+      }
+      await replyText(frame, msg, who, renderChats(bridge.chatRoster(who)));
+      return { stop: true };
+    }
     // /peers — this chat's own session roster (default + `#tag` siblings), with
     // live busy state. Read-only, mirror-mode only.
     if (isPeersCommand(text)) {
@@ -808,8 +878,9 @@ export const installInboundRouter = (
 
   // 路由用掉的那个 `#tag` 已被 parseTag 摘走,正文里剩下的每个 `#x` 都可能是
   // 用户在指另一个会话。解析走 bridge 自己的 resolvePeerTag —— peer 工具用的
-  // 同一套(本 chat 优先、否则全局唯一 tag),所以标注出来的 tag 一定是
-  // peek_peer/send_peer 打得中的;解析不到的 `#123`/`#L45` 与自指静默略过。
+  // 同一套(本 chat 优先、否则全局唯一 tag、再否则带 chat 名的全称),所以标注
+  // 出来的地址一定是 peek_peer/send_peer 打得中的;解析不到的 `#123`/`#L45` 与
+  // 自指静默略过。给的是 `address` 而不是裸 tag —— 跨 chat 时裸 tag 未必唯一。
   const peerMentions = (who: string, text: string): PeerMention[] => {
     if (!("resolvePeerTag" in bridge)) return [];
     const mb = bridge as MirrorBridge;
@@ -817,7 +888,15 @@ export const installInboundRouter = (
       const r = mb.resolvePeerTag(who, tag);
       if (!r.ok || r.target === who) return [];
       const { runningCwd, defaultCwd } = mb.getCwd(r.target);
-      return [{ tag, target: r.target, foreign: r.foreign, label: labelFor(tag), cwd: runningCwd || defaultCwd }];
+      return [{
+        tag,
+        target: r.target,
+        address: peerAddress(cfg, who, r.target),
+        chat: chatNameOf(cfg, r.target),
+        foreign: r.foreign,
+        label: labelFor(tag),
+        cwd: runningCwd || defaultCwd,
+      }];
     });
   };
 

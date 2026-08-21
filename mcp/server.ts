@@ -315,31 +315,6 @@ server.registerTool(
   },
 );
 
-server.registerTool(
-  "new_claude_session",
-  {
-    title: "Spawn a new Claude session and mirror it",
-    description:
-      "Spawn a brand-new Claude Code session in a fresh tmux pane rooted at the given project path, then switch the WeCom mirror to it. Call this when the user asks to start a new session somewhere — e.g. '在 /path/to/proj 下新建一个 claude session', '帮我在 xxx 目录起个新会话'. The directory is created if it doesn't exist.",
-    inputSchema: {
-      cwd: z.string().describe("Absolute project path to start the new session in, e.g. /Users/foo/projects/bar. Created if missing."),
-      cli: z
-        .enum(["claude", "claude-internal", "codebuddy"])
-        .optional()
-        .describe("Which CLI to launch. Omit unless the user names one (e.g. '用 codebuddy 起一个'); the daemon's default backend is used otherwise. Multiple backends can run side by side."),
-    },
-  },
-  async ({ cwd, cli }) => {
-    const resp = await fetch(`${DAEMON_BASE}/sessions/new`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ cwd, cli }),
-    });
-    const j = (await resp.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
-    return j.ok ? ok(j) : fail(`new_claude_session failed: ${j.reason ?? `http ${resp.status}`}`);
-  },
-);
-
 // ── Peer collaboration (agent ↔ agent inside one WeCom chat) ───────────────
 // One WeCom chat can host several concurrent agent sessions, each addressed by
 // a `#tag` (`#fix`, `#docs`, …) and each free to run a different CLI / model /
@@ -371,12 +346,87 @@ const daemonPost = async (path: string, body: Record<string, unknown>): Promise<
 const unwrap = (name: string, { j, status }: { j: Record<string, unknown>; status: number }) =>
   j.ok ? ok(j) : fail(`${name} failed: ${(j.reason as string) ?? `http ${status}`}`);
 
+// The one address grammar, restated in full wherever a tool takes one: a model
+// reading a single tool schema in isolation has no other place to learn it, and
+// a guessed address silently resolves to the wrong agent's terminal.
+const ADDRESS_DOC =
+  "Peer address. `''` = this chat's own default (untagged) session. A bare tag like `'fix'` means THIS chat's `#fix`, falling back to a GLOBALLY UNIQUE `#fix` in some other chat. `'daily#fix'` names the chat outright — the reliable cross-chat form, and the only one that works when several chats each hold a `#fix`. Never invent one: list_peers and list_chats return the exact string to pass, as `address`.";
+
+// Creating a session is a peer operation, not a global one: it lands in the
+// caller's own chat (hence `selfRef` via daemonPost) under its own `#tag`, or —
+// with `chat` — in another NAMED chat, which is what chat naming buys.
+server.registerTool(
+  "new_claude_session",
+  {
+    title: "Spawn a new peer session",
+    description:
+      "Spawn a brand-new agent session in a fresh tmux pane rooted at the given project path, as a `#tag` PEER — by default of THIS chat, exactly what the user gets by typing `/new #tag` here. The peer posts into that chat (its bubbles are headed `emoji #tag`, and it shows up in chat detail), and you can drive it afterwards with list_peers / peek_peer / send_peer / wait_peer. Call this when the user asks to start a new session somewhere — e.g. '在 /path/to/proj 下新建一个 claude session', '帮我在 xxx 目录起个新会话', '再开一个 agent 干这件事'. Pass `chat` to create it in ANOTHER chat instead ('在 daily 群里开一个 #ingest 跑这个目录') — that chat must have a name (list_chats shows them); this is the way to stand up a cross-chat collaborator that doesn't exist yet, instead of asking a human to go type `/new` over there. The directory is created if it doesn't exist. Never takes over a chat's default session.",
+    inputSchema: {
+      cwd: z.string().describe("Absolute project path to start the new session in, e.g. /Users/foo/projects/bar. Created if missing."),
+      tag: z
+        .string()
+        .optional()
+        .describe("Tag to address the new peer by, WITHOUT '#' (e.g. 'fix', 'docs'). Pick a short name describing its job; use it later with send_peer / peek_peer. Must not collide with an existing peer in the target chat — call list_peers / list_chats first if unsure. Omitted → derived from the directory name."),
+      chat: z
+        .string()
+        .optional()
+        .describe("Name of the chat to create the peer in (as shown by list_chats). Omit for this chat, which is what the user almost always means. Only NAMED chats can be targeted — an unnamed one has no address, so someone must run `/name <name>` in it first."),
+      cli: z
+        .enum(["claude", "claude-internal", "codebuddy"])
+        .optional()
+        .describe("Which CLI to launch. Omit unless the user names one (e.g. '用 codebuddy 起一个'); the peer then inherits that chat's current backend. Multiple backends can run side by side."),
+    },
+  },
+  async ({ cwd, tag, chat, cli }) =>
+    unwrap("new_claude_session", await daemonPost("/sessions/new", {
+      cwd,
+      ...(tag ? { tag } : {}),
+      ...(chat ? { chat } : {}),
+      ...(cli ? { cli } : {}),
+    })),
+);
+
+// ── Chat naming (the cross-chat address space) ─────────────────────────────
+// A WeCom chat's identity is an unreadable `chat:wrkS…` id, so before naming,
+// the ONLY way to reach across chats was a tag that happened to be globally
+// unique. A name turns the chat into a token a human can type and an agent can
+// pass, which is what makes `daily#fix` — and spawning into `daily` — possible.
+server.registerTool(
+  "name_chat",
+  {
+    title: "Name this WeCom chat",
+    description:
+      "Give THIS chat a short name, so agents in other chats can address its sessions as `name#tag` and spawn peers into it. Call this when the user says '给这个群起个名叫 daily' / '把这个聊天命名为 xxx' / '这个群叫什么' (omit `name` to just read the current one) / '取消命名' (pass '-'). Names are unique across the host and case-insensitive; renaming replaces the old name, and any address written against the old one stops resolving. After naming, tell the user the address form their other chats should use (`name#tag`).",
+    inputSchema: {
+      name: z
+        .string()
+        .optional()
+        .describe("The new name: 1-32 chars, letters/digits/'_'/'-' only (no spaces, '#', '/', ':'). Omit to read the current name without changing it. Pass '-' to remove the name."),
+    },
+  },
+  async ({ name }) =>
+    name === undefined
+      ? unwrap("name_chat", await daemonPost("/chats/list", {})) // read-only path: roster carries this chat's name
+      : unwrap("name_chat", await daemonPost("/chats/name", { name })),
+);
+
+server.registerTool(
+  "list_chats",
+  {
+    title: "List every chat and its sessions",
+    description:
+      "The cross-chat directory: every WeCom chat the daemon knows, its name (empty = unnamed), whether it is the one you live in (`self`), and the sessions running in each with the exact `address` to pass to send_peer / peek_peer / wait_peer. Call this whenever the user points at work outside this chat — '别的群有谁在跑', '把这个交给 daily 群的 agent', '在 sanitizer 群里开个会话' — or when a peer address failed to resolve and you need the real one. Unnamed chats cannot be addressed or spawned into; if the user wants one used, they must run `/name <name>` inside it.",
+    inputSchema: {},
+  },
+  async () => unwrap("list_chats", await daemonPost("/chats/list", {})),
+);
+
 server.registerTool(
   "list_peers",
   {
     title: "List sibling agent sessions in this chat",
     description:
-      "List the OTHER agent sessions running in the SAME WeCom chat as this one. A chat hosts one default session plus any number of `#tag` sessions (e.g. `#fix`, `#review`), each with its own tmux pane, CLI, model and working directory. Returns for each peer: its tag, emoji label, cwd, CLI, whether its pane is alive, whether it is mid-turn (`busy`), when it last did anything, and a one-line summary of its recent conversation. `self: true` marks your own session. Also returns `foreignPeers`: sessions living in OTHER chats whose `#tag` is globally unique across the host — those are the ones you can reach with a plain `send_peer('theirTag')` to hand work across chats (e.g. daily pipeline → sanitizer). Call this FIRST whenever the user refers to another agent or tag — '#fix 进展如何', '还有谁在跑', '让 #docs 也看看', '把语料交给 #sanitizer 处理' — then use peek_peer / send_peer / wait_peer to actually collaborate.",
+      "List the OTHER agent sessions running in the SAME WeCom chat as this one. A chat hosts one default session plus any number of `#tag` sessions (e.g. `#fix`, `#review`), each with its own tmux pane, CLI, model and working directory. Returns for each peer: its tag, the `address` to pass to the other peer tools, emoji label, cwd, CLI, whether its pane is alive, whether it is mid-turn (`busy`), when it last did anything, and a one-line summary of its recent conversation. `self: true` marks your own session. Also returns `foreignPeers`: reachable sessions in OTHER chats — either their `#tag` is globally unique (plain `send_peer('theirTag')` hits it) or their chat has a name, in which case `address` is the qualified `chatName#tag` form. Always send back the `address` verbatim rather than reassembling one. Call this FIRST whenever the user refers to another agent or tag — '#fix 进展如何', '还有谁在跑', '让 #docs 也看看', '把语料交给 #sanitizer 处理' — then use peek_peer / send_peer / wait_peer to actually collaborate. For chats with no session you can see yet, use list_chats.",
     inputSchema: {},
   },
   async () => unwrap("list_peers", await daemonPost("/peers/list", {})),
@@ -389,7 +439,7 @@ server.registerTool(
     description:
       "Observe another agent WITHOUT interrupting it: returns `dialog` — the last N turns of its actual conversation, read from its session transcript, `▸` for what was asked and `◂` for what it answered — plus whether it is currently mid-turn (`busy`) and its most recent complete reply (`lastText`). This is the readable record of what that agent and whoever drives it have been saying; use it to answer '查看 #fix 的进展', '他们聊到哪了', or to decide whether a peer needs a nudge. A `#tag` written INSIDE a user message means that peer: the daemon appends a system-reminder naming every mentioned tag that resolves to a live session, so `#b` in the prompt is peer `b` — peek it here instead of guessing what it is doing or answering on its behalf. If the peer has no readable transcript yet, `pane` falls back to its raw terminal tail. `foreign: true` in the reply means the tag resolved to a session in another chat. Read-only and safe to poll.",
     inputSchema: {
-      tag: z.string().describe("Peer tag WITHOUT '#'. Empty string = this chat's default (untagged) session. A non-empty tag prefers a same-chat match; if none exists, it falls back to a GLOBALLY UNIQUE match in another chat (cross-chat peek). Refuses when the tag is ambiguous — pick a unique name."),
+      tag: z.string().describe(ADDRESS_DOC),
       turns: z.number().optional().describe("How many recent conversation turns to return (1-40, default 6)."),
     },
   },
@@ -401,9 +451,9 @@ server.registerTool(
   {
     title: "Send a message into a sibling agent's session",
     description:
-      "Type a message into another agent's session, exactly as if the user had sent it there — the peer picks it up as a new turn. This is how you DRIVE a peer: unblock it, answer its question, hand it work, or tell it to keep going. Typical loop for '推动 #fix 直到结束': peek_peer → send_peer with the nudge → wait_peer until it goes idle → peek_peer again. Cross-chat handoff (e.g. daily pipeline → sanitizer): the target agent lives in a DIFFERENT WeCom chat under a globally-unique tag like `#sanitizer-ingest`; call send_peer with that tag and the daemon routes across chats automatically — both chats see the exchange in their timelines. If the peer's session doesn't exist yet, ask the user to `/new #tag` in the target chat first. Refuses to target your own session.",
+      "Type a message into another agent's session, exactly as if the user had sent it there — the peer picks it up as a new turn. This is how you DRIVE a peer: unblock it, answer its question, hand it work, or tell it to keep going. Typical loop for '推动 #fix 直到结束': peek_peer → send_peer with the nudge → wait_peer until it goes idle → peek_peer again. Cross-chat handoff (e.g. daily pipeline → sanitizer): the target agent lives in a DIFFERENT WeCom chat, addressed either by a globally-unique tag like `#sanitizer-ingest` or, when that chat has a name, in full as `sanitizer#ingest`; the daemon routes across chats automatically and both chats see the exchange in their timelines. If the peer doesn't exist yet, create it yourself with new_claude_session (pass `chat` for another chat). Refuses to target your own session.",
     inputSchema: {
-      tag: z.string().describe("Peer tag WITHOUT '#'. Empty string = this chat's default (untagged) session. A non-empty tag prefers a same-chat match; if none exists, it falls back to a GLOBALLY UNIQUE match in another chat (cross-chat send). Refuses when the tag is ambiguous — the user should rename so exactly one session holds that tag."),
+      tag: z.string().describe(ADDRESS_DOC),
       text: z.string().describe("Message to inject. Plain prompt text; slash commands like '/clear' also work."),
     },
   },
@@ -417,7 +467,7 @@ server.registerTool(
     description:
       "Block until the named peer stops working (its terminal no longer shows an interrupt hint), then return its latest reply. Use it after send_peer so you act on a finished answer instead of a half-written one. Returns `idle: false` with a reason if the timeout hits first — the peer is simply still working, so you can peek and wait again. Cheap: the daemon polls the pane, it does not consume tokens.",
     inputSchema: {
-      tag: z.string().describe("Peer tag WITHOUT '#'. Empty string = this chat's default session. Non-empty prefers same-chat, falls back to a GLOBALLY UNIQUE match in another chat."),
+      tag: z.string().describe(ADDRESS_DOC),
       timeoutSec: z.number().optional().describe("Max seconds to wait (10-7200, default 900)."),
     },
   },

@@ -76,6 +76,27 @@ export const baseOfKey = (target: string): string => {
 /** Compose a session key from a base principal and a tag ("" → default session). */
 export const keyOf = (base: string, tag: string): string => (tag ? `${base}#${tag}` : base);
 
+/** Coerce an arbitrary string into the tag charset `TAG_TOKEN` accepts — an
+ *  agent-supplied tag that the header parser can't round-trip would make its
+ *  own bubbles unaddressable. "" when nothing usable survives. */
+export const normalizeTag = (raw: string | undefined): string =>
+  (raw ?? "")
+    .trim()
+    .replace(/^#+/, "")
+    .replace(/[^\p{L}\p{N}_-]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+
+/** Default tag for a session spawned in `cwd` — the project's own name is what
+ *  a human would have typed. */
+export const tagFromCwd = (cwd: string): string => normalizeTag(cwd.split("/").filter(Boolean).pop());
+
+/** `want`, or the first `want-N` its chat isn't already using. */
+export const uniqueTag = (want: string, taken: ReadonlySet<string>, n = 1): string => {
+  const candidate = n < 2 ? want : `${want.slice(0, 29)}-${n}`;
+  return taken.has(candidate) ? uniqueTag(want, taken, n + 1) : candidate;
+};
+
 // 出站气泡的头 (`🦊 #fix …` / 未打 tag 的 `🧙 …`) 是可被「引用」的路由信息:
 // 群里要跟某个 `#tag` 会话说话,引用它的气泡比手打 tag 快得多。这里做反向解析。
 // 头部 emoji 取自固定表 —— 用户消息以这些 emoji 开头且后接 `#tag` 的概率可忽略。

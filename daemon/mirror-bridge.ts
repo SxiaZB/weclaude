@@ -37,6 +37,7 @@ import type { CtxCut, TurnOrigin, TurnUsage } from "./detail.js";
 import { labelFor, tagOfKey, baseOfKey, keyOf, withTagHeader } from "../shared/session-label.js";
 import { splitMarkdown } from "../shared/md-chunk.js";
 import { randomTip } from "./tips.js";
+import { chatBaseOf, chatNameOf, listChatNames, normChatName, parsePeerRef, peerAddress } from "./chat-name.js";
 import { stripAnsi, compactPane, paneIsBusy, paneIsStalled, transcriptStalled, summarizeTail, lastAssistantText, lastContextTokens, keepaliveStamps, tailTurns, renderDialog, type PeerInfo } from "./peers.js";
 
 // Same PATH augmentation logic as cc-bridge: launchd / systemd start the daemon
@@ -1586,21 +1587,29 @@ export interface MirrorBridge {
    *  override. Used by /new to give the user a fresh claude in the bound
    *  project. Returns the new attachment result. */
   newSession: (target: string, windowName?: string, cli?: CliBackendName, opts?: { model?: string; cwd?: string; silent?: boolean }) => Promise<{ ok: boolean; reason?: string; sessionId?: string; cwd?: string }>;
+  /** Every target key of `target`'s chat (default + every `#tag`), live or
+   *  merely persisted. Sync and cheap — the `peers` probe shells out to tmux,
+   *  far too much for answering "is this tag taken". */
+  chatTargets: (target: string) => string[];
   /** Sibling sessions of `target`'s chat (default + every `#tag`), each with
    *  liveness / busy / last-activity so an agent can see who else is working. */
   peers: (target: string) => Promise<PeerInfo[]>;
-  /** Sessions in OTHER chats whose `#tag` is globally unique across the host,
-   *  i.e. reachable from `target` via a bare tag lookup — the discovery surface
-   *  for cross-chat handoffs. Same shape as `peers`, with `self: false`. */
+  /** Sessions in OTHER chats that `target` can actually address — a globally
+   *  unique `#tag`, or any tag in a NAMED chat (reachable as `chatName#tag`).
+   *  The discovery surface for cross-chat handoffs; same shape as `peers`. */
   foreignPeers: (target: string) => Promise<PeerInfo[]>;
-  /** Resolve `tag` to a target key. Empty tag → self's chat default. Non-empty
-   *  prefers self's chat; if not present locally, falls back to a GLOBALLY
-   *  UNIQUE match across all chats (the cross-chat handoff path). Refuses on
-   *  0 or ≥2 foreign matches so callers must pick unambiguous tag names. */
+  /** Resolve a peer address to a target key. `""` → self's chat default;
+   *  `fix` → self's chat, else a GLOBALLY UNIQUE `#fix` elsewhere;
+   *  `daily#fix` / `chat:wr…#fix` → that exact chat's `#fix`, no uniqueness
+   *  requirement. Refuses (with the addresses that would have worked) rather
+   *  than guessing between ambiguous matches. */
   resolvePeerTag: (
     self: string,
-    tag: string,
+    ref: string,
   ) => { ok: true; target: string; foreign: boolean } | { ok: false; reason: string; candidates?: string[] };
+  /** Every chat the daemon knows — named ones plus any with a live/persisted
+   *  session — with the target keys living in each. The cross-chat directory. */
+  chatRoster: (self: string) => Array<{ base: string; name: string; self: boolean; targets: string[] }>;
   /** Live tmux pane tail of `target` — what that agent's terminal shows right
    *  now, including in-flight tool calls the transcript hasn't recorded yet. */
   peekPane: (target: string, rows?: number) => Promise<{ ok: boolean; reason?: string; pane?: string; busy?: boolean }>;
@@ -3858,15 +3867,47 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return allTargets().filter((k) => basePrincipalOf(k) === base);
   };
 
-  // 跨 chat 的 peer 寻址:tag = "" 永远是本 chat 的 default(自身语义不变);
-  // 非空 tag 优先在本 chat 里查(平级 `#tag` 同名时不产生歧义);本 chat 没有
-  // 时再全局兜底 —— 全 host 上只有一个 session 挂着这个 tag 才认。0 命中或
-  // ≥2 命中都拒绝,让用户显式把目标 peer 的 tag 起成全局唯一的名字。
+  // 名字解析:`daily` / `chat:wrxxx` → base principal。认不出就把已知名字一并回给
+  // 调用方 —— 跨 chat 出错时"我该写什么"比"你写错了"有用得多。
+  const resolveChatRef = (ref: string): { ok: true; base: string } | { ok: false; reason: string; candidates?: string[] } => {
+    const base = chatBaseOf(cfg, ref);
+    if (base) return { ok: true, base };
+    const known = listChatNames(cfg).map((c) => c.name);
+    return {
+      ok: false,
+      reason: `unknown chat '${ref}' — give that chat a name first (\`/name ${normChatName(ref) || "<name>"}\` inside it)`,
+      candidates: known,
+    };
+  };
+
+  // peer 寻址。地址是两级的(见 chat-name.ts):
+  //   ""            本 chat 的 default —— 自身语义不变;
+  //   `fix`         本 chat 优先,本 chat 没有再全局兜底(全 host 唯一才认)——
+  //                 命名之前唯一的跨 chat 路子,老调用方不能因为引入命名而断掉;
+  //   `daily#fix`   daily 这个 chat 里的 `#fix`,精确到点,不问 tag 全不全局唯一;
+  //   `daily#`      daily 的 default 会话;
+  //   `chat:wr…#fix` 全量 key 同理(list_peers 吐的就是它)。
+  // 裸 tag 的 0 命中 / ≥2 命中依旧拒绝,但出路从"回去改 tag 名"变成"用带 chat 名
+  // 的全称地址"——后者不需要动别人的会话。
   const resolvePeerTag = (
     self: string,
-    tag: string,
+    ref: string,
   ): { ok: true; target: string; foreign: boolean } | { ok: false; reason: string; candidates?: string[] } => {
-    const t = (tag ?? "").trim().replace(/^#/, "");
+    const { chat, tag } = parsePeerRef(ref ?? "");
+    const t = tag.trim();
+    if (chat) {
+      const c = resolveChatRef(chat);
+      if (!c.ok) return c;
+      const target = keyOf(c.base, t);
+      if (allTargets().includes(target)) {
+        return { ok: true, target, foreign: c.base !== basePrincipalOf(self) };
+      }
+      return {
+        ok: false,
+        reason: `chat '${chat}' has no ${t ? `'#${t}'` : "default"} session — create it with new_claude_session({ chat: '${chat}'${t ? `, tag: '${t}'` : ""}, cwd })`,
+        candidates: allTargets().filter((k) => basePrincipalOf(k) === c.base),
+      };
+    }
     const local = keyOf(basePrincipalOf(self), t);
     if (!t) return { ok: true, target: local, foreign: false };
     const all = allTargets();
@@ -3874,60 +3915,39 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     const foreignMatches = all.filter((k) => tagOfKey(k) === t && basePrincipalOf(k) !== basePrincipalOf(self));
     if (foreignMatches.length === 1) return { ok: true, target: foreignMatches[0]!, foreign: true };
     if (foreignMatches.length === 0) {
-      return { ok: false, reason: `no peer with tag '#${t}' — create one in the target chat first (/new #${t})` };
+      // 裸 token 正好是个 chat 名字 —— 用户/agent 想说的是"那个群",不是"那个 tag"。
+      // 直接给出它的会话地址,比让人再查一次 list_chats 快。
+      const asChat = chatBaseOf(cfg, t);
+      if (asChat) {
+        return {
+          ok: false,
+          reason: `'${t}' is a CHAT, not a tag — address one of its sessions, e.g. '${t}#' for its default`,
+          candidates: allTargets().filter((k) => basePrincipalOf(k) === asChat).map((k) => peerAddress(cfg, self, k)),
+        };
+      }
+      return { ok: false, reason: `no peer with tag '#${t}' — create one with new_claude_session, or address it in full as 'chatName#${t}' (list_chats shows the names)` };
     }
     return {
       ok: false,
-      reason: `tag '#${t}' is not globally unique — it exists in ${foreignMatches.length} chats; rename them so exactly one holds this tag`,
-      candidates: foreignMatches,
+      reason: `tag '#${t}' exists in ${foreignMatches.length} chats — address it in full as 'chatName#${t}' (list_chats shows the names)`,
+      candidates: foreignMatches.map((k) => peerAddress(cfg, self, k)),
     };
   };
 
-  // list_peers 的跨 chat 补充:除了本 chat 的兄弟 sessions,再列出其他 chat 里
-  // **全局唯一** tag 的 session —— 那些才是当前调用方能直接 send_peer 命中的
-  // 外部 peer。带 base 前缀让人一眼看出属于哪个群。
-  const foreignPeers = async (self: string): Promise<PeerInfo[]> => {
-    const selfBase = basePrincipalOf(self);
-    const all = allTargets();
-    const byTag = new Map<string, string[]>();
-    for (const k of all) {
-      const tg = tagOfKey(k);
-      if (!tg) continue;
-      if (basePrincipalOf(k) === selfBase) continue;
-      const arr = byTag.get(tg) ?? [];
-      arr.push(k);
-      byTag.set(tg, arr);
-    }
-    const uniqueForeigns: string[] = [];
-    for (const [, arr] of byTag) if (arr.length === 1) uniqueForeigns.push(arr[0]!);
-    return Promise.all(
-      uniqueForeigns.map(async (t): Promise<PeerInfo> => {
-        const a = byTarget.get(t);
-        const rec = deps.store.get(t);
-        const jsonlPath = jsonlOf(t);
-        const pane = paneOf(t);
-        const paneAlive = pane ? await tmuxPaneAlive(pane) : false;
-        const tag = tagOfTarget(t);
-        let lastActivity = 0;
-        try { if (jsonlPath) lastActivity = statSync(jsonlPath).mtimeMs; } catch { /* not written yet */ }
-        return {
-          target: t,
-          tag,
-          label: tag ? labelFor(tag) : "🧙",
-          sessionId: a?.sessionId || rec?.sessionId || "",
-          jsonlPath,
-          cwd: a?.runningCwd || rec?.cwd || expandedDefaultCwd,
-          cli: jsonlPath ? backendForPath(jsonlPath).name : (activeBackends()[0]?.name ?? "claude"),
-          tmuxPane: pane,
-          attached: !!a,
-          paneAlive,
-          busy: paneAlive ? paneIsBusy(await capturePaneTail(pane, 12)) : false,
-          lastActivity,
-          summary: jsonlPath ? summarizeTail(jsonlPath) : "(未绑定会话)",
-          self: false,
-        };
-      }),
-    );
+  /** 已知的每个 chat:命名的 + 有会话在跑的。`name` 为空即"还没起名",那就是
+   *  它暂时只能靠全局唯一 tag 被找到的原因。 */
+  const chatRoster = (self: string): Array<{ base: string; name: string; self: boolean; targets: string[] }> => {
+    const bases = new Set([
+      ...listChatNames(cfg).map((c) => c.base),
+      ...allTargets().map(basePrincipalOf),
+      basePrincipalOf(self),
+    ]);
+    return [...bases].filter(Boolean).sort().map((base) => ({
+      base,
+      name: chatNameOf(cfg, base),
+      self: base === basePrincipalOf(self),
+      targets: allTargets().filter((k) => basePrincipalOf(k) === base),
+    }));
   };
 
   const paneOf = (target: string): string =>
@@ -3948,36 +3968,55 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     return p ? lastAssistantText(p) : "";
   };
 
-  const peers = async (target: string): Promise<PeerInfo[]> => {
-    const list = await Promise.all(
-      chatTargets(target).map(async (t): Promise<PeerInfo> => {
-        const a = byTarget.get(t);
-        const rec = deps.store.get(t);
-        const jsonlPath = jsonlOf(t);
-        const pane = paneOf(t);
-        const paneAlive = pane ? await tmuxPaneAlive(pane) : false;
-        const tag = tagOfTarget(t);
-        let lastActivity = 0;
-        try { if (jsonlPath) lastActivity = statSync(jsonlPath).mtimeMs; } catch { /* not written yet */ }
-        return {
-          target: t,
-          tag,
-          label: tag ? labelFor(tag) : "🧙",
-          sessionId: a?.sessionId || rec?.sessionId || "",
-          jsonlPath,
-          cwd: a?.runningCwd || rec?.cwd || expandedDefaultCwd,
-          cli: jsonlPath ? backendForPath(jsonlPath).name : (activeBackends()[0]?.name ?? "claude"),
-          tmuxPane: pane,
-          attached: !!a,
-          paneAlive,
-          busy: paneAlive ? paneIsBusy(await capturePaneTail(pane, 12)) : false,
-          lastActivity,
-          summary: jsonlPath ? summarizeTail(jsonlPath) : "(未绑定会话)",
-          self: t === target,
-        };
-      }),
+  // 一个 target 的完整画像。本 chat 的兄弟和外 chat 的 peer 走同一条,只有
+  // `self` / `address` 因观察者而异 —— 地址本来就是相对调用方说的话。
+  const peerInfoOf = async (t: string, self: string): Promise<PeerInfo> => {
+    const a = byTarget.get(t);
+    const rec = deps.store.get(t);
+    const jsonlPath = jsonlOf(t);
+    const pane = paneOf(t);
+    const paneAlive = pane ? await tmuxPaneAlive(pane) : false;
+    const tag = tagOfTarget(t);
+    let lastActivity = 0;
+    try { if (jsonlPath) lastActivity = statSync(jsonlPath).mtimeMs; } catch { /* not written yet */ }
+    return {
+      target: t,
+      tag,
+      chat: chatNameOf(cfg, t),
+      address: peerAddress(cfg, self, t),
+      label: tag ? labelFor(tag) : "🧙",
+      sessionId: a?.sessionId || rec?.sessionId || "",
+      jsonlPath,
+      cwd: a?.runningCwd || rec?.cwd || expandedDefaultCwd,
+      cli: jsonlPath ? backendForPath(jsonlPath).name : (activeBackends()[0]?.name ?? "claude"),
+      tmuxPane: pane,
+      attached: !!a,
+      paneAlive,
+      busy: paneAlive ? paneIsBusy(await capturePaneTail(pane, 12)) : false,
+      lastActivity,
+      summary: jsonlPath ? summarizeTail(jsonlPath) : "(未绑定会话)",
+      self: t === self,
+    };
+  };
+
+  const byRecent = (x: PeerInfo, y: PeerInfo): number => y.lastActivity - x.lastActivity;
+
+  const peers = async (target: string): Promise<PeerInfo[]> =>
+    (await Promise.all(chatTargets(target).map((t) => peerInfoOf(t, target)))).sort(byRecent);
+
+  // list_peers 的跨 chat 补充:其他 chat 里**当前调用方叫得动**的 session。两条
+  // 入选路径 —— tag 全局唯一(裸 tag 就能命中),或者它所在的 chat 有名字(全称
+  // `daily#fix` 命中)。后者是命名带来的新增量:同名 tag 不再互相遮蔽,想被找到
+  // 只要给群起个名,不必回去改别人的 tag。
+  const foreignPeers = async (self: string): Promise<PeerInfo[]> => {
+    const selfBase = basePrincipalOf(self);
+    const foreign = allTargets().filter((k) => tagOfKey(k) && basePrincipalOf(k) !== selfBase);
+    const tagCount = foreign.reduce(
+      (acc, k) => acc.set(tagOfKey(k), (acc.get(tagOfKey(k)) ?? 0) + 1),
+      new Map<string, number>(),
     );
-    return list.sort((x, y) => y.lastActivity - x.lastActivity);
+    const reachable = foreign.filter((k) => tagCount.get(tagOfKey(k)) === 1 || chatNameOf(cfg, k));
+    return (await Promise.all(reachable.map((t) => peerInfoOf(t, self)))).sort(byRecent);
   };
 
   // Capture a few extra rows then compact away the TUI's blank padding, so
@@ -4161,9 +4200,11 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
 
   return {
     attach,
+    chatTargets,
     peers,
     foreignPeers,
     resolvePeerTag,
+    chatRoster,
     peekPane,
     peekTurns,
     isBusy,

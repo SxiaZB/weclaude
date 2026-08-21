@@ -4,7 +4,11 @@
 
 ## [Unreleased]
 
+### Fixed
+- `sessions`: **`new_claude_session` 在调用方自己的 chat 里建 peer**,不再掉进 `defaultChat`。这个工具此前不带 `selfRef`,daemon 只能 `target ?? cfg.defaultChat` 兜底,于是非 default 会话里的 agent 一喊「新开一个会话」,session 就落到另一个群里 —— 叫它的人既看不见也够不着;而且落点是**不带 tag 的 key**,那就是那个 chat 的默认会话,attach 直接把原本镜像在那儿的会话顶掉。现在:调用方按 `sessionId` / `tmuxPane` 解析出自己所在的 chat,新会话一律带 `#tag` 落成同 chat 的 peer(tag 可显式给,省略则由目录名派生并去重;撞上已存在的 tag 直接拒绝,而不是 respawn 掉那个正在跑的 peer),并且改走 `newSession` 而非裸 spawn+attach —— cwd/CLI 的 chat 级继承、tmux 窗口名、以及「created + 📂 当前项目」那条气泡全都和用户手打 `/new #tag` 完全一致:群里发得出消息、chat detail 里有记录、`list_peers` / `send_peer` 立刻能寻址。
+
 ### Added
+- `chats`: **给聊天命名,跨聊天寻址与建会话**。一个 WeCom 聊天的身份是 `chat:wrkS…` 这种既读不出也打不进去的 id,所以在此之前跨聊天只有「全局唯一 tag」一条路:两个群各有一个 `#fix`,就谁也叫不动谁,唯一的出路是回去改别人的 tag。现在 `/name daily` 给聊天起个名(`/name` 查看、`/name -` 取消;名字全机唯一、大小写不敏感,落在 `config.jsonc` 的 `chats` 里,和 `topics` 同一套写法),地址空间随之变成两级:`fix` 仍是本聊天的 `#fix`(老语义一字不改,不唯一时才回退全局搜),`daily#fix` 精确到那个聊天的那个会话、不问 tag 全不全局唯一,`daily#` 是它的默认会话。`send_peer` / `peek_peer` / `wait_peer` 都收这个全称,`list_peers` 的每一行现在直接给出该照抄的 `address`,`foreignPeers` 也从「只有全局唯一 tag」放宽到「全局唯一 tag **或** 所在聊天有名字」。新增 `/chats` 与 `list_chats` 作为跨聊天目录(谁有名字、各自跑着哪些会话),以及 `name_chat` 让 agent 也能读写名字。最后一块:`new_claude_session` 新增 `chat` 参数,可以直接在**另一个已命名的聊天**里建 peer —— 「目标 peer 还不存在」不再需要找个人去那个群里手打 `/new`。未命名的聊天依旧无法被寻址、也无法被建入,这是刻意的:往一个谁也读不出的 `chat:wr…` id 里塞会话,等于把它扔进一个调用方根本不该进的群。
 - `peers`: **跨 chat 的 peer 寻址**。`send_peer` / `peek_peer` / `wait_peer` / `handoff` 的 `tag` 参数在本 chat 找不到目标时,会在全 host 的 sessions 里回退搜同名 tag —— 只当命中数**正好为 1** 时才认(0/多命中都拒绝、把原因回给调用方),把「跨 chat 交接」收敛成「让目标群里的 peer 起一个全局唯一的 tag」这一个约束,不引入 alias 表、不改授权模型。相应地 `list_peers` 新增 `foreignPeers`(其他 chat 里全局唯一 tag 的 session 列表),给 agent 发现可跨群命中的 peer。跨 chat 的 relay 气泡两侧 chat 都会推,免得被叫的那侧看不到「另一个群的 agent 找上门了」这件事。典型用法:daily 语料链的 peer 产出 corpus,直接 `send_peer("sanitizer-ingest")` 交给 sanitizer 群里的 `#sanitizer-ingest` 继续。
 
 ## [1.2.19] - 2026-08-19

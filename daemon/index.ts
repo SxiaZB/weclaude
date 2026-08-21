@@ -34,7 +34,8 @@ import {
   addSchedule,
   removeSchedulesByTopic,
 } from "./topics.js";
-import { baseOfKey, withTagHeader } from "../shared/session-label.js";
+import { baseOfKey, keyOf, normalizeTag, tagFromCwd, tagOfKey, uniqueTag, withTagHeader } from "../shared/session-label.js";
+import { chatBaseOf, chatNameOf, clearChatName, listChatNames, normChatName, peerAddress, setChatName } from "./chat-name.js";
 import {
   startGraph,
   stopRun,
@@ -278,6 +279,19 @@ const main = async (): Promise<void> => {
       const att = m.attach({ sessionId: r.sessionId!, jsonlPath: r.jsonlPath!, target, tmuxPane: r.tmuxPane, tmuxSession: r.tmuxSession });
       json(res, att.ok ? 200 : 500, att.ok ? { ok: true, sessionId: r.sessionId, tmuxSession: r.tmuxSession, tmuxPane: r.tmuxPane, target } : { ok: false, reason: att.reason });
     });
+    // Which chat is the caller? An MCP tool can only see its own process, so
+    // every route an agent drives has to be told: explicit target → sessionId
+    // → tmuxPane (stable across `/clear`, which rotates sessionId) → the
+    // configured defaultChat. Same precedence as /mirror/cwd.
+    const resolveSelf = (b: Partial<{ target: string; sessionId: string; tmuxPane: string }>): string => {
+      const explicit = (b.target ?? "").trim();
+      if (explicit) return explicit;
+      const bySid = b.sessionId?.trim() ? m.targetForSession(b.sessionId.trim()) : undefined;
+      if (bySid) return bySid;
+      const byPane = b.tmuxPane?.trim() ? m.targetForPane(b.tmuxPane.trim()) : undefined;
+      if (byPane) return byPane;
+      return (cfg.defaultChat ?? "").trim();
+    };
     // ── Session discovery / switching (conversational, via MCP tools) ───────
     // GET /sessions/list — enumerate live claude sessions in tmux + a one-line
     // "what is it doing" summary each, with a stable animal-emoji label. The
@@ -325,29 +339,79 @@ const main = async (): Promise<void> => {
         ? { ok: true, sessionId: hit.sessionId, label: hit.label, target, cwd: hit.cwd, tmuxSession: hit.tmuxSession }
         : { ok: false, reason: att.reason });
     });
-    // POST /sessions/new { cwd, target? } — spawn a fresh claude in a tmux pane
-    // rooted at `cwd`, then attach the WeCom mirror to it. Reuses the same
-    // spawn+attach path as /mirror/spawn, just with an explicit cwdOverride.
+    // POST /sessions/new { cwd, tag?, chat?, cli?, target?|sessionId?|tmuxPane? } —
+    // spawn a peer session in the caller's chat (or, with `chat`, in a NAMED
+    // one), rooted at `cwd`.
+    //
+    // The caller is an agent living in some chat, so "new session" means what
+    // it means to the human typing `/new #tag` there: another `#tag` sibling of
+    // THIS chat. Two things this must not do, both of which the old
+    // `target ?? defaultChat` fallback did: (1) materialize the session in
+    // defaultChat, where the agent that asked for it can neither see nor reach
+    // it; (2) land untagged, which IS the chat's default session — attaching
+    // there evicts whoever is already mirrored to it, quite possibly the caller.
+    // Routing through `m.newSession` (not spawn+attach) is what makes the peer
+    // indistinguishable from a hand-made one: chat-scoped cwd/CLI inheritance,
+    // the tag as tmux window name, and the "created + 📂 当前项目" bubble that
+    // gives it a visible record in the group and in chat detail.
+    //
+    // `chat` lifts that from "in my chat" to "in that chat", and it is why chat
+    // naming exists: a NAMED chat is the only kind an agent can point at, so
+    // the escape hatch for "the peer I need lives over there and doesn't exist
+    // yet" stops being "go ask a human to type /new in the other group".
+    // Unnamed chats stay unaddressable ON PURPOSE — spawning into a raw
+    // `chat:wr…` id nobody can read is how you strand a session in a group the
+    // caller has no business in.
     http.register("POST /sessions/new", async (req, res) => {
       const { readBody } = await import("./http.js");
-      const body = (await readBody(req)) as Partial<{ cwd: string; target: string; cli: CliBackendName }>;
+      const body = (await readBody(req)) as Partial<{ cwd: string; tag: string; chat: string; target: string; sessionId: string; tmuxPane: string; cli: CliBackendName }>;
       const cwd = (body.cwd ?? "").toString().trim();
       if (!cwd) {
         json(res, 400, { ok: false, reason: "cwd required" });
         return;
       }
-      const target = (body.target ?? cfg.defaultChat ?? "").trim();
-      if (!target) {
-        json(res, 400, { ok: false, reason: "target required (and cfg.defaultChat empty)" });
+      const self = resolveSelf(body);
+      if (!self) {
+        json(res, 400, { ok: false, reason: "cannot resolve caller chat (pass target/sessionId/tmuxPane, or set cfg.defaultChat)" });
         return;
       }
-      const spawnLog = log.child({ mod: "mirror", sub: "sessions-new", target });
-      const r = await spawnTmuxClaude({ cfg, log: spawnLog, windowName: target, cwdOverride: cwd, cli: body.cli });
-      if (!r.ok) { json(res, 500, { ok: false, reason: r.reason }); return; }
-      const att = m.attach({ sessionId: r.sessionId!, jsonlPath: r.jsonlPath!, target, tmuxPane: r.tmuxPane, tmuxSession: r.tmuxSession, cwd: r.cwd });
-      json(res, att.ok ? 200 : 500, att.ok
-        ? { ok: true, sessionId: r.sessionId, target, cwd: r.cwd, cli: r.cli, tmuxSession: r.tmuxSession, tmuxPane: r.tmuxPane }
-        : { ok: false, reason: att.reason });
+      const wantChat = (body.chat ?? "").toString().trim();
+      const base = wantChat ? chatBaseOf(cfg, wantChat) : baseOfKey(self);
+      if (!base) {
+        json(res, 404, {
+          ok: false,
+          reason: `unknown chat '${wantChat}' — only NAMED chats can be spawned into; have someone run \`/name ${normChatName(wantChat) || "<name>"}\` there first`,
+          candidates: listChatNames(cfg).map((c) => c.name),
+        });
+        return;
+      }
+      const foreign = base !== baseOfKey(self);
+      const taken = new Set(m.chatTargets(base).map(tagOfKey).filter(Boolean));
+      const asked = normalizeTag(body.tag);
+      // Reusing a live tag would respawn — i.e. kill — that peer. The caller
+      // asked for another one, not for that one restarted; make it pick a name.
+      if (asked && taken.has(asked)) {
+        json(res, 409, { ok: false, reason: `peer '#${asked}' already exists in ${foreign ? `chat '${wantChat}'` : "this chat"} — pick a different tag, or drive that one with send_peer`, tag: asked });
+        return;
+      }
+      const tag = asked || uniqueTag(tagFromCwd(cwd) || "peer", taken);
+      const target = keyOf(base, tag);
+      log.child({ mod: "mirror", sub: "sessions-new", target }).info({ self, cwd, foreign, cli: body.cli }, "spawning peer session");
+      const r = await m.newSession(target, tag, body.cli, { cwd });
+      json(res, r.ok ? 200 : 500, r.ok
+        ? {
+            ok: true,
+            sessionId: r.sessionId,
+            self,
+            target,
+            base,
+            tag,
+            cwd: r.cwd,
+            foreign,
+            // What the caller must pass to send_peer/peek_peer to drive it.
+            address: peerAddress(cfg, self, target),
+          }
+        : { ok: false, reason: r.reason });
     });
     // Frame-less inject — used by `wezard init` to fire a demo prompt right
     // after /mirror/spawn so first-time users see the full PreToolUse → card
@@ -394,23 +458,12 @@ const main = async (): Promise<void> => {
     // other `#tag` sessions of the same WeCom chat. An MCP tool can only see
     // its own process, so the daemon — which owns every attachment — is the
     // only place that can answer "what is #fix doing" or "inject this into
-    // #review". Callers identify themselves the same way /mirror/cwd does:
-    // explicit target → sessionId → tmuxPane (stable across /clear) →
-    // defaultChat.
-    const resolveSelf = (b: Partial<{ target: string; sessionId: string; tmuxPane: string }>): string => {
-      const explicit = (b.target ?? "").trim();
-      if (explicit) return explicit;
-      const bySid = b.sessionId?.trim() ? m.targetForSession(b.sessionId.trim()) : undefined;
-      if (bySid) return bySid;
-      const byPane = b.tmuxPane?.trim() ? m.targetForPane(b.tmuxPane.trim()) : undefined;
-      if (byPane) return byPane;
-      return (cfg.defaultChat ?? "").trim();
-    };
-    // Peer addressed by tag. Empty tag = the chat's default (untagged) session,
-    // which is a legitimate collaboration target ("report back to the main one").
-    // 非空 tag 若本 chat 里没有,会在全 host 的 sessions 里找**全局唯一**同 tag
-    // 的 session —— 那就是跨 chat 交接的落点。0/多命中都会失败,让用户把跨 chat
-    // 目标的 tag 起得唯一(比如 `#sanitizer-ingest` 而不是 `#fix`)。
+    // #review". Callers identify themselves via `resolveSelf` above.
+    // Peer addressed by a peer address (see mirror-bridge.resolvePeerTag). ""
+    // = the chat's default (untagged) session, which is a legitimate
+    // collaboration target ("report back to the main one"); a bare `fix` is
+    // this chat first then a globally unique `#fix` anywhere; `daily#fix`
+    // names the chat outright and needs no uniqueness at all.
     const resolvePeer = (
       self: string,
       tag: string,
@@ -419,6 +472,43 @@ const main = async (): Promise<void> => {
       if (r.ok) return r;
       return { ok: false, status: 404, reason: r.reason, candidates: r.candidates };
     };
+
+    // ── Chat naming ────────────────────────────────────────────────────
+    // A WeCom chat's identity is an unreadable `chat:wrkS…` id. Naming it is
+    // what makes cross-chat addressing (`daily#fix`) and cross-chat spawning
+    // (`new_claude_session({ chat: 'daily' })`) expressible at all.
+    http.register("POST /chats/list", async (req, res) => {
+      const { self } = await readPeerBody(req);
+      const roster = self ? m.chatRoster(self) : listChatNames(cfg).map((c) => ({ ...c, self: false, targets: [] }));
+      json(res, 200, {
+        ok: true,
+        self,
+        chats: roster.map((c) => ({
+          ...c,
+          sessions: c.targets.map((t) => ({
+            target: t,
+            tag: tagOfKey(t),
+            address: self ? peerAddress(cfg, self, t) : t,
+          })),
+        })),
+      });
+    });
+
+    http.register("POST /chats/name", async (req, res) => {
+      const { self, body } = await readPeerBody(req);
+      if (!self) { json(res, 400, { ok: false, reason: "cannot resolve caller chat (pass target/sessionId/tmuxPane)" }); return; }
+      const raw = ((body as { name?: string }).name ?? "").toString().trim();
+      // "-" is the same erase gesture `/name -` uses in the chat — one verb,
+      // one meaning, whether a human or an agent performs it.
+      if (raw === "-") {
+        const gone = clearChatName(cfg, sourcePath, self);
+        json(res, 200, { ok: true, base: baseOfKey(self), name: "", previous: gone });
+        return;
+      }
+      const previous = chatNameOf(cfg, self);
+      const r = setChatName(cfg, sourcePath, self, raw);
+      json(res, r.ok ? 200 : 409, r.ok ? { ok: true, base: r.base, name: r.name, previous } : { ok: false, reason: r.reason });
+    });
 
     interface PeerBody { target?: string; sessionId?: string; tmuxPane?: string; tag?: string }
     const readPeerBody = async (req: import("node:http").IncomingMessage): Promise<{ self: string; body: PeerBody }> => {

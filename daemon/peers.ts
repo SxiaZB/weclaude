@@ -286,12 +286,17 @@ export const compactPane = (paneText: string, rows = 24): string =>
 // lookup send_peer/peek_peer use, so it can never advertise a call that would
 // fail — an unresolvable `#123` / `#L45` passes through silently.
 export interface PeerMention {
-  /** Tag as written, without `#`. Exactly what the peer tools take. */
+  /** Tag as written, without `#`. */
   tag: string;
   /** Resolved session key, e.g. `chat:wrxxx#b`. */
   target: string;
-  /** Lives in a DIFFERENT chat, reached by its globally-unique tag. */
+  /** Canonical string to hand the peer tools — the bare tag for a sibling,
+   *  `chatName#tag` for a session in another (named) chat. */
+  address: string;
+  /** Lives in a DIFFERENT chat. */
   foreign: boolean;
+  /** That chat's name; "" when it has none. */
+  chat: string;
   label: string;
   cwd: string;
 }
@@ -304,8 +309,8 @@ export const renderPeerMentionHint = (mentions: readonly PeerMention[]): string 
   if (mentions.length === 0) return "";
   const lines = mentions.map(
     (m) =>
-      `- \`#${m.tag}\` ${m.label} — a live agent session${m.foreign ? " in ANOTHER chat" : " in this chat"}` +
-      ` (target \`${m.target}\`${m.cwd ? `, cwd ${m.cwd}` : ""}), reachable as tag "${m.tag}".`,
+      `- \`#${m.tag}\` ${m.label} — a live agent session${m.foreign ? ` in ANOTHER chat${m.chat ? ` named "${m.chat}"` : ""}` : " in this chat"}` +
+      ` (target \`${m.target}\`${m.cwd ? `, cwd ${m.cwd}` : ""}), address "${m.address}".`,
   );
   return [
     "",
@@ -313,8 +318,9 @@ export const renderPeerMentionHint = (mentions: readonly PeerMention[]): string 
     "The `#tag` token(s) in the message above name peer agent sessions, not literal text:",
     ...lines,
     "When the user asks you to involve, check on, or relay to one of them, use the wezard peer tools rather than",
-    "guessing or answering on its behalf: peek_peer(tag) reads its recent conversation, send_peer(tag, text) hands",
-    "it work or a nudge, wait_peer(tag) blocks until it goes idle, list_peers() shows everyone. A mention that is",
+    "guessing or answering on its behalf: peek_peer(address) reads its recent conversation, send_peer(address, text)",
+    "hands it work or a nudge, wait_peer(address) blocks until it goes idle, list_peers() shows everyone. Pass the",
+    "`address` shown above verbatim — a bare tag for a sibling, `chatName#tag` for a peer in another chat. A mention that is",
     "merely referential (\"#b 说的那个方案\") needs no tool call — judge from what the user is asking for.",
     "</system-reminder>",
   ].join("\n");
@@ -326,6 +332,12 @@ export interface PeerInfo {
   target: string;
   /** `#tag` suffix; "" for the chat's default session. */
   tag: string;
+  /** Name of the chat this session lives in; "" when that chat is unnamed. */
+  chat: string;
+  /** Exactly what to pass to peek_peer / send_peer / wait_peer to hit this
+   *  session from the caller's own: bare tag for a sibling, `chatName#tag`
+   *  across chats. */
+  address: string;
   /** Stable animal emoji (same glyph the approval cards use). */
   label: string;
   sessionId: string;

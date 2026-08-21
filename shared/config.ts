@@ -322,9 +322,16 @@ const Topics = z.object({
   schedules: z.array(Schedule).default([]),
 });
 
+// 聊天命名表: `name → base principal` (`chat:wrxxx` / `user:xxx`)。方向选 name→
+// principal 而不是反过来: 名字是寻址用的 key, 这个方向天然保证唯一, 手写也更顺。
+// 有了名字, 跨 chat 的 peer 才能写成 `daily#fix` 这种稳定地址 —— 否则只能靠
+// "全局唯一 tag" 碰运气。见 daemon/chat-name.ts。
+const Chats = z.record(z.string(), z.string());
+
 export const ConfigSchema = z.object({
   bot: Bot,
   defaultChat: z.string().default(""),
+  chats: Chats.default({}),
   daemon: Daemon.default({}),
   wrc: Wrc.default({}),
   approval: Approval.default({}),
