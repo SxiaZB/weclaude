@@ -333,7 +333,7 @@ const approveButtons = (a: CardArgs): TemplateCard["button_list"] =>
       ]
     : [
         { text: "❌", style: 4, key: encodeKey(a.reqId, "deny") },
-        { text: windowLabel(a.windowMinutes), style: 1, key: encodeKey(a.reqId, "allow_window") },
+        { text: windowLabel(a.windowMinutes), style: 4, key: encodeKey(a.reqId, "allow_window") },
         // 「总是」= 由本次调用生成一条 allowRules 并落盘, 对齐 Claude Code 原生
         // 弹窗的 Always allow。危险卡上没有这个入口 (与「⏱全过」同理)。
         { text: "✅总是", style: 4, key: encodeKey(a.reqId, "allow_always") },
@@ -383,7 +383,8 @@ const fmtWindow = (min: number): string =>
   min % 60 === 0 ? `${min / 60}h` : `${min}min`;
 
 // 按钮上的时间窗文案: 裸「10h」看不出是放行, 补 ⏱ + 「自动过」点明语义。
-// (style 也从 3 改成 1 — 企微 3 渲染成红色, 与「放行」相悖。)
+// (style 跟 ❌/✅总是/✅ 一律 4 —— 3 渲染成红色, 1 渲染成蓝色, 都让这颗按钮
+//  在一排里显得像另一类操作; 它和其余三颗是同级选项, 不该被强调。)
 const windowLabel = (min: number): string => `⏱${fmtWindow(min)}自动过`;
 
 const verbOf = (d: Decision, windowMinutes: number): string => {
@@ -560,7 +561,7 @@ const buildBatchCard = (batch: ActiveBatch, transcriptTail: string): TemplateCar
   task_id: batch.batchId,
   button_list: [
     { text: "❌", style: 4, key: encodeBatchKey(batch.batchId, "deny") },
-    { text: windowLabel(batch.windowMinutes), style: 1, key: encodeBatchKey(batch.batchId, "allow_window") },
+    { text: windowLabel(batch.windowMinutes), style: 4, key: encodeBatchKey(batch.batchId, "allow_window") },
     // 批量卡同样给「总是」: 合流的成员是同一个工具的 N 次调用, 逐个点「总是」与
     // 点一次的结果相同(每位成员各自走一遍规则生成, 已被现有规则覆盖的不重复加)。
     { text: "✅总是", style: 4, key: encodeBatchKey(batch.batchId, "allow_always") },
@@ -716,7 +717,7 @@ export const buildAskqCard = (reqId: string, q: AskqQuestion, transcriptTail: st
   const tail = oneLine(transcriptTail).trim();
   return {
     card_type: "vote_interaction",
-    source: buildSource(tail),
+    source: buildSource(undefined, tail),
     main_title: { title: TRUNC(`🤔 ${emojiFor(approver)}${q.header || "请选择"}`, ASKQ_TITLE_MAX) },
     task_id: reqId,
     checkbox: {
@@ -758,7 +759,7 @@ const buildAskqResolvedCard = (
   const tail = oneLine(transcriptTail).trim();
   return {
     card_type: "button_interaction",
-    source: buildSource(tail),
+    source: buildSource(undefined, tail),
     main_title: { title: TRUNC(`🤔 ${emojiFor(approver)}${q.header || "已回答"}`, ASKQ_TITLE_MAX) },
     sub_title_text: TRUNC(q.question, ASKQ_SUB_MAX),
     task_id: reqId,
@@ -860,7 +861,7 @@ const buildPlanCard = (reqId: string, _sessionId: string, cwd: string, transcrip
   const dir = dirName(cwd);
   return {
     card_type: "button_interaction",
-    source: buildSource(tail),
+    source: buildSource(undefined, tail),
     main_title: { title: TRUNC(`📋 计划审批 · ${tag}${dir}/`, PLAN_TITLE_MAX + 12) },
     sub_title_text: hasPlan
       ? "审阅上方计划后选择:同意开始执行,或让 Claude 继续完善。"
@@ -885,7 +886,7 @@ const buildPlanResolvedCard = (
   const summary = action === "approve" ? "✅ 已同意 · 开始执行" : "✏️ 继续完善计划";
   return {
     card_type: "button_interaction",
-    source: buildSource(tail),
+    source: buildSource(undefined, tail),
     main_title: { title: TRUNC(`📋 计划 · ${emojiFor(approver)}${dir}/`, PLAN_TITLE_MAX + 12) },
     task_id: reqId,
     button_list: [{ text: summary, style: 4, key: encodePlanNoopKey(reqId) }],
