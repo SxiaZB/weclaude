@@ -154,7 +154,7 @@ export const lastContextTokens = (jsonlPath: string): number => {
  *  endless keepalive loop. Deriving from turns kills that at the source.
  *   `lastMs`     newest user/assistant turn (real OR our own ping) — the prompt-cache
  *                warmth clock; only a real model request actually re-warms the cache.
- *   `lastRealMs` newest GENUINE turn (non-ping/non-pong) — the real-idle cutoff; 0
+ *   `lastRealMs` newest GENUINE turn (non-keepalive) — the real-idle cutoff; 0
  *                when none sits in the read window ⇒ real work predates the tail.
  *   `stamped`    false when no turn carried a timestamp (backend without them), so
  *                the caller can fall back to mtime instead of judging all idle. */
@@ -174,7 +174,6 @@ export const keepaliveStamps = (
     t.role === "user" &&
     (norm(t.text).toLowerCase() === "ping" ||
       pingSigs.some((sig) => sig.length > 0 && norm(t.text).includes(sig)));
-  const isPong = (t: Turn): boolean => t.role === "assistant" && norm(t.text).replace(/[^a-zA-Z]/g, "").toLowerCase() === "pong";
   let lastMs = 0;
   let lastRealMs = 0;
   let stamped = false;
@@ -183,11 +182,11 @@ export const keepaliveStamps = (
     const ms = t.ms ?? 0;
     if (ms > 0) stamped = true;
     if (ms > lastMs) lastMs = ms;
-    // A ping USER line and a literal "pong" reply are keepalive noise. But an
-    // assistant reply to a ping that is NOT "pong" means the model resumed real
-    // work (stall recovery) — so it counts, re-anchoring lastRealMs. (This is why
-    // the old blanket "assistant-after-ping ⇒ keepalive" clause is gone.)
-    const isKeepalive = isPing(t) || isPong(t);
+    // Keepalive = ping query + whatever the model replies to it. Detection is
+    // purely query-based: if the user turn is a ping, the assistant reply is
+    // keepalive too — even when the model adds extra content beyond "pong".
+    const isKeepalive = isPing(t) ||
+      (t.role === "assistant" && i > 0 && isPing(turns[i - 1]!));
     if (ms > lastRealMs && !isKeepalive) lastRealMs = ms;
   }
   return { lastMs, lastRealMs, stamped };

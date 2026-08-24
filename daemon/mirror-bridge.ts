@@ -1771,7 +1771,7 @@ interface AttachState {
   /** Keepalive clocks, driven by MESSAGE-turn timestamps (see keepaliveStamps),
    *  NOT file mtime — non-message lines bump mtime and must not read as activity.
    *  `lastMs` = last user/assistant turn (real OR our ping) = cache-warmth clock;
-   *  `lastRealMs` = last genuine (non-ping/non-pong) turn = the real-idle cutoff.
+   *  `lastRealMs` = last genuine (non-keepalive) turn = the real-idle cutoff.
    *  `seenMtime` = file mtime observed last tick, the cheap "re-read the tail?"
    *  gate. `pinging`/`pingMtime` guard the inject→settle window (pingMtime holds
    *  `lastMs` at fire; the ping settles once a newer turn — its own — appears).
@@ -1794,11 +1794,6 @@ interface AttachState {
    *  (cache-read snapshot) is routed here from the swallowed turn_usage items,
    *  so the timeline shows the ping happened and proves it was a cheap read. */
   keepaliveTurnId?: string;
-  /** Accumulates the letters of the in-flight ping's assistant reply. While it
-   *  stays a prefix of "pong" the turn is swallowed (a heartbeat); the moment it
-   *  diverges — real resumed work, or a tool_use — the turn is un-swallowed to
-   *  chat and the real-idle clock re-anchors. Reset to "" when a ping fires. */
-  keepalivePongBuf?: string;
 }
 
 // Mirror outbound state machine. See plan: defer stream open by N ms; flush
@@ -2646,60 +2641,34 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     a.keepaliveQuiet = undefined;
   };
 
-  // A reply is still a heartbeat while its letters remain a prefix of "pong"
-  // (covers streamed partials "p"/"po"/"pon" and trailing punctuation). Anything
-  // else means the model ignored the ping and resumed real work.
-  const pongPrefix = (s: string): boolean =>
-    "pong".startsWith(s.replace(/[^a-zA-Z]/g, "").toLowerCase());
-
-  // Stop swallowing the in-flight ping turn: close its heartbeat detail turn,
-  // lift the quiet window, and re-anchor the clocks to "real activity now" so the
-  // resumed work resets the round budget. The caller then falls through to the
-  // normal onItem path, letting this and the rest of the turn reach chat.
-  const releaseKeepalive = (a: AttachState): void => {
-    if (a.keepaliveTurnId) { recordTurnClose(a.keepaliveTurnId); a.keepaliveTurnId = undefined; }
-    endKeepaliveQuiet(a);
-    a.keepalivePongBuf = undefined;
-    if (a.keepalive) { a.keepalive.round = 0; a.keepalive.pinging = false; a.keepalive.settledAt = 0; a.keepalive.lastRealMs = Date.now(); }
-    log.info({ target: a.target, sessionId: a.sessionId }, "keepalive: reply diverged from pong — un-swallowing resumed turn");
-  };
+  // A keepalive ping turn is swallowed wholesale — the reply content doesn't
+  // matter (model may add extra commentary beyond "pong", that's fine).
 
   const onItem = (a: AttachState, item: RenderItem): void => {
     // 新 spawn 的 pane 在首次 inject 落地前吞掉所有初始输出 (greeting/system)。
     if (a.muteUntilInject) return;
     // Keepalive ping turns are cache-warmers: swallow every item from the WeCom
     // paths so the ping/pong never reaches chat. But record the REAL exchange
-    // into its chat-detail turn — the actual assistant reply (expected: just
-    // "pong"), the tool calls if any, and the usage (proof it was a cheap
-    // cache-read) — so the detail page shows the genuine heartbeat, not a
-    // synthetic summary. Closed on the terminal signal (hard or soft turn_end).
+    // into its chat-detail turn — the actual assistant reply, the tool calls if
+    // any, and the usage (proof it was a cheap cache-read) — so the detail page
+    // shows the genuine heartbeat, not a synthetic summary.
     if (a.keepaliveQuiet) {
-      // Swallow only while the reply is consistent with a bare "pong". A text
-      // whose accumulated letters leave the "pong" prefix, or ANY tool_use (a
-      // heartbeat never calls tools), means the model resumed real work → release
-      // and fall through so the turn reaches chat instead of being hidden.
-      const nextBuf = item.kind === "text" ? (a.keepalivePongBuf ?? "") + item.body : (a.keepalivePongBuf ?? "");
-      const divergent = item.kind === "tool_use" || (item.kind === "text" && !pongPrefix(nextBuf));
-      if (!divergent) {
-        if (item.kind === "text") a.keepalivePongBuf = nextBuf;
-        const id = a.keepaliveTurnId;
-        if (id) {
-          const now = Date.now();
-          if (item.kind === "text") {
-            recordTurnItem(id, { t: "text", body: item.body, ts: now, final: item.final === true });
-          } else if (item.kind === "tool_result") {
-            recordTurnItem(id, { t: "tool_result", toolUseId: item.toolUseId, body: item.full, ts: now });
-          } else if (item.kind === "turn_usage") {
-            recordTurnUsage(id, { model: item.model, messageId: item.messageId, usage: item.usage });
-          } else if (item.kind === "turn_end") {
-            recordTurnClose(id);
-            a.keepaliveTurnId = undefined;
-          }
+      const id = a.keepaliveTurnId;
+      if (id) {
+        const now = Date.now();
+        if (item.kind === "text") {
+          recordTurnItem(id, { t: "text", body: item.body, ts: now, final: item.final === true });
+        } else if (item.kind === "tool_result") {
+          recordTurnItem(id, { t: "tool_result", toolUseId: item.toolUseId, body: item.full, ts: now });
+        } else if (item.kind === "turn_usage") {
+          recordTurnUsage(id, { model: item.model, messageId: item.messageId, usage: item.usage });
+        } else if (item.kind === "turn_end") {
+          recordTurnClose(id);
+          a.keepaliveTurnId = undefined;
         }
-        if (item.kind === "turn_end") { endKeepaliveQuiet(a); a.keepalivePongBuf = undefined; }
-        return;
       }
-      releaseKeepalive(a); // fall through to normal handling for this item
+      if (item.kind === "turn_end") { endKeepaliveQuiet(a); }
+      return;
     }
     // 任何新 item 到达 = 上一条"消息写完了"并不代表这一轮结束 → 撤销待确认的软收口。
     // 硬信号 (end_turn / turn_duration) 的后端永远不会走到这里。
@@ -4085,7 +4054,6 @@ export const startMirror = (deps: MirrorDeps): MirrorBridge => {
     // buys a deterministic reply. keepaliveStamps matches every form, so none
     // reads as real activity. (round is incremented below, after the inject lands.)
     const text = stalled ? kc.resumePing : kc.ping;
-    a.keepalivePongBuf = ""; // fresh reply accumulator for the swallow/release gate
     // Suppress the pane→WeCom echo of the ping user line, then swallow the whole
     // ping turn (reply included). The 60s fail-safe clears the quiet window if
     // the turn somehow never emits turn_end, so a later real turn is never muted;
