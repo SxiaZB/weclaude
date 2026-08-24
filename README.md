@@ -194,6 +194,44 @@ tagged session 的每条回复自带 `emoji #tag` 前缀（emoji 由 tag 名 has
 
 ---
 
+## 跨聊天：给聊天命名
+
+一个 WeCom 聊天的身份是 `chat:wrkS…` 这种既读不出也打不进去的 id。所以在给聊天起名之前，跨聊天叫人只有一条路：**赌 tag 全局唯一**——两个群各有一个 `#fix`，就谁也叫不动谁，唯一的出路是回去改别人的 tag。
+
+起个名字，这个聊天就有了能写进消息、也能传给工具的地址。
+
+```
+/name daily        给本聊天起名为 daily
+/name              查看当前名字
+/name -            取消命名
+/chats             列出所有已知聊天、各自跑着哪些会话
+```
+
+**名字规则**：1–32 个字符，字母 / 数字 / `_` / `-`（不能有空格、`#`、`/`、`:`）。全机唯一、大小写不敏感，重名会被拒；改名即覆盖，一个聊天只留一个名字。名字写在 `~/.wezard/config.jsonc` 的 `chats` 里，手改也行。
+
+**地址空间**随之变成两级，老写法一字不改：
+
+| 写法 | 指向 |
+|---|---|
+| `fix` | 本聊天的 `#fix`；本聊天没有，才回退去找全机唯一的 `#fix` |
+| `daily#fix` | daily 这个聊天的 `#fix`——不问 tag 全不全局唯一 |
+| `daily#` | daily 的默认（无 tag）会话 |
+| `chat:wr…#fix` | 全量 key，`/chats`、`list_peers` 吐出来的原样也能用 |
+
+起完名之后，在**别的群**里直接说人话即可：
+
+```
+让 daily#fix 看一眼这个报错          → AI 调 send_peer("daily#fix", …)
+在 daily 里开个 #ingest 跑 ~/repo    → AI 调 new_claude_session({ chat: "daily", tag: "ingest", cwd })
+别的群还有谁在跑                      → AI 调 list_chats
+```
+
+最后一块是**跨群建会话**：`new_claude_session` 的 `chat` 参数可以直接在另一个已命名的聊天里拉起 peer，「目标 peer 还不存在」不再需要找个人去那个群手打 `/new`。跨群的每一次 `send_peer`，两边聊天都会收到 relay 气泡——被叫的那侧不会莫名其妙冒出一句话。
+
+> **未命名的聊天既不可寻址、也不可被建入**，这是刻意的：往一个谁也读不出的 `chat:wr…` id 里塞会话，等于把它扔进一个调用方根本不该进的群。想让某个群能被叫到，就在那个群里发一次 `/name`。
+
+---
+
 ## 多 CLI 后端（`claude` / `claude-internal` / `codebuddy`）
 
 daemon 同时挂载所有已安装的 CLI，不是二选一：你可以一个 tmux 窗口跑 `claude`、另一个跑 `codebuddy`，各自绑不同的 IM 聊天。**会话身份就是它的 jsonl 路径**，daemon 由路径反推是哪个 CLI 写的，`--resume` 用哪个二进制、jsonl 用哪套 schema 解析、project-dir 怎么编码，全部由此派生。
@@ -256,6 +294,8 @@ IM 里发 `/help` 可随时拉出完整命令表；每次 `/new`、`/clear` 之�
 /new · /clear · /stop · /n          会话控制
 /sessions [emoji|id]                 列出 / 切换 live 会话
 /new <cli> [#tag]                    切换 CLI 后端 / 开并行会话
+/peers                               本聊天的会话及忙闲状态
+/name [名字|-] · /chats              给本聊天起名 / 跨聊天目录
 /id · /pwd · /usage · /cost · /audit  信息查询（免授权）
 /help                                全部命令
 ```
