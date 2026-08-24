@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.2.20] - 2026-08-24
+
 ### Fixed
 - `sessions`: **`new_claude_session` 在调用方自己的 chat 里建 peer**,不再掉进 `defaultChat`。这个工具此前不带 `selfRef`,daemon 只能 `target ?? cfg.defaultChat` 兜底,于是非 default 会话里的 agent 一喊「新开一个会话」,session 就落到另一个群里 —— 叫它的人既看不见也够不着;而且落点是**不带 tag 的 key**,那就是那个 chat 的默认会话,attach 直接把原本镜像在那儿的会话顶掉。现在:调用方按 `sessionId` / `tmuxPane` 解析出自己所在的 chat,新会话一律带 `#tag` 落成同 chat 的 peer(tag 可显式给,省略则由目录名派生并去重;撞上已存在的 tag 直接拒绝,而不是 respawn 掉那个正在跑的 peer),并且改走 `newSession` 而非裸 spawn+attach —— cwd/CLI 的 chat 级继承、tmux 窗口名、以及「created + 📂 当前项目」那条气泡全都和用户手打 `/new #tag` 完全一致:群里发得出消息、chat detail 里有记录、`list_peers` / `send_peer` 立刻能寻址。
 
@@ -229,7 +231,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.19...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.20...HEAD
+[1.2.20]: https://github.com/guxi11/wezard/compare/v1.2.19...v1.2.20
 [1.2.19]: https://github.com/guxi11/wezard/compare/v1.2.18...v1.2.19
 [1.2.18]: https://github.com/guxi11/wezard/compare/v1.2.17...v1.2.18
 [1.2.17]: https://github.com/guxi11/wezard/compare/v1.2.16...v1.2.17
