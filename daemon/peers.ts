@@ -298,6 +298,8 @@ export interface PeerMention {
   chat: string;
   label: string;
   cwd: string;
+  /** Session doesn't exist yet — chat name resolved but no running session. */
+  unborn?: boolean;
 }
 
 /** Machinery, not conversation: the `<system-reminder>` wrapper is the same
@@ -306,23 +308,44 @@ export interface PeerMention {
  *  summaries. Empty string for no mentions — appending it stays a no-op. */
 export const renderPeerMentionHint = (mentions: readonly PeerMention[]): string => {
   if (mentions.length === 0) return "";
-  const lines = mentions.map(
+  const live = mentions.filter((m) => !m.unborn);
+  const unborn = mentions.filter((m) => m.unborn);
+  const lines = live.map(
     (m) =>
       `- \`#${m.tag}\` ${m.label} — a live agent session${m.foreign ? ` in ANOTHER chat${m.chat ? ` named "${m.chat}"` : ""}` : " in this chat"}` +
       ` (target \`${m.target}\`${m.cwd ? `, cwd ${m.cwd}` : ""}), address "${m.address}".`,
   );
-  return [
+  const unbornLines = unborn.map(
+    (m) =>
+      `- \`${m.address}\` — refers to chat "${m.chat}" tag "#${m.tag}", but that session does NOT exist yet.` +
+      ` Create it first: new_claude_session({ chat: "${m.chat}", tag: "${m.tag}", cwd: "<project path>" }),` +
+      ` then send_peer("${m.address}", "<task>") to hand it work.`,
+  );
+  const parts: string[] = [
     "",
     "<system-reminder>",
-    "The `#tag` token(s) in the message above name peer agent sessions, not literal text:",
-    ...lines,
+  ];
+  if (lines.length > 0) {
+    parts.push(
+      "The `#tag` token(s) in the message above name peer agent sessions, not literal text:",
+      ...lines,
+    );
+  }
+  if (unbornLines.length > 0) {
+    parts.push(
+      "The following compound addresses (`chatName#tag`) refer to sessions that don't exist yet:",
+      ...unbornLines,
+    );
+  }
+  parts.push(
     "When the user asks you to involve, check on, or relay to one of them, use the wezard peer tools rather than",
     "guessing or answering on its behalf: peek_peer(address) reads its recent conversation, send_peer(address, text)",
     "hands it work or a nudge, wait_peer(address) blocks until it goes idle, list_peers() shows everyone. Pass the",
     "`address` shown above verbatim — a bare tag for a sibling, `chatName#tag` for a peer in another chat. A mention that is",
     "merely referential (\"#b 说的那个方案\") needs no tool call — judge from what the user is asking for.",
     "</system-reminder>",
-  ].join("\n");
+  );
+  return parts.join("\n");
 };
 
 // ── Peer model ────────────────────────────────────────────────────────

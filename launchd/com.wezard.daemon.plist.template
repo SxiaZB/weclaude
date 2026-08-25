@@ -20,8 +20,6 @@
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
-        <key>NODE_ENV</key>
-        <string>production</string>
     </dict>
 
     <key>RunAtLoad</key>

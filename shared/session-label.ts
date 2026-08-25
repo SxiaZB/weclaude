@@ -48,6 +48,24 @@ export const allTags = (text: string): string[] => [
   ...new Set([...text.matchAll(new RegExp(TAG_TOKEN, "gu"))].map((m) => m[2] ?? "").filter(Boolean)),
 ];
 
+// Compound address: `chatName#tag` (no space before `#`). Captures word-boundary
+// delimited `name#tag` tokens that TAG_TOKEN misses because the `#` isn't preceded
+// by whitespace. The left part MIGHT be a chat name — caller must validate.
+const COMPOUND_ADDR = "(?:^|(?<=\\s))([\\p{L}\\p{N}_-]{1,32})#([\\p{L}\\p{N}_-]{1,32})(?=[\\s\\u200B-\\u200D\\u2060\\uFEFF]|$)";
+
+/** Every distinct `name#tag` compound address in `text`. */
+export const allCompoundAddresses = (text: string): Array<{ raw: string; chat: string; tag: string }> => {
+  const seen = new Set<string>();
+  const results: Array<{ raw: string; chat: string; tag: string }> = [];
+  for (const m of text.matchAll(new RegExp(COMPOUND_ADDR, "gu"))) {
+    const raw = m[0]!.trim();
+    if (seen.has(raw)) continue;
+    seen.add(raw);
+    results.push({ raw, chat: m[1]!, tag: m[2]! });
+  }
+  return results;
+};
+
 // ── Target-key tagging ──────────────────────────────────────────────────
 // Daemon-internal target keys are `user:xxx[#tag]` / `chat:xxx[#tag]`. Every
 // user-visible artifact bound to a TAGGED session must carry the same visual

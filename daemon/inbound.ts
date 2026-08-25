@@ -17,8 +17,8 @@ import { computeUsage, renderUsageReport } from "./usage.js";
 import { computeAuditReport } from "./audit.js";
 import { syncProjectConfig, renderSyncReport } from "./cfg-sync.js";
 import { captureQuota, renderQuotaReport } from "./quota.js";
-import { tagOfKey, baseOfKey, withTagHeader, parseTagHeader, tagTokenRe, allTags, labelFor } from "../shared/session-label.js";
-import { chatNameOf, clearChatName, listChatNames, peerAddress, setChatName } from "./chat-name.js";
+import { tagOfKey, baseOfKey, withTagHeader, parseTagHeader, tagTokenRe, allTags, allCompoundAddresses, labelFor } from "../shared/session-label.js";
+import { chatNameOf, chatBaseOf, clearChatName, listChatNames, peerAddress, setChatName } from "./chat-name.js";
 
 /** 判定"引用内容是否已在目标会话上下文里"时回看的轮数 —— 引用的通常是最近几轮
  *  里的某条气泡,再往前用户多半是真想把老内容重新拎出来说事。 */
@@ -886,9 +886,13 @@ export const installInboundRouter = (
   const peerMentions = (who: string, text: string): PeerMention[] => {
     if (!("resolvePeerTag" in bridge)) return [];
     const mb = bridge as MirrorBridge;
-    return allTags(text).flatMap((tag): PeerMention[] => {
+    const seen = new Set<string>();
+
+    // Pass 1: standalone `#tag` tokens (existing behavior)
+    const fromTags = allTags(text).flatMap((tag): PeerMention[] => {
       const r = mb.resolvePeerTag(who, tag);
       if (!r.ok || r.target === who) return [];
+      seen.add(r.target);
       const { runningCwd, defaultCwd } = mb.getCwd(r.target);
       return [{
         tag,
@@ -900,6 +904,43 @@ export const installInboundRouter = (
         cwd: runningCwd || defaultCwd,
       }];
     });
+
+    // Pass 2: compound `chatName#tag` patterns (invisible to TAG_TOKEN because
+    // `#` isn't preceded by whitespace). Feed the raw compound to resolvePeerTag
+    // which internally splits via parsePeerRef.
+    const fromCompound = allCompoundAddresses(text).flatMap((addr): PeerMention[] => {
+      const r = mb.resolvePeerTag(who, addr.raw);
+      if (r.ok) {
+        if (r.target === who || seen.has(r.target)) return [];
+        seen.add(r.target);
+        const { runningCwd, defaultCwd } = mb.getCwd(r.target);
+        return [{
+          tag: addr.tag,
+          target: r.target,
+          address: peerAddress(cfg, who, r.target),
+          chat: chatNameOf(cfg, r.target),
+          foreign: r.foreign,
+          label: labelFor(addr.tag),
+          cwd: runningCwd || defaultCwd,
+        }];
+      }
+      // Session doesn't exist but chat name is valid → unborn peer hint
+      if (chatBaseOf(cfg, addr.chat)) {
+        return [{
+          tag: addr.tag,
+          target: "",
+          address: `${addr.chat}#${addr.tag}`,
+          chat: addr.chat,
+          foreign: true,
+          label: labelFor(addr.tag),
+          cwd: "",
+          unborn: true,
+        }];
+      }
+      return [];
+    });
+
+    return [...fromTags, ...fromCompound];
   };
 
   const send = async (frame: WsFrame<BaseMessage>, msg: BaseMessage, who: string, text: string, images: string[] = []): Promise<void> => {

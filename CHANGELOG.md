@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+## [1.2.21] - 2026-08-25
+
+### Fixed
+- `peers`: **compound `chatName#tag` 地址在用户正文里被正确识别并标注**。此前 `#tag` 的正则要求 `#` 前有空白,导致 `sanitizer#handle824` 这种紧凑写法对路由和标注都不可见——消息整条落进本 chat 的默认会话,目标 chat 里什么都没被创建。现在 `peerMentions` 在 `allTags` 之外额外扫描 `word#word` 形式的 compound 地址,chat 名合法即标注;目标会话尚不存在时(unborn peer)也注入提示,告诉 agent 先 `new_claude_session` 再 `send_peer`。
+
+### Changed
+- `launchd`: plist 模板移除 `NODE_ENV=production`——daemon 不依赖该变量,且它会干扰 tsx dev 模式。
+
 ## [1.2.20] - 2026-08-24
 
 ### Fixed
@@ -231,7 +239,8 @@
 ### Fixed
 - `chat`: 修复移动端滚动 — `.main` 加 `min-height:0`,叠加 overscroll + safe-area。
 
-[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.20...HEAD
+[Unreleased]: https://github.com/guxi11/wezard/compare/v1.2.21...HEAD
+[1.2.21]: https://github.com/guxi11/wezard/compare/v1.2.20...v1.2.21
 [1.2.20]: https://github.com/guxi11/wezard/compare/v1.2.19...v1.2.20
 [1.2.19]: https://github.com/guxi11/wezard/compare/v1.2.18...v1.2.19
 [1.2.18]: https://github.com/guxi11/wezard/compare/v1.2.17...v1.2.18
